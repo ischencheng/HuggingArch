@@ -606,6 +606,12 @@ class SpecIRNode:
     # own only because the invocation it belongs to — the assignment that
     # picked this template for these layers — has no node in the graph.
     block_dims_raw: Dict[str, str] = field(default_factory=dict)
+    # The frame the node sits in, as the tree builder resolved it: the
+    # model's dims under every enclosing block assignment's and component
+    # call's `dims:`. Shared with its siblings (one dict per frame), and
+    # empty on a node a pass grafts after the build. Read through `bound`.
+    frame: Dict[str, Any] = field(default_factory=dict, repr=False,
+                                  compare=False)
     dim: Optional[Any] = None
     dim_raw: Optional[str] = None
     # Explicit n-D shape (parameter_tensor and similar source ops).
@@ -732,6 +738,20 @@ class SpecIRNode:
         node with no op of its own."""
         decl = self.declaration
         return decl.processor_step if decl is not None else None
+
+    def bound(self, label: str) -> Optional[Any]:
+        """What `label` is bound to at this node before any walk: its own
+        `dims:` over the frame it sits in (`frame`), or None when neither
+        binds it. The walked answer is `Analysis.node_dims`; this one is
+        for a reader that runs before the walk does, on a node the tree
+        builder made. A node a pass grafted later has no frame, and asking
+        it is refused rather than answered None."""
+        if not self.frame:
+            raise ValueError(
+                f"{self.display_path}: a grafted node has no build-time "
+                "frame; read the walked frame (`Analysis.node_dims`)")
+        value = self.dims.get(label)
+        return value if value is not None else self.frame.get(label)
 
     @property
     def owns_weight(self) -> bool:

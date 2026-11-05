@@ -150,7 +150,11 @@ def replicated_encoders(program: Any, parallel: Any, phase: str
         if node.op not in ATTENTION_SCORE_OPS:
             continue
         stack = program.stack_of(node)
-        count = node.dims["n_heads"]
+        count = node.bound("n_heads")
+        if count is None:
+            raise ValueError(
+                f"{node.display_path}: an encoder attention score whose "
+                "frame binds no `n_heads`")
         if not equal(heads.setdefault(stack, count), count):
             raise ValueError(
                 f"encoder stack {stack!r} scores attention over "
@@ -245,9 +249,10 @@ def _sequence_axis(spec: Any, node: Any,
     return (found[0], len(signature.ins[input_index])) if len(found) == 1 else None
 
 
-def _head_axis(program: Any, spec: Any, node: Any,
+def _head_axis(spec: Any, node: Any,
                input_index: int) -> Optional[Tuple[int, int, str]]:
-    """The operand's head axis and its walked extent."""
+    """The operand's head axis and the extent the node's frame binds it to
+    (`SpecIRNode.bound`): this runs before the walk."""
     signature = signature_for(spec, node, len(spec.shape_out or ()))
     if signature is None or input_index >= len(signature.ins):
         return None
@@ -259,13 +264,7 @@ def _head_axis(program: Any, spec: Any, node: Any,
         return None
     axis = found[0]
     label = signature.ins[input_index][axis]
-    extent = node.dims.get(label)
-    if extent is None:
-        block = program.block_of(node.uid)
-        override = (program.blocks[block].dim_overrides
-                    if block is not None else {}).get(label)
-        extent = override if override is not None else (
-            program.resolved.dim_values.get(label))
+    extent = node.bound(label)
     if extent is None:
         return None
     return axis, int(value_of(extent)), label
@@ -424,7 +423,7 @@ def head_repartition_kv_cache_region(program: Any, parallel: Any
         if input_index is None:
             continue
         sequence_axis = _sequence_axis(spec, node, input_index)
-        head = _head_axis(program, spec, node, input_index)
+        head = _head_axis(spec, node, input_index)
         if sequence_axis is None or head is None:
             continue
         _axis, extent, label = head

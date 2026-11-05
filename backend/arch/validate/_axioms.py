@@ -135,22 +135,22 @@ class _Call:
         for stack in analysis.program.walk_stacks:
             if stack.is_encoder:
                 continue
-            out.extend(cls.of_stage(resolved, spec, stage)
+            out.extend(cls.of_stage(analysis, spec, stage)
                        for stage in stack.stages
                        if isinstance(stage, BlockStage))
         return out
 
     @classmethod
-    def of_stage(cls, resolved, spec, stage) -> "_Call":
+    def of_stage(cls, analysis, spec, stage) -> "_Call":
         """A block a stack runs directly. A cache belongs to the component
         calls inside it, so the block itself keeps nothing; a block that
         declares one anyway is a cache no call grew, which nothing here can
         judge — that is a finding whether or not the block has claims."""
         template = stage.template
         bg = spec.get_block(template.name)
-        dims = dict(resolved.dim_values)
-        dims.update({k: eval_dim_expr(str(v), dims)
-                     for k, v in template.dim_overrides.items()})
+        # The frame the walk ran the block in (`Analysis.block_frame`), as
+        # a call's `dims` is the frame the walk ran the call in.
+        dims = dict(analysis.block_frame(template))
         return cls(
             template=bg.synth_template or template.name,
             path=stage.name,
