@@ -229,10 +229,12 @@ class ModelReport:
 
     @property
     def embedding_params(self) -> int:
-        banks = self.top_level_node_params
+        """The model's input embedding: the model-level node whose
+        `boundary_role` is `input_embedding` — the same node
+        `top_level_node_params` and `_lookup_table_params` set aside."""
         return sum(
-            node.params for name, node in self.model_level_nodes.items()
-            if node.op == "embedding" and name not in banks
+            node.params for node in self.model_level_nodes.values()
+            if node.boundary_role == "input_embedding"
         )
 
     @property
