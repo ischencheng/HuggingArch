@@ -95,6 +95,7 @@ from .program import HandedTensor, Program, Stack
 from .refusal import EngineGap, SpecRefusal
 from .storage import module_path
 from .traffic import produced_width
+from .evaluator import Evaluator
 from .dim import (Dim, Domain, declared_workload, eval_dim_expr, expr_of,
                   maximum, minimum, names_of, nearest, ratio_symbol, value_of)
 from ..loader import ResolvedSpec, get_default_loader
@@ -1275,8 +1276,6 @@ class Deployment:
                 if point else analysis)
 
     def _walk(self, binding: Binding, *, checkpoint: bool = False) -> Any:
-        from .evaluator import Evaluator
-
         # A walk is over the workload's counts as symbols: a count given as
         # a number is read at its point after the walk (`analyze`), never
         # walked as one.

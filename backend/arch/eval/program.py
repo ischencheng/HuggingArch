@@ -63,7 +63,7 @@ from ..schema import HISTORY_AXIS as HISTORY_AXIS, parse_input_ref
 from ..spec_tree import (
     STACK_ENTRY, BlockMeta, InputRef, SpecIRNode, SpecIRTree, SpineEntry,
     TreeStream,
-    checkpoint_prefix, ir_dim_symbols, ir_to_leaf, iter_leaves,
+    checkpoint_prefix, ir_dim_symbols, ir_to_leaf, iter_leaves, iter_tree,
     require_module,
     scope_prefix,
 )
@@ -1030,7 +1030,6 @@ class Program:
 
     @classmethod
     def of(cls, resolved: Any, ir: Optional[SpecIRTree] = None) -> "Program":
-        from ..spec_tree import iter_tree
         return cls(
             resolved=resolved,
             ir=ir if ir is not None else iter_tree(resolved),

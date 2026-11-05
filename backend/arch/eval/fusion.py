@@ -55,7 +55,8 @@ import sympy as sp
 
 from ..activation_formats import ACTIVATION_FORMATS
 from .analysis import OwnCopies
-from .cache import Edges, is_view, main_port
+from .cache import (Edges, cached_node_uids, is_view, main_port,
+                    state_carrier_uids)
 from .dim import exact, is_whole, same_law, value_of, where
 from .launch import FusedNode
 from .layer import Layer, Rewrite
@@ -1808,7 +1809,6 @@ def kept_rows(analysis: Any) -> FrozenSet[int]:
     node (the cache it writes is unchanged), a recurrent state's carrier
     (its per-rank axes come from the carrier's shape), and a lookup (the
     rows it gathers are its output's: `traffic._table_read_fractions`)."""
-    from .cache import cached_node_uids, state_carrier_uids
     return frozenset(cached_node_uids(analysis.program)
                      | state_carrier_uids(analysis)
                      | set(analysis.program.lookups))

@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Tuple
 import pytest
 
 from backend.arch.eval import evaluator as evaluator_mod
+from backend.arch.eval import transforms as transforms_mod
 from backend.arch.eval.dim import value_of
 from backend.arch.eval.occurrence import Occurrence
 from backend.arch.eval.program import BlockStage, OpStage, Program
@@ -55,12 +56,13 @@ def _recording():
             self.bound: Dict[int, List[Any]] = {}
             seen.append(self)
 
-    original = evaluator_mod.Evaluator
-    evaluator_mod.Evaluator = Recording
+    # Patched where the walk names it: `Deployment._walk` in `transforms`.
+    original = transforms_mod.Evaluator
+    transforms_mod.Evaluator = Recording
     try:
         yield seen
     finally:
-        evaluator_mod.Evaluator = original
+        transforms_mod.Evaluator = original
 
 
 def walk_of(program: Program, phase: str = "prefill", *, media=None,

@@ -150,7 +150,7 @@ IMPORTS = {
     # model to project isolated blocks — the loader/schema reads below are its
     # declared, pinned dependencies.
     "program.py:schema": 1,
-    "program.py:spec_tree": 2,
+    "program.py:spec_tree": 1,
     "storage.py:spec_tree": 1,
     # 3 → 1 when the three function-body loader imports (get_default_loader +
     # two ResolvedSpec) were hoisted to a single module-top import (lazy_edges
