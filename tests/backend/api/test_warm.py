@@ -237,6 +237,16 @@ def test_the_warm_pool_is_its_own_knob(monkeypatch):
     assert warm.WarmProcess.default_workers() == 1
 
 
+def test_an_offline_warm_takes_up_to_32_workers_and_leaves_two_cores(monkeypatch):
+    """Unset, the warm's pool is as wide as the box allows up to 32, two
+    cores left to everything else."""
+    monkeypatch.delenv("HA_WARM_WORKERS", raising=False)
+    monkeypatch.setattr(warm.os, "cpu_count", lambda: 112)
+    assert warm.WarmProcess.default_workers() == 32
+    monkeypatch.setattr(warm.os, "cpu_count", lambda: 8)
+    assert warm.WarmProcess.default_workers() == 6
+
+
 def test_the_warm_runs_its_jobs_in_its_pool(monkeypatch):
     """With workers, every heavy job of the warm runs in its pool, as in the
     server."""

@@ -17,7 +17,7 @@ once the server reports healthy), or once per engine/spec at image build:
 Process knobs (flag, else env, else default):
 
     --nice N      HA_WARM_NICE           10   lowest CPU priority it runs at
-    --workers N   HA_SWEEP_POOL_WORKERS  min(4, cpu-2)  its own sweep pool
+    --workers N   HA_WARM_WORKERS        min(32, cpu-2) its own sweep pool
     --pidfile P   —                      —    written at start, removed at exit
 
 Cache locations are the server's: `HA_GALLERY_CACHE_DIR`,
@@ -318,11 +318,13 @@ class WarmProcess:
     def default_workers() -> int:
         """`HA_WARM_WORKERS`, its own knob — not the API's pool size
         (`HA_SWEEP_POOL_WORKERS`): the warm runs beside the API's pool in one
-        container, so it is budgeted apart (fly.toml) — else min(4, cpu-2)."""
+        container, so it is budgeted apart (fly.toml) — else min(32, cpu-2):
+        run offline, a cold warm is thousands of independent layout walks,
+        and a 4-worker pool left a 112-core box idle for hours."""
         raw = os.environ.get("HA_WARM_WORKERS", "").strip()
         if raw:
             return int(raw)
-        return max(0, min(4, (os.cpu_count() or 1) - 2))
+        return max(0, min(32, (os.cpu_count() or 1) - 2))
 
     def __enter__(self) -> "WarmProcess":
         current = os.nice(0)
