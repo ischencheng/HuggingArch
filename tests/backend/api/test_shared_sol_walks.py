@@ -163,6 +163,17 @@ def test_a_point_outside_the_producer_anchor_runs_its_own_cell(shared):
         scaling._PARALLEL, scaling._PARALLEL.plan(req)) == {}
 
 
+def test_the_canonical_bundle_holds_every_scaling_layout(shared):
+    """Scaling's ladder does not become direct cells beside the Gallery pool."""
+    _gallery, scaling, _pool, _calls = shared
+    assert asyncio.run(_gallery.keepSharedWalk(MODEL, "H100-SXM"))
+    req = _request(scaling, context_len=1024, gpu_skus=["H100-SXM"])
+    plan = scaling._PARALLEL.plan(req)
+    assert len(plan.cells) >= 1
+    assert set(scaling._sharedWalkResults(
+        scaling._PARALLEL, plan)) == set(range(len(plan.cells)))
+
+
 def test_a_decode_batch_outside_the_public_grid_is_substituted(shared):
     from backend.api._models import BatchPoint
 

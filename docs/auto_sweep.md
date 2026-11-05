@@ -470,6 +470,9 @@ Each tier has the invalidation its data needs.
    `sol_law.cardBinding`, which asks `Card.refuse_unless_one_class`, and a
    point is read off the record by `sol_law.servingLawPoint`. A card of
    another class names a different bundle and reads that one.
+   The bundle's layout axis is the union every public consumer can ask for
+   (`layoutsByCard`); `galleryLayoutsByCard` names the Gallery's frontier
+   subset, so widening a bundle for Scaling never adds Gallery points.
 2. **SOL answers** are projections of those laws, or of freshly walked cells,
    for one request. They are cached in the request cache
    (`api/sweep_runtime._SWEEP`: memory → disk → remote tier) under content

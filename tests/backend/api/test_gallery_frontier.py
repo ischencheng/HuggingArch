@@ -667,6 +667,8 @@ def test_an_entry_missing_its_measures_part_is_priced_again(monkeypatch, tmp_pat
     assert got == {"walk": {"cards": cards,
                             "layoutsByCard": {c: [ParallelConfig().to_dict()]
                                                 for c in cards},
+                            "galleryLayoutsByCard": {
+                                c: [ParallelConfig().to_dict()] for c in cards},
                             "layouts": [ParallelConfig().to_dict()]}}
     # A view that reads no measures draws off the first part alone.
     assert "drawn" in f._frontier_read(model, f.FrontierView("B200", draft_tokens=1))

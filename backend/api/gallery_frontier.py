@@ -1088,11 +1088,14 @@ class _Stored(NamedTuple):
         if not walkManifestIsValid(manifest):
             return None
         metadata = manifest.get("metadata") or {}
-        if view.gpu_sku not in metadata.get("layoutsByCard", {}):
+        # A canonical bundle holds every public layout (Gallery's frontier ∪
+        # Scaling's ladder). The Gallery draws only its own subset of them.
+        galleryLayouts = metadata.get("galleryLayoutsByCard",
+                                      metadata.get("layoutsByCard", {}))
+        if view.gpu_sku not in galleryLayouts:
             return None
         wantedNames = {StepLawKey.of_layout(walk_key, layout).record_name
-                       for layout in
-                       metadata["layoutsByCard"][view.gpu_sku]}
+                       for layout in galleryLayouts[view.gpu_sku]}
         recordIds = sharedSolPool.recordIds(bundle_key)
         if recordIds is None:
             return None
@@ -1288,12 +1291,16 @@ def _walk_plan(resolved: Any, view: FrontierView, *,
     layouts (`_scalingLayouts`)."""
     cards = view.walk_cards()
     caps = sweep_caps({}, resolved=resolved)
+    frontierByCard = {
+        sku: [cfg.to_dict() for cfg in frontier_layouts(caps, sku)]
+        for sku in cards
+    }
     layouts = (_scalingLayouts(caps, cards) if scaling
                else class_frontier_layouts(caps, cards))
     return {"cards": cards,
-            "layoutsByCard": {sku: [cfg.to_dict() for cfg in
-                                    frontier_layouts(caps, sku)]
+            "layoutsByCard": {sku: [cfg.to_dict() for cfg in layouts]
                               for sku in cards},
+            "galleryLayoutsByCard": frontierByCard,
             "layouts": [cfg.to_dict() for cfg in layouts]}
 
 
@@ -1361,9 +1368,15 @@ async def keepSharedWalk(model_id: str, gpu_sku: str) -> bool:
             for name in wanted:
                 record = sharedSolPool.record(bundle_key, name)
                 if (record is not None
-                        and record.get("walk", {}).get("schema") == walkRecordSchema):
+                    and record.get("walk", {}).get("schema") == walkRecordSchema):
                     existing[name] = record
-        if len(existing) == len(wanted):
+        published = {
+            StepLawKey.of_layout(walk_key, layout).record_name
+            for layouts in ((sharedSolPool.manifest(bundle_key).get(
+                "metadata") or {}).get("layoutsByCard") or {}).values()
+            for layout in layouts
+        }
+        if len(existing) == len(wanted) and wanted <= published:
             return True
     layouts = [ParallelConfig.from_dict(layout) for layout in plan["layouts"]
                if StepLawKey.of_layout(walk_key, layout).record_name
@@ -1383,6 +1396,7 @@ async def keepSharedWalk(model_id: str, gpu_sku: str) -> bool:
         metadata={
             "cards": list(plan["cards"]),
             "layoutsByCard": plan["layoutsByCard"],
+            "contexts": list(GALLERY_SEQ_LENS),
             "facts": ServingWalkFacts.producer().to_json(),
             "recordSchema": walkRecordSchema,
         })
