@@ -86,6 +86,12 @@ logger = logging.getLogger(__name__)
 # away, takes it.
 DEADLINE_S = float(os.environ.get("HA_REQUEST_DEADLINE_S", "20"))
 RETRY_AFTER_S = 5
+# Work that publishes as it goes (`report_partial`) answers a waiting client
+# as soon as it has something new rather than at the deadline — after this
+# grace, so items landing together go out together — and asks it back
+# sooner: its next item may be a second away.
+_NEWS_GRACE_S = 0.5
+NEWS_RETRY_AFTER_S = 1
 # How long a result whose caller timed out stays for the retry, and how many.
 _HOLD_S = 600.0
 _HOLD_MAX = 32
@@ -110,10 +116,14 @@ class StillComputing(Exception):
     def __init__(self, message: str = "",
                  progress: Optional[Tuple[int, int]] = None,
                  jobs_done: Optional[int] = None,
-                 partial: Optional[Dict[str, Any]] = None):
+                 partial: Optional[Dict[str, Any]] = None,
+                 retry_after_s: Optional[float] = None):
         super().__init__(message)
         self.progress = progress
         self.jobs_done = jobs_done
+        #: How soon to ask again, when sooner than `RETRY_AFTER_S`: the work
+        #: answered early because it published something new.
+        self.retry_after_s = retry_after_s
         #: The items the work has published that the client does not have
         #: yet (`report_partial`): `{"tag", "count", "head", "items"}`, or
         #: None for work that publishes none.
@@ -383,8 +393,8 @@ class _Work:
     requests wait on it now."""
 
     __slots__ = ("__weakref__", "abandoned", "asked_at", "held_until", "hint",
-                 "jobs_done", "left_at", "partial_head", "partial_items",
-                 "progress", "tag", "task", "waiting")
+                 "jobs_done", "left_at", "news", "partial_head",
+                 "partial_items", "progress", "tag", "task", "waiting")
 
     def __init__(self) -> None:
         self.task: "asyncio.Task[Any]"
@@ -402,6 +412,9 @@ class _Work:
         #: What the work published so far (`report_partial`).
         self.partial_head: Optional[Dict[str, Any]] = None
         self.partial_items: List[Any] = []
+        #: Set, and replaced, each time the work publishes (`report_partial`):
+        #: a request waiting on the work answers then (`_result_or_news`).
+        self.news = asyncio.Event()
         #: What this work's jobs are tagged with on the pool's progress
         #: channel (`_reporting`). An int, so it crosses to a worker and
         #: back by value and holds no reference to the work itself.
@@ -504,6 +517,46 @@ def report_partial(item: Any = None, *,
         work.partial_head = head
     if item is not None:
         work.partial_items.append(item)
+    published, work.news = work.news, asyncio.Event()
+    published.set()
+
+
+class _News(Exception):
+    """The work published something the waiting client does not have."""
+
+
+async def _result_or_news(work: "_Work", deadline_s: float,
+                          have: Optional[int]) -> Any:
+    """The work's result; or `_News` once it has published what the client
+    lacks — at once when it already holds more items than the client's
+    `have`, else when it next publishes — after `_NEWS_GRACE_S`, so what
+    lands together goes out together; or `asyncio.TimeoutError` at the
+    deadline. The work goes on either way."""
+    loop = asyncio.get_running_loop()
+    end = loop.time() + deadline_s
+    result = asyncio.shield(work.task)
+    try:
+        behind = have is not None and len(work.partial_items) > have
+        if not behind:
+            news = asyncio.ensure_future(work.news.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    {result, news}, timeout=max(0.0, end - loop.time()),
+                    return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                news.cancel()
+            if result in done:
+                return result.result()
+            if not done:
+                raise asyncio.TimeoutError
+        grace = max(0.0, min(_NEWS_GRACE_S, end - loop.time()))
+        done, _ = await asyncio.wait({result}, timeout=grace)
+        if done:
+            return result.result()
+        raise _News
+    finally:
+        if not result.done():
+            result.cancel()       # the shield only: the work goes on
 
 
 # Per event loop: a task belongs to the loop that runs it (a test client
@@ -588,10 +641,11 @@ async def within_deadline(key: str, start: Callable[[], Awaitable[_T]], *,
     try:
         if _deadline_s is None:
             return _own(await asyncio.shield(work.task))
+        have = (None if cursor is None
+                else cursor[1] if cursor[0] == work.tag else 0)
         try:
-            return _own(await asyncio.wait_for(asyncio.shield(work.task),
-                                               _deadline_s))
-        except asyncio.TimeoutError:
+            return _own(await _result_or_news(work, _deadline_s, have))
+        except (asyncio.TimeoutError, _News) as why:
             work.abandoned = True
             # The ledger is read now, so take what the workers reported
             # since the last fold first.
@@ -609,7 +663,9 @@ async def within_deadline(key: str, start: Callable[[], Awaitable[_T]], *,
                 "few seconds; the computation continues while it is asked "
                 "for.",
                 progress=work.progress, jobs_done=work.jobs_done,
-                partial=partial) from None
+                partial=partial,
+                retry_after_s=(NEWS_RETRY_AFTER_S if isinstance(why, _News)
+                               else None)) from None
     finally:
         work.leave(table, key)
 

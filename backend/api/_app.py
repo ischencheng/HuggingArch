@@ -133,8 +133,10 @@ async def _compute_not_ready(_request, exc: Exception):
     on, or could not read its measurements (the Kernel Bench service did not
     answer — nothing was computed or cached): one 503 naming which, that the
     client may send again."""
-    content = {"detail": str(exc), "reason": exc.reason,
-               "retry_after_s": _offload.RETRY_AFTER_S}
+    after = _offload.RETRY_AFTER_S
+    if isinstance(exc, _offload.StillComputing) and exc.retry_after_s is not None:
+        after = exc.retry_after_s
+    content = {"detail": str(exc), "reason": exc.reason, "retry_after_s": after}
     if isinstance(exc, _offload.StillComputing):
         if exc.progress is not None:
             done, total = exc.progress
@@ -145,7 +147,7 @@ async def _compute_not_ready(_request, exc: Exception):
             content["partial"] = jsonable_encoder(exc.partial)
     return JSONResponse(
         status_code=503,
-        headers={"Retry-After": str(_offload.RETRY_AFTER_S)},
+        headers={"Retry-After": str(int(after))},
         content=content)
 
 

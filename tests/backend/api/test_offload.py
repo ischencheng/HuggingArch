@@ -791,3 +791,44 @@ def test_a_503_carries_the_published_items_the_client_lacks(monkeypatch):
         app.router.routes[:] = [r for r in app.router.routes
                                 if getattr(r, "path", "") != "/__test/partial"]
     offload.report_partial({"model_id": "nobody"})   # outside a request: no-op
+
+
+def test_work_that_publishes_answers_a_waiting_client_without_waiting_for_the_deadline(
+        monkeypatch):
+    """A long poll: a request waiting on work that publishes (`report_partial`)
+    answers as soon as something new lands — after a short grace — and asks
+    to be sent again in a second; a client already behind the work's items
+    is answered at once; with nothing new it waits for the deadline."""
+    import asyncio
+
+    async def publishes_late():
+        await asyncio.sleep(0.1)
+        offload.report_partial({"model_id": "m1"})
+        await asyncio.sleep(10)
+        return "done"
+
+    async def silent():
+        await asyncio.sleep(10)
+        return "done"
+
+    async def timed(key, start, **kw):
+        t0 = time.monotonic()
+        with pytest.raises(offload.StillComputing) as info:
+            await offload.within_deadline(key, start, **kw)
+        return time.monotonic() - t0, info.value
+
+    async def scenario():
+        early, first = await timed("news", publishes_late)
+        behind, again = await timed("news", publishes_late,
+                                    cursor=(first.partial["tag"], 0))
+        quiet, nothing = await timed("quiet", silent)
+        return early, first, behind, again, quiet, nothing
+
+    monkeypatch.setattr(offload, "_deadline_s", 3.0)
+    early, first, behind, again, quiet, nothing = asyncio.run(scenario())
+    assert early < 1.5, early
+    assert first.retry_after_s == offload.NEWS_RETRY_AFTER_S
+    assert [i["model_id"] for i in first.partial["items"]] == ["m1"]
+    assert behind < 1.0, behind
+    assert [i["model_id"] for i in again.partial["items"]] == ["m1"]
+    assert quiet >= 2.9 and nothing.retry_after_s is None
