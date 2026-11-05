@@ -18,13 +18,15 @@ Laws are keyed by the REAL primitive vocabulary of `ops.OP_REGISTRY` —
 `required_node_facts` flag the caller answers from the node, and a biased linear has
 no passthrough: a backend that fuses one must finalize INSIDE the kernel
 and then apply the affine), `combine`, `add`, `mul`, `scatter_rows_add`,
-`concat`, and the carry (payload-moving view) ops.
+`concat`, and the payload-moving view ops.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import permutations
 from typing import Optional, Tuple
+
+from backend.arch.op_names import op_keyed
 
 from .value import Partial, PENDING_MERGE_KINDS, UnknownValue
 
@@ -118,16 +120,11 @@ def _view_law(op: str) -> ReductionHomomorphism:
         parameter_conditions=(("index_map", INDEX_EQUIVARIANT),),
         schema_map="reindex")
 
-#: Views that move a pending payload without touching its algebra.
-PARTIAL_PRESERVING_VIEW_OPS = (
-    "slice", "view_split", "view_merge", "spatial_merge", "transpose",
-    "head_repeat",
-)
-
-#: The corpus passthrough table, exhaustively enumerated by REAL op names.
+#: The corpus passthrough table, exhaustively enumerated by REAL op names
+#: (`op_keyed`: a key no registered op answers to is refused at load).
 #: Ops absent here (biased linear via `required_node_facts`, activations,
 #: narrowing casts) have NO law: arriving Partials finalize first.
-HOMOMORPHISM_REGISTRY = {
+HOMOMORPHISM_REGISTRY = op_keyed({
     "linear": _linear_law("linear"),
     "linear_param": _linear_law("linear_param"),
     # linear_external_weight takes its weight as a SECOND DATA INPUT
@@ -169,8 +166,11 @@ HOMOMORPHISM_REGISTRY = {
         op="concat", reducer=ANY_REDUCER, carrier_slots=(ALL_INPUT_SLOTS,),
         parameter_conditions=(("segment_injections", INDEX_EQUIVARIANT),),
         schema_map="concat"),
-    **{op: _view_law(op) for op in PARTIAL_PRESERVING_VIEW_OPS},
-}
+    # Views that move a pending payload without touching its algebra.
+    **{op: _view_law(op) for op in (
+        "slice", "view_split", "view_merge", "spatial_merge", "transpose",
+        "head_repeat")},
+})
 
 
 def may_defer_reduction(law: ReductionHomomorphism, inputs, coefficient_ok,

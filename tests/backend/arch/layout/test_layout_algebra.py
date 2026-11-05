@@ -548,9 +548,8 @@ class TestReductionHomomorphism(unittest.TestCase):
     def test_law_table_speaks_the_real_op_vocabulary(self):
         from backend.arch.ops import OP_REGISTRY
         for name in layout.HOMOMORPHISM_REGISTRY:
-            if name != "carry":
-                self.assertIn(name, OP_REGISTRY,
-                              f"law keyed to unknown op {name!r}")
+            self.assertIn(name, OP_REGISTRY,
+                          f"law keyed to unknown op {name!r}")
 
     def test_linear_requires_bias_absent(self):
         # Real arity: the weight is an implicit parameter, not a data

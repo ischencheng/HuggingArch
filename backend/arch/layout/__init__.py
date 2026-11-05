@@ -11,7 +11,7 @@ from .value import (Complete, Partial, UnknownValue, ValueProvenance, COMPLETE,
                     SUM, MAX, ONLINE_ATTENTION, PENDING_MERGE_KINDS, PAYLOAD_SCHEMAS,
                     join_orthogonal_partials)
 from .workload import ExpectedRoutedLoad
-from .foldlaw import (ReductionHomomorphism, HOMOMORPHISM_REGISTRY, PARTIAL_PRESERVING_VIEW_OPS, may_defer_reduction, GROUP_INVARIANT,
+from .foldlaw import (ReductionHomomorphism, HOMOMORPHISM_REGISTRY, may_defer_reduction, GROUP_INVARIANT,
                       PARTITION_OF_UNITY, INDEX_EQUIVARIANT, CONSTANT,
                       ANY_REDUCER, ALL_INPUT_SLOTS)
 from .axis_use import (AxisUse, AXIS_USE, custom_axis_use, GEOMETRY_OPS,
@@ -39,7 +39,6 @@ __all__ = [
                      "INDEX_EQUIVARIANT",
                      "MAX",
                      "ONLINE_ATTENTION",
-                     "PARTIAL_PRESERVING_VIEW_OPS",
                      "PARTITION_OF_UNITY",
                      "PAYLOAD_SCHEMAS",
                      "PENDING_MERGE_KINDS",
