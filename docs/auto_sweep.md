@@ -72,7 +72,7 @@ The engine provides:
 |---|---|
 | `Cell(walk, points)` | One walk's picklable arguments and the coordinates substituted into it |
 | `walk_cells` | Maps a walk over cells: across the process pool (`pool.map_cells`) or through a caller's mapper |
-| `compile_law` / `evaluate` | The one compiler of law text: exact (`Fraction` until a float enters), CSE over whole laws, `Piecewise`-aware |
+| `compile_law` / `evaluate` | The one compiler of law text: exact (`Fraction` until a float enters), CSE over whole laws and ordered graph assignments, `Piecewise`-aware |
 | `PointMeasure` | One phase of one point before measurement: per row its key or why it has none, its launches, its label and reason; the phase's formula; the selection context |
 | `sweep_keys` / `look_up` | The union of every point's keys, and the one lookup over it |
 | `MeasuredFormula` | The measured total Σ w_k·n_k·T_k as law text, plus which terms cost nothing |
@@ -434,7 +434,7 @@ list.
 | Response | Fields |
 |---|---|
 | `/inference/estimate` `phases.<phase>` | `t_measured_s` (null unless complete), `coverage`, and the older `measured_rows` / `total_rows` (the page falls back to these, with no states, when `coverage` is absent) |
-| `/inference/estimate-sweep`, each point's `phases.<phase>` | The same |
+| `/inference/estimate-sweep`, each point's `phases.<phase>` | The same after a measured fold; its SOL projection carries no breakdown row counts |
 | `/inference/estimate-parallel-sweep`, each chart point | `<phase>_tps_per_gpu_measured`, `<phase>_t_measured_s` (null unless complete), `<phase>_measured_coverage` |
 | `/gallery/frontier`, each model | `frontier_measured` (through fully measured points only), `measured_track.state` (`reads` / `none` / `unavailable`) and, when it reads, `measured_track.coverage` per context (points, complete points, best and median share, keys most needed per state) |
 | Per-op rows (`per_op_timing*`, `phases.<phase>.flops_by_module`) | `t_measured_s` (`0` on zero-cost rows, null where not measured), `measured_state`, `measured_key` |
@@ -446,12 +446,18 @@ list.
 Each tier has the invalidation its data needs.
 
 1. **Canonical law records** (`inference/sol_law.py`, schema
-   `serving-law-v2`, `sol_data.walkRecordSchema`) are the only SOL artifact
+   `serving-law-v4`, `sol_data.walkRecordSchema`) are the only SOL artifact
    shared across surfaces. A record holds one layout's phase laws as a CSE
    formula graph over workload and card symbols (`sol_law.LawGraph`), its
    collective signatures, and compact capacity facts per card and context. It
    holds no expanded points, per-op breakdown, module table or response
-   payload. A law's terms are the rows of one walk, and which rows exist
+   payload. A reader compiles each CSE graph into one ordered assignment
+   program in-process, keyed by the graph's law content, so a public point
+   never re-parses SymPy per definition. `_capacity_preparation` itself reads
+   the resident-weight ledger and returns a refused preparation when a rank
+   cannot load its weights; estimate and canonical-law consumers therefore walk
+   no phase rows, and no caller divides checkpoint bytes by a parallel world.
+   A law's terms are the rows of one walk, and which rows exist
    depends on the card's walk class (§4), so a record belongs to one class:
    it names the card it was walked on (`walked_on`), and records live in the
    SOL pool (§8.2) under one identity per model **and walk class**
@@ -512,13 +518,15 @@ reads:
 3. **finish** — `assemble` (the one lookup and the fold, on a private copy,
    for a measured answer; none for a SOL answer), then store the SOL answer.
 
-A cell is projected from a canonical record only when the request is the
-record's anchor: a SOL request, contexts on the serving grid
-(`sol_data.servingContexts`), no cached prefix, verify width 1, prefill batch
-1, the producer's workload facts and the default floors, and (for the
-parallel sweep) each card's own capacity batch. Anything else — another
-precision or framework, paired prefill batching, a non-canonical layout, a
-measured request — runs its own cell. A spec refined while the cells ran
+A cell is projected from a canonical record only when `PublicServingLawRequest`
+says the record owns the question: the producer's `ServingWalkFacts`, the
+request's card class and layout, and contexts on the serving grid
+(`sol_data.servingContexts`), with no measurement scope. Floors, decode and
+prefill batches, cached prefix and verify width are law inputs, not cache
+axes. A different HBM budget changes `ServingWalkFacts` and walks its own
+record; a non-canonical layout or measured request runs its own cell. The
+direct estimate and the StepLaw projection leave through the one serving point
+view (`serving_view.servingLawPointView`). A spec refined while the cells ran
 stores and serves nothing (`ensure_spec_generation`).
 
 ### 7.4 Resumable steps
@@ -578,10 +586,10 @@ layout) rather than parsing a bundle; the manifest carries the bundle's plan
 `sol_data.walkManifestIsValid` checks before any record is read. Law records
 are small enough that a further compression layer would cost more than it
 saves. Formulas and keys serialize as plain JSON (law text read back through
-`law_text`), never pickle.
+`law_text`), never pickle or generated program source.
 
 In production the pool lives on the persistent volume. Each engine version has
-a small Storage index (`serving-law-v2/<engine>/index.json`); it names one
+a small Storage index (`serving-law-v4/<engine>/index.json`); it names one
 immutable, digest-addressed archive. `backend.sol_pool_artifact` reads that
 index at container start, downloads the archive it names and verifies its
 SHA-256. An absent index is not an error (the runtime warm builds the pool),
@@ -598,6 +606,11 @@ measured views are folded live and are deliberately excluded.
 `scripts.publish_gallery_cache.publish` is that layer's publisher. A new
 deterministic artifact clears stale machine-local measured views before
 merging its entries; runtime warm can then add more entries beside them.
+
+Gallery and Scaling project a serving-law record in-process. The compiled CSE
+graph is memoized by its law content for the process's lifetime; there is no
+durable projection cache or remote tier. Only the serving-law pool above is
+bootstrapped as an immutable artifact.
 
 ### 8.3 Runtime warm
 

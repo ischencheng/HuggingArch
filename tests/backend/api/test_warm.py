@@ -187,10 +187,11 @@ def test_entry_point_binds_cache_dirs_from_dotenv(tmp_path):
     sweep = tmp_path / "from-dotenv-sweep"
     (tmp_path / ".env").write_text(
         f"HA_GALLERY_CACHE_DIR={gallery}\n"
-        f"HA_SOL_POOL_DIR={sol}\nHA_SWEEP_CACHE_DIR={sweep}\n")
+        f"HA_SOL_POOL_DIR={sol}\n"
+        f"HA_SWEEP_CACHE_DIR={sweep}\n")
     env = {k: v for k, v in os.environ.items()
            if k not in ("HA_GALLERY_CACHE_DIR", "HA_SOL_POOL_DIR",
-                        "HA_SWEEP_CACHE_DIR",
+                       "HA_SWEEP_CACHE_DIR",
                         "PYTEST_CURRENT_TEST")}
     env["PYTHONPATH"] = str(repo)
     out = subprocess.run(

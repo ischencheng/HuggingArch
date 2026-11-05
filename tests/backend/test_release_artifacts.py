@@ -19,10 +19,10 @@ def _failing(code, body):
     return request
 
 
-@pytest.mark.parametrize("pinned", ["", "serving-law-v2/e/a.tar.gz"])
+@pytest.mark.parametrize("pinned", ["", "serving-law-v3/e/a.tar.gz"])
 def test_a_missing_object_is_absent_not_an_error(pinned):
     assert artifact_to_pull(
-        pinned, "serving-law-v2/e/index.json", "e", "https://s", "k",
+        pinned, "serving-law-v3/e/index.json", "e", "https://s", "k",
         "sol-pool", 30, _failing(*SUPABASE_MISSING)) is None
 
 

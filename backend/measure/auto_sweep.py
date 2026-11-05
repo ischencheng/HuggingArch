@@ -38,8 +38,8 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, replace
-from typing import (Any, Callable, ClassVar, Dict, Iterable, List, Mapping, Optional, Sequence,
-                    Tuple)
+from typing import (Any, Callable, ClassVar, Dict, Iterable,
+                    List, Mapping, Optional, Sequence, Tuple)
 
 import sympy as sp
 
@@ -258,7 +258,8 @@ class _ExactPrinter(LambdaPrinter):
         # The quotient is taken only where its divisor is not zero.
         condition, empty, part, whole = expr.args
         return (f"(({self._print(empty)}) if ({self._print(condition)}) "
-                f"else (({self._print(part)}) / ({self._print(whole)})))")
+                f"else (_law_div({self._print(part)}, "
+                f"{self._print(whole)})))")
 
 
 def _each_law_once(exprs: Sequence[Any]
@@ -304,8 +305,26 @@ def compile_law(exprs: Sequence[Any], names: Tuple[str, ...]
                          f"(it binds {sorted(names)})")
     return sp.lambdify([by_name.get(n, sp.Symbol(n)) for n in names],
                        list(exprs),
-                       modules=[{"math": math, "Fraction": Fraction}],
-                       printer=_ExactPrinter, cse=_each_law_once)
+                       modules=[{"math": math, "Fraction": Fraction,
+                                 "_law_div": exact_div}],
+                       printer=_ExactPrinter,
+                       cse=_each_law_once)
+
+
+def exact_div(part: Any, whole: Any) -> Any:
+    """A quotient of two whole numbers stays exact in compiled law text.
+
+    Python's ``/`` always makes a float, even for ``int / int``; a law's
+    `Quotient` is exact until a card's float rate enters it, like every other
+    rational in the law language.
+    """
+    if isinstance(part, int) and isinstance(whole, int):
+        return Fraction(part, whole)
+    return part / whole
+
+
+# Compatibility for readers that learned the runtime helper by its old name.
+_exact_div = exact_div
 
 
 def evaluate(text: str, binding: Mapping[str, Any]) -> Any:

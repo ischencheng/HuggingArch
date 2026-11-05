@@ -384,6 +384,10 @@ class _CapacityPreparation:
     # The speculative draft this decode step counts, or None for the verify
     # forward alone (`speculative_draft.SpeculativeDraft`).
     draft: Optional[SpeculativeDraft] = None
+    #: Why this preparation's weights cannot load, or None when they can. The
+    #: preparation owns the refusal, so every estimate consumer refuses before
+    #: a phase walk instead of remembering a separate preflight.
+    refusal_reason: Optional[str] = None
     #: The walks every step of this preparation shares, across all the
     #: points of a sweep (`step_eval.StepCells`).
     cells: StepCells = field(default_factory=StepCells)
@@ -1368,6 +1372,58 @@ def _model_cells(resolved: Any, parallel: ParallelConfig,
             CellBasis(shared.resolved, parallel, precision, shared.cells)))
 
 
+@dataclass(frozen=True)
+class _CapacityInput:
+    """The deployment facts every capacity question starts from."""
+
+    card: Card
+    resolved: Any
+    parallel: ParallelConfig
+    precision: PrecisionProfile
+
+
+def _capacity_input(*, config: dict, gpu_sku: str,
+                    knobs: CapacityKnobs) -> _CapacityInput:
+    """Resolve the one card/spec/mesh/precision context a caller names."""
+    card = Card.of(gpu_sku)
+    if not 0.1 <= knobs.gpu_memory_fraction <= 1.0:
+        raise ValueError("gpu_memory_fraction must be in [0.1, 1.0]")
+
+    resolved = knobs.resolved
+    if resolved is None:
+        resolved = get_default_loader().match(config, model_id=knobs.model_id)
+    if resolved is None:
+        raise ValueError(
+            f"No spec matches {knobs.model_id!r}. "
+            "Add a spec in backend/arch/models/ or run /generate-spec first.")
+
+    parallel = (knobs.parallel or ParallelConfig()).for_program(
+        Program.of(resolved))
+    errs = parallel.validate()
+    if errs:
+        raise ValueError("; ".join(errs))
+    precision = (knobs.precision
+                 if isinstance(knobs.precision, PrecisionProfile)
+                 else PrecisionProfile.from_request(knobs.precision))
+    return _CapacityInput(card, resolved, parallel, precision)
+
+
+def _weight_overflow_reason(*, gpu: Any, weight_bytes: float,
+                            usable_bytes: float, static_bytes: float,
+                            constant_state_bytes: float) -> str:
+    """The one sentence a rank whose weights cannot load is refused with."""
+    static = (f" + KV static ({static_bytes / _GB:.2f} GiB)"
+              if static_bytes > 0 else "")
+    constant = (f" + recurrent state ({constant_state_bytes / _GB:.2f} GiB)"
+                if constant_state_bytes > 0 else "")
+    return (
+        f"weights ({weight_bytes / _GB:.2f} GiB){static}{constant} exceed "
+        f"usable HBM "
+        f"({usable_bytes / _GB:.2f} GiB) on {gpu.sku} at this parallel config. "
+        "Raise TP/EP or use a smaller-weight model."
+    )
+
+
 @stage_context("preparation")
 def _capacity_preparation(
     *,
@@ -1396,38 +1452,14 @@ def _capacity_preparation(
     tensor_patterns_meta = knobs.tensor_patterns_meta
     published_weight_bytes = knobs.published_weight_bytes
 
-    # The card this preparation is built on, refused before the spec
-    # resolve below (`Card.of`: an unknown SKU, or one the sheet lists no
-    # HBM for). Its price reaches the preparation's fields the one way a
-    # card ever does (`_preparation_fields`, below) — the same way a
-    # prepared walk reaches another card of this card's class
-    # (`_restamp_gpu`).
-    card = Card.of(gpu_sku)
-    if not 0.1 <= gpu_memory_fraction <= 1.0:
-        raise ValueError("gpu_memory_fraction must be in [0.1, 1.0]")
-
-    # Single spec resolve — shared between kv_cache and weight_breakdown.
-    # VLM text_config unwrapping happens once, in the spec yaml's `dims:`
-    # binding. Matching is a single entry point: a caller that already
-    # resolved the spec passes it in, and capacity never re-matches; only
-    # a bare `model_id` caller resolves here.
-    resolved = knobs.resolved
-    if resolved is None:
-        resolved = get_default_loader().match(config, model_id=knobs.model_id)
-    if resolved is None:
-        raise ValueError(
-            f"No spec matches {knobs.model_id!r}. "
-            "Add a spec in backend/arch/models/ or run /generate-spec first."
-        )
-
-    # The mesh the model runs: a region it has no node in spans no ranks
-    # (`ParallelConfig.for_program`), so a dense model is never refused for
-    # an expert mesh it does not have.
-    parallel = (knobs.parallel or ParallelConfig()).for_program(
-        Program.of(resolved))
-    errs = parallel.validate()
-    if errs:
-        raise ValueError("; ".join(errs))
+    # One card/spec/mesh/precision context, shared with the weights preflight:
+    # neither path can admit a deployment the other refuses. The card's price
+    # reaches this preparation through `_preparation_fields` below.
+    capacity_input = _capacity_input(config=config, gpu_sku=gpu_sku,
+                                     knobs=knobs)
+    card, resolved, parallel, precision = (
+        capacity_input.card, capacity_input.resolved, capacity_input.parallel,
+        capacity_input.precision)
 
     # The GPU count is the mesh's rank count; nothing is priced off a count
     # stated beside it. The request boundary refuses a stated count that
@@ -1436,9 +1468,6 @@ def _capacity_preparation(
     cluster_size = parallel.cluster_size
     num_gpus = cluster_size
 
-    precision = (knobs.precision
-                 if isinstance(knobs.precision, PrecisionProfile)
-                 else PrecisionProfile.from_request(knobs.precision))
     # The walks this preparation's steps share — every point of a sweep
     # reads the same ones, and so does every later request of the same
     # model, deployment and precision (`_model_cells`).
@@ -1644,9 +1673,6 @@ def _capacity_preparation(
         kv_static_per_rank = chosen.static
         kv_constant_state_per_rank = chosen.constant_state
 
-    # The tree is built for the stage the numbers beside it describe.
-    wb = _weight_tree(pp_stage)
-
     weight_bytes_per_rank = (
         pp_bound.weight_bytes if pp_bound is not None
         else _resident()
@@ -1660,6 +1686,81 @@ def _capacity_preparation(
         weight_bytes_per_rank=weight_bytes_per_rank,
         static=kv_static_per_rank,
         constant_state=kv_constant_state_per_rank)
+    refusal_reason = (
+        None if card_fields["fits"] else _weight_overflow_reason(
+            gpu=card, weight_bytes=weight_bytes_per_rank,
+            usable_bytes=price.usable_bytes,
+            static_bytes=kv_static_per_rank,
+            constant_state_bytes=kv_constant_state_per_rank))
+
+    if refusal_reason is not None:
+        # A rank that cannot load its weights has no display tree to build and
+        # no phase rows to walk. Keep the budget facts already read — enough
+        # for every ceiling and the no-step response — and return here.
+        wb = {
+            "total_bytes_per_rank": weight_bytes_per_rank,
+            "deployment_total_bytes": weight_bytes_total,
+            "deployment_data_bytes": weight_bytes_total,
+            "deployment_scale_bytes": 0.0,
+            "unattributed_scale_bytes": 0.0,
+            "pipeline": {"stage": pp_stage},
+            "published_checkpoint_bytes": published_weight_bytes,
+            "left_out_stacks": [],
+            "groups": [],
+            "model_level": [],
+        }
+        return _CapacityPreparation(
+            **card_fields,
+            cluster_size=cluster_size, num_gpus=num_gpus,
+            parallel=parallel,
+            gpu_memory_fraction=gpu_memory_fraction,
+            model_id=knobs.model_id,
+            resolved=resolved,
+            precision=precision,
+            resolved_precision=resolved_precision,
+            precision_report=analysis.precision_effective(),
+            kv_div=kv_div,
+            kv_reader=kv_reader,
+            kv_static_per_rank=kv_static_per_rank,
+            kv_constant_state_per_rank=kv_constant_state_per_rank,
+            per_token_per_rank=per_token_per_rank,
+            wb=wb,
+            weight_tree_at=lambda _stage=None: wb,
+            weight_bytes_per_rank=weight_bytes_per_rank,
+            weight_bytes_total=weight_bytes_total,
+            host_offload_bytes=host_offload_bytes,
+            host_offload=knobs.host_offload,
+            pp_stages=pp_stages,
+            pp_bound=pp_bound,
+            unique_tokens_multiplier=(
+                parallel.dp_attention * parallel.dp_replicas),
+            kv_replication_factor=kv_replication_factor,
+            comm_latency_s=knobs.comm_latency_us * 1e-6,
+            launch_floor_s=knobs.launch_floor_us * 1e-6,
+            roles_present=[],
+            shape_warnings=[],
+            max_context=max_context,
+            framework=fw,
+            framework_binding=framework_binding,
+            measurement_scope=knobs.measurement_scope or NO_MEASUREMENTS,
+            calibration_rows=knobs.calibration_rows,
+            strategy=strategy,
+            enable_measured_lookup=enable_measured_lookup,
+            selection_mode=knobs.selection_mode,
+            kernel_mix=knobs.kernel_mix,
+            kv_block_size=deployment_kv_block_size(
+                framework_binding, knobs.kv_block_size),
+            s_prefix_cached=knobs.s_prefix_cached,
+            s_verify=knobs.s_verify,
+            acceptance_rate=knobs.acceptance_rate,
+            ep_load_factor=knobs.ep_load_factor,
+            draft=draft,
+            refusal_reason=refusal_reason,
+            cells=cells,
+        )
+
+    # The tree is built for the stage the numbers beside it describe.
+    wb = _weight_tree(pp_stage)
 
     # Unique-token multiplier for cluster-level totals (see estimate_capacity
     # docstring).
@@ -1729,6 +1830,7 @@ def _capacity_preparation(
         acceptance_rate=knobs.acceptance_rate,
         ep_load_factor=knobs.ep_load_factor,
         draft=draft,
+        refusal_reason=refusal_reason,
         cells=cells,
     )
 
@@ -2538,15 +2640,10 @@ def capacity_ceilings(
     if max_batch > 0:
         infeasibility_reason: Optional[str] = None
     elif not fits:
-        # A sentence the page shows as is: the static KV term only when the
-        # model has one.
-        static = (f" + KV static ({kv_static_per_rank / _GB:.2f} GiB)"
-                  if kv_static_per_rank > 0 else "")
-        infeasibility_reason = (
-            f"weights ({weight_bytes_per_rank / _GB:.2f} GiB){static} exceed usable HBM "
-            f"({usable_bytes / _GB:.2f} GiB) on {gpu.sku} at this parallel config. "
-            f"Raise TP/EP or use a smaller-weight model."
-        )
+        infeasibility_reason = _weight_overflow_reason(
+            gpu=gpu, weight_bytes=weight_bytes_per_rank,
+            usable_bytes=usable_bytes, static_bytes=kv_static_per_rank,
+            constant_state_bytes=kv_constant_state_per_rank)
     else:
         infeasibility_reason = (
             f"KV budget ({usable_for_tokens / _GB:.2f} GiB) is too small for "
@@ -3301,6 +3398,62 @@ def _capacity_pending(
     )
     prefill_chunk_schedule = prefill_chunk_schedule.with_endpoint_batch(
         eff_prefill_batch)
+
+    if p.refusal_reason is not None:
+        reason = p.refusal_reason
+
+        def refused_estimate() -> dict:
+            """The complete no-step answer; no phase walk can load its weights."""
+            phases = {
+                name: {"phase": name, "batch": None,
+                       "time_unpublished_reason": reason}
+                for name in ("prefill", "decode")
+            }
+            return without_step({
+                "gpu": gpu.to_json(),
+                "num_gpus": p.num_gpus,
+                "cluster_size": p.cluster_size,
+                "parallel": {
+                    "pp": parallel.pp, "tp_attention": parallel.tp_attention,
+                    "tp_dense_ffn": parallel.tp_dense_ffn,
+                    "tp_moe_expert": parallel.tp_moe_expert,
+                    "ep_moe": parallel.ep_moe, "cp": parallel.cp,
+                    "dp_attention": parallel.dp_attention,
+                    "dp_replicas": parallel.dp_replicas,
+                },
+                "gpu_memory_fraction": p.gpu_memory_fraction,
+                "weight_bytes_total": weight_bytes_total,
+                "avg_output_tokens": avg_output_tokens,
+                **_capacity_fields(
+                    p, _c, wb, avg_input_tokens=avg_input_tokens),
+                "peak_flops_per_sec": p.peak_flops,
+                "peak_source": p.peak_source_s,
+                "peak_hbm_bw_bytes_per_sec": p.peak_bw,
+                "unique_tokens_multiplier": p.unique_tokens_multiplier,
+                "kv_replication_factor": p.kv_replication_factor,
+                "phases": phases,
+                "weight_breakdown": wb,
+                "precision": p.precision_report,
+                "parallel_warnings": wb.get("parallel_warnings", []),
+                "assumptions": [],
+                "roles_present": p.roles_present,
+                "moe_enabled": Program.of(p.resolved).has_dispatch_zone,
+                "shape_warnings": p.shape_warnings,
+                "max_context_tokens": p.max_context,
+            }, ())
+
+        return PendingEstimate(
+            scope=p.measurement_scope,
+            calibration_rows=p.calibration_rows,
+            reads=p.enable_measured_lookup,
+            walks=(),
+            finish=refused_estimate,
+            ceilings=_c,
+            walked_on=p.card,
+            selection_mode=p.selection_mode,
+            kernel_mix=p.kernel_mix,
+            preparation=p,
+            prefill_chunk_schedule=prefill_chunk_schedule)
 
     # The two steps this estimate describes, each evaluated ONCE. Everything
     # below is a view: the phase table folds them by module, the per-op rows

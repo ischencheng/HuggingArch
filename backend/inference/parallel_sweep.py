@@ -52,6 +52,7 @@ from .frontier import POINT_DIMS, PointDim, frontier_view
 from .point_cloud import parallel_cloud, point_coordinates
 from .gpu_specs import get_gpu, gpus_per_node, hbm_bytes
 from .prefill_geometry import PrefillEndpointGeometry, PrefillChunkSchedule
+from .serving_view import servingLawPointView
 from .sweep_grid import (FRONTIER_MAX_GPUS, GALLERY_GPUS,
                          SCALING_DECODE_LADDER, SWEEP_MAX_GPUS)
 from backend.measure.lookup import MeasurementsUnavailable
@@ -544,6 +545,14 @@ def _estimate_layout(payload: Dict[str, Any]) -> Dict[str, dict]:
             ceilings = capacity_ceilings(
                 p, avg_input_tokens=avg_in, avg_output_tokens=avg_out,
                 prefill_chunk_schedule=base_schedule)
+            if p.refusal_reason is not None:
+                pending = _capacity_pending(
+                    p, avg_input_tokens=avg_in, avg_output_tokens=avg_out,
+                    prefill_chunk_schedule=base_schedule,
+                    fold_prefill_chunks=False, breakdown=False)
+                out[sku] = {"sol": pending.finish(), "measures": {},
+                            "ladder": []}
+                continue
             walk = (klass, ceilings.pp_stage)
             if walk not in bases:
                 pending = _capacity_pending(
@@ -715,13 +724,11 @@ def run_layout_cell(cell: LayoutCell) -> Dict[str, Any]:
 
 def _chart_view(estimate: dict) -> dict:
     """What a chart point (`_point`) and its measured track
-    (`batch_sweep.apply_measured`) read of a card's estimate: everything but
-    the per-op rows and the module tables, as a response serves it
-    (`module_rows.served`)."""
-    estimate = served(estimate)
-    return {**{k: v for k, v in estimate.items() if not k.startswith("per_op_timing")},
-            "phases": {name: {k: v for k, v in (ph or {}).items() if k != "flops_by_module"}
-                       for name, ph in (estimate.get("phases") or {}).items()}}
+    (`batch_sweep.apply_measured`) read of a card's estimate: the serving
+    projection's one public point shape. A measured fold may add its measured
+    fields afterwards; the SOL projection never carries an estimate plan's
+    breakdown."""
+    return servingLawPointView(estimate)
 
 
 @dataclass(frozen=True)

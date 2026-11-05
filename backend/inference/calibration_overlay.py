@@ -863,6 +863,10 @@ class OverlayWalk:
     spec_hash: str
     pipeline_time: Optional[dict]
     want_module_rows: bool
+    #: The step whose rows `analysis` walked. The phase facts the rows do
+    # not carry (notably whether the decode MLA rebind fired) are read from
+    # here, not re-derived by a consumer.
+    step_eval: Any = None
 
     def finish(self) -> tuple:
         """``(per_op_timing, fusion_delta, has_dispatch_zone, module_rows,
@@ -1062,4 +1066,5 @@ def overlay_walk(
         analysis=analysis, workload=workload, deployment=deployment,
         model_id=model_id, spec_hash=resolved.identity_hash(),
         pipeline_time=pipeline_time,
-        want_module_rows=want_module_rows and breakdown)
+        want_module_rows=want_module_rows and breakdown,
+        step_eval=step_eval)

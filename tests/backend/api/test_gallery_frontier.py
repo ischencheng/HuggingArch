@@ -364,6 +364,30 @@ def test_a_speculative_view_is_its_own_request_but_not_its_own_entry():
             != k2.key_parts())
     # Acceptance is not a key under plain decode.
     assert f.FrontierView("B200", acceptance_rate=0.6).key_parts() == plain.key_parts()
+        # One entry serves every K and acceptance, keyed by its floors.
+    assert (plain.entry_parts() == k2.entry_parts() == f.FrontierView(
+        "B200", draft_tokens=3, acceptance_rate=0.6).entry_parts())
+    floored = f.FrontierView("B200", comm_latency_us=5.0)
+    fraction = f.FrontierView("B200", gpu_memory_fraction=.8)
+    assert not fraction.keeps_walk()
+    assert floored.entry_parts() != plain.entry_parts()
+    assert floored.entry_parts() != f.FrontierView(
+        "B200", launch_floor_us=9.0, draft_tokens=2).entry_parts()
+
+
+def test_a_serving_entry_draws_each_k_off_its_kept_step_time():
+    """A serving entry's point keeps every K's step total (`draftTimes`),
+    not a form: a K view reads it and keeps 1 + α·K tokens of it."""
+    sk = str(GALLERY_SEQ_LENS[0])
+    item = _timed_item(sk)
+    item.pop("floors"), item.pop("draft")
+    item["draftTimes"] = {"2": 0.016}
+    view = f.FrontierView("B200", draft_tokens=2, acceptance_rate=0.5)
+    dec = f._at_view(item, view)["sol"]["phases"]["decode"]
+    assert dec["t_sol_s"] == 0.016
+    assert dec["throughput"]["sol"]["time_per_output_token_s"] == 0.016 / 2
+    assert f._at_view(item, f.FrontierView("B200", draft_tokens=1)) is None
+    assert f._at_view(item, f.FrontierView("B200")) is item
 
 
 def test_the_route_refuses_a_draft_length_off_the_pickers(monkeypatch):

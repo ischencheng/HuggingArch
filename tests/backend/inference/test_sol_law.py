@@ -12,6 +12,7 @@ from backend.inference.capacity import (
     CapacityKnobs,
     _capacity_pending,
     _capacity_preparation,
+    finish_estimates,
 )
 from backend.inference.card import Card
 from backend.inference.defaults import (
@@ -22,6 +23,8 @@ from backend.inference.parallel_config import ParallelConfig
 from backend.inference.sol_law import (
     LawGraph,
     cardBinding,
+    draftForwardsLaw,
+    servingLawPoints,
     servingLawPoint,
     servingLawRecord,
 )
@@ -55,10 +58,11 @@ def _direct(environment, *, context: int, batch: int):
     preparation = _capacity_preparation(
         config=environment["config"], gpu_sku=environment["gpu_sku"],
         knobs=knobs)
-    return _capacity_pending(
+    pending = _capacity_pending(
         preparation, avg_input_tokens=context, avg_output_tokens=256,
         prefill_batch_override=1, decode_batch_override=batch,
-        breakdown=False, fold_prefill_chunks=False).finish()
+        breakdown=False, fold_prefill_chunks=False)
+    return finish_estimates([pending])[0]
 
 
 def test_one_law_substitutes_every_point_without_breakdown():
@@ -107,6 +111,30 @@ def test_one_law_substitutes_every_point_without_breakdown():
         _direct(h200, context=8192, batch=8)["max_decode_batch_per_gpu"])
     assert served["phases"]["decode"]["throughput"]["sol"]["per_gpu"] == (
         _direct(h200, context=8192, batch=8)["phases"]["decode"]["throughput"]["sol"]["per_gpu"])
+
+
+def test_a_point_grid_is_the_same_point_projection_read_once():
+    """The grid shares the card, capacity and prefill read, not a second law."""
+    environment = _environment()
+    parallel = ParallelConfig(tp_attention=2, tp_dense_ffn=2,
+                              tp_moe_expert=2)
+    record = servingLawRecord(
+        environment, gpu_sku="H100-SXM", anchorContext=4096,
+        outputTokens=256, parallel=parallel,
+        capacityCards=("H100-SXM", "H200"), capacityContexts=(8192,))
+    grid = servingLawPoints(
+        record, card=Card.of("H200"), contexts=(8192,),
+        decodeBatches=(1, 8, None), outputTokens=256,
+        comm_latency_us=COMM_LATENCY_US_DEFAULT,
+        launch_floor_us=LAUNCH_FLOOR_US_DEFAULT)
+    oneAtATime = [
+        servingLawPoint(
+            record, card=Card.of("H200"), context=8192, outputTokens=256,
+            decodeBatch=batch, comm_latency_us=COMM_LATENCY_US_DEFAULT,
+            launch_floor_us=LAUNCH_FLOOR_US_DEFAULT)
+        for batch in (1, 8, None)
+    ]
+    assert grid == [oneAtATime]
 
 
 def test_a_law_binds_no_card_of_another_walk_class():
@@ -158,6 +186,8 @@ def test_cse_keeps_an_as_written_extremum_over_cases():
     request = InferenceEstimateRequest(
         model_id=DRAFT_MODEL,
         gpu_sku="RTX-4090",
+        parallel=ParallelConfig(
+            tp_attention=32, tp_dense_ffn=32, tp_moe_expert=32).to_dict(),
         precision={"canonical": AS_SHIPPED.canonical()},
         avg_input_tokens=1024,
         avg_output_tokens=256,
@@ -167,14 +197,21 @@ def test_cse_keeps_an_as_written_extremum_over_cases():
         selection_mode="theoretical_only",
     )
     environment = resolve_estimate_environment(request)
+    parallel = ParallelConfig.from_dict(request.parallel)
     record = servingLawRecord(
         environment, gpu_sku="RTX-4090", anchorContext=1024,
-        outputTokens=256, parallel=ParallelConfig(),
-        capacityCards=("RTX-4090",), capacityContexts=(1024,))
+        outputTokens=256, parallel=parallel,
+        capacityCards=("RTX-4090",), capacityContexts=(1024,),
+        draft_forwards=draftForwardsLaw)
+    law = record["phases"]["decode"]["law"]
+    assert law["definitions"]
+    assert "program" not in law
     encoded = json.dumps(record, separators=(",", ":"))
     assert "law_inert_extremum" not in encoded
+    with pytest.raises(ValueError, match="law text only"):
+        LawGraph.from_json({**law, "program": "def forbidden(): pass"})
 
-    graph = LawGraph.from_json(record["phases"]["decode"]["law"])
+    graph = LawGraph.from_json(law)
     binding = cardBinding(
         record, Card.of("RTX-4090"), comm_latency_us=COMM_LATENCY_US_DEFAULT,
         launch_floor_us=LAUNCH_FLOOR_US_DEFAULT)
@@ -182,6 +219,53 @@ def test_cse_keeps_an_as_written_extremum_over_cases():
                              "s_output": 256, "s_prefix": 0, "s_verify": 2,
                              "rho": 0.8})
     assert 0 < answer["t_sol_s"] < 1
+    for batch in (1, None):
+        expected = servingLawPoint(
+                record, card=Card.of("RTX-4090"), context=1024,
+                outputTokens=256, decodeBatch=batch, prefillBatch=1,
+                verifyWidth=2, draftTokens=1, acceptanceRate=.8,
+                comm_latency_us=COMM_LATENCY_US_DEFAULT,
+                launch_floor_us=LAUNCH_FLOOR_US_DEFAULT)
+        other = servingLawPoint(
+                record, card=Card.of("RTX-4090"), context=1024,
+                outputTokens=256, decodeBatch=batch, prefillBatch=1,
+                verifyWidth=2, draftTokens=1, acceptanceRate=.6,
+                comm_latency_us=COMM_LATENCY_US_DEFAULT,
+                launch_floor_us=LAUNCH_FLOOR_US_DEFAULT)
+        assert (other["phases"]["decode"]["t_sol_s"]
+                == expected["phases"]["decode"]["t_sol_s"])
+        assert (other["phases"]["decode"]["throughput"]["sol"]["per_gpu"]
+                != expected["phases"]["decode"]["throughput"]["sol"]["per_gpu"])
+
+
+def test_draft_rows_enter_the_collective_sidecar(monkeypatch):
+    """A draft term's collectives are facts of the phase it was summed into."""
+    import types
+    import backend.inference.sol_law as sol_law
+
+    main = {"main": True}
+    draft = {"draft": True}
+    seen = []
+
+    class Step:
+        terms = ()
+
+        def law(self, _name):
+            return 0
+
+    monkeypatch.setattr(
+        sol_law.StepSum, "of",
+        lambda *rows, **_kwargs: Step())
+    monkeypatch.setattr(
+        sol_law.LawGraph, "of",
+        lambda *_exprs: types.SimpleNamespace(to_json=dict))
+    monkeypatch.setattr(
+        sol_law, "_collectives",
+        lambda rows: seen.append(tuple(rows)) or ())
+
+    phase = sol_law._phase([main], draft_rows=[draft])
+    assert phase["collectives"] == []
+    assert seen == [(main, draft)]
 
 
 def test_lifting_substitutes_card_symbols_without_ordering_extremum_arms():
@@ -191,6 +275,8 @@ def test_lifting_substitutes_card_symbols_without_ordering_extremum_arms():
     request = InferenceEstimateRequest(
         model_id=NESTED_EXTREMUM_MODEL,
         gpu_sku="H100-SXM",
+        parallel=ParallelConfig(
+            tp_attention=4, tp_dense_ffn=4, tp_moe_expert=4).to_dict(),
         precision={"canonical": AS_SHIPPED.canonical()},
         avg_input_tokens=1024,
         avg_output_tokens=256,
@@ -198,7 +284,9 @@ def test_lifting_substitutes_card_symbols_without_ordering_extremum_arms():
     )
     record = servingLawRecord(
         resolve_estimate_environment(request), gpu_sku="H100-SXM",
-        anchorContext=1024, outputTokens=256, parallel=ParallelConfig(),
+        anchorContext=1024, outputTokens=256,
+        parallel=ParallelConfig(
+            tp_attention=4, tp_dense_ffn=4, tp_moe_expert=4),
         capacityCards=("H100-SXM",), capacityContexts=(1024,))
     graph = LawGraph.from_json(record["phases"]["prefill"]["law"])
     binding = cardBinding(

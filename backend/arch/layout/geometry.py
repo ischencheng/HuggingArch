@@ -16,6 +16,7 @@ from backend.arch.eval.dim import (
     same_law,
     value_of,
 )
+from backend.arch.eval.refusal import LayoutRefusal
 
 from .attention import AttentionForm
 from .edge import EdgeState
@@ -588,7 +589,7 @@ def sequence_window(rule: LayoutPropagation, node: Any,
             tuple(layout), state.value, state.workload,
             state.provenance)
     if not axis_fully_replicated(axis):
-        raise ValueError(
+        raise LayoutRefusal(
             f"{node.display_path}: the window's sequence axis is cut "
             f"({axis!r}); a cached tensor leaves its producer whole, so "
             "eviction is local")

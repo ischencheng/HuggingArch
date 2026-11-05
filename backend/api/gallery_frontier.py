@@ -124,24 +124,26 @@ from backend.inference.sweep_grid import (
     SWEEP_MAX_GPUS,
 )
 from backend.inference.sol_data import (
+    StepLawKey,
+    ServingWalkFacts,
+    ServingWalkKey,
     capacityBatchPoint,
-    layoutRecordName,
-    producerWalkFacts,
-    servingWalkIdentity,
     walkManifestIsValid,
     walkRecordSchema,
 )
 from backend.inference.sol_data import sharedSolPool
 from backend.inference.sol_law import (
-    LawGraph,
-    cardBinding,
     draftForwardsLaw,
     servingLawCapacity,
-    servingLawPoint,
+    servingLawPoints,
     servingLawRecord,
 )
 from backend.inference.point_cloud import (CloudRecord, point_coordinates,
                                            produce_cloud)
+from backend.inference.serving_projection import (
+    PublicServingLawRequest,
+    projectServingLawPoints,
+)
 from backend.measure.scope import NONE as NO_MEASUREMENTS, of_render
 
 logger = logging.getLogger(__name__)
@@ -155,7 +157,7 @@ pareto_front = _pareto_front
 # version): the entry's two parts, and what views read off them (the
 # measured rates and a drawn view). A drawing's fields change without the
 # entry's, and an entry is priced again only when its own do.
-_FRONTIER_SCHEMA = "gallery-frontier-v9"
+_FRONTIER_SCHEMA = "gallery-frontier-v11"
 _DRAWING_SCHEMA = "gallery-frontier-drawing-v3"
 _GALLERY_SELECTION = "envelope"
 #: The precision profile every frontier is priced under: as shipped.
@@ -192,7 +194,41 @@ class FrontierView(NamedTuple):
         (`_Stored.walk_identity`): at the default HBM fraction. Each card's
         ceiling batch is walked on that card at that fraction, so a view at
         another walks its own card alone (`walk_cards`), kept nowhere."""
-        return float(self.gpu_memory_fraction) == GPU_MEMORY_FRACTION_DEFAULT
+        return (float(self.gpu_memory_fraction)
+                == ServingWalkFacts.producer().gpu_memory_fraction)
+
+    def _servingLawEnvironment(self) -> dict[str, Any]:
+        return {
+            **ServingWalkFacts.producer().to_environment(),
+            "gpu_memory_fraction": self.gpu_memory_fraction,
+            "comm_latency_us": self.comm_latency_us,
+            "launch_floor_us": self.launch_floor_us,
+        }
+
+    def _servingLawAxes(self, *, draft_tokens: int = 0) -> dict[str, Any]:
+        batches = tuple(
+            point["decode_batch_size"] for point in FRONTIER_BATCH_GRID)
+        return {
+            "contexts": tuple(GALLERY_SEQ_LENS),
+            "decode_batches": batches,
+            "prefill_batches": (1,) * len(batches),
+            "prefix_tokens": (0,) * len(GALLERY_SEQ_LENS),
+            "verify_widths": (1 + int(draft_tokens),)
+            * len(GALLERY_SEQ_LENS),
+        }
+
+    def servingLawRequest(self, walk: ServingWalkKey, layout: Any, *,
+                          draft_tokens: int = 0) -> PublicServingLawRequest:
+        return PublicServingLawRequest(
+            walk=walk, card=self.gpu_sku, layout=layout,
+            environment=self._servingLawEnvironment(),
+            draft_tokens=draft_tokens,
+            **self._servingLawAxes(draft_tokens=draft_tokens))
+
+    def entry_parts(self) -> List[Any]:
+        """What a model's cached entry is priced under, including its floors."""
+        return [*self.walk_parts(), float(self.comm_latency_us),
+                float(self.launch_floor_us)]
 
     def walk_cards(self) -> List[str]:
         """The cards one walk serves this view from, the walk card first:
@@ -384,16 +420,16 @@ def _layout_law(item: Tuple[str, List[str], float, dict, dict]) -> dict:
                               cfg.to_dict())
     try:
         environment = resolve_estimate_environment(request)
-        capacity = servingLawCapacity(
-            environment, gpu_sku=cards[0], parallel=cfg,
-            capacityCards=cards, capacityContexts=ROUTINE_SEQ_LENS)
-        if all(int(fact["max_decode_batch"] or 0) <= 0
-               and int(fact["max_prefill_batch"] or 0) <= 0
-               for fact in capacity):
-            return {"refused": next(
-                fact.get("infeasibility_reason") or "layout admits no request"
-                for fact in capacity)}
         if draft_refusal(model_id) is None:
+            capacity = servingLawCapacity(
+                environment, gpu_sku=cards[0], parallel=cfg,
+                capacityCards=cards, capacityContexts=ROUTINE_SEQ_LENS)
+            if all(int(fact["max_decode_batch"] or 0) <= 0
+                   and int(fact["max_prefill_batch"] or 0) <= 0
+                   for fact in capacity):
+                return {"refused": next(
+                    fact.get("infeasibility_reason")
+                    or "layout admits no request" for fact in capacity)}
             spec = request.model_copy(update={
                 "speculative_draft_tokens": 1,
                 "speculative_draft": "recursive",
@@ -406,6 +442,8 @@ def _layout_law(item: Tuple[str, List[str], float, dict, dict]) -> dict:
                 outputTokens=GALLERY_OUTPUT_TOKENS, parallel=cfg,
                 capacityCards=cards, capacityContexts=ROUTINE_SEQ_LENS,
                 draft_forwards=draftForwardsLaw)
+            if "refused" in record:
+                return record
             record["draft_capacity"] = record["capacity"]
             record["capacity"] = capacity
         else:
@@ -486,7 +524,9 @@ def _draft_walk(requests: Dict[str, InferenceEstimateSweepRequest],
     return {"ks": out}
 
 
-def _restamp_layout(walked: dict, gpu_sku: str, cfg: ParallelConfig) -> dict:
+def _restamp_layout(walked: dict, gpu_sku: str, cfg: ParallelConfig,
+                    walk_key: Optional[ServingWalkKey] = None,
+                    view: Optional[FrontierView] = None) -> dict:
     """One layout's walk (`_layout_walk`) on `gpu_sku`, one of the class's
     cards: `{"theory": [point…], "draft_errors": […]}` — each point served
     on the card, its decode step as a function of the floors there, and for
@@ -494,26 +534,39 @@ def _restamp_layout(walked: dict, gpu_sku: str, cfg: ParallelConfig) -> dict:
     the walk's refusal or error, said on this card."""
     if walked.get("schema") == walkRecordSchema:
         card = Card.of(gpu_sku)
+        view = view if view is not None else FrontierView(gpu_sku)
+
         theory: List[dict] = []
-        laws: List[dict] = [{
-            "walked_on": walked["walked_on"],
-            "law": walked["phases"]["decode"]["law"],
-            "collectives": walked["phases"]["decode"]["collectives"],
-        }]
         draftErrors: List[dict] = []
         byPoint: Dict[Tuple[str, int], dict] = {}
         label, num_gpus = layout_label(cfg), cfg.cluster_size
-        for seq in GALLERY_SEQ_LENS:
-            for batchPoint in FRONTIER_BATCH_GRID:
-                try:
-                    served = servingLawPoint(
-                        walked, card=card, context=seq,
-                        outputTokens=GALLERY_OUTPUT_TOKENS,
-                        decodeBatch=batchPoint["decode_batch_size"],
-                        prefillBatch=1,
-                        comm_latency_us=FrontierView(gpu_sku).comm_latency_us,
-                        launch_floor_us=FrontierView(gpu_sku).launch_floor_us)
-                except Exception:
+
+        def rows(record: dict, *, draft_tokens: int = 0) -> list[list[dict | None]]:
+            if walk_key is None:
+                return servingLawPoints(
+                    record, card=card, contexts=list(GALLERY_SEQ_LENS),
+                    decodeBatches=[point["decode_batch_size"]
+                                   for point in FRONTIER_BATCH_GRID],
+                    outputTokens=GALLERY_OUTPUT_TOKENS, prefillBatches=1,
+                    prefixCached=0, verifyWidth=draft_tokens + 1,
+                    draftTokens=draft_tokens,
+                    acceptanceRate=FRONTIER_ACCEPTANCE_DEFAULT,
+                    comm_latency_us=view.comm_latency_us,
+                    launch_floor_us=view.launch_floor_us,
+                    servedOnly=True)
+            request = view.servingLawRequest(
+                walk_key, record["parallel"], draft_tokens=draft_tokens)
+            return projectServingLawPoints(record, request)
+
+        try:
+            points = rows(walked)
+        except Exception as e:
+            logger.warning("gallery frontier law for %s on %s failed: %s",
+                           label, gpu_sku, e)
+            return {"error": str(e)}
+        for seq, row in zip(GALLERY_SEQ_LENS, points, strict=True):
+            for batchPoint, served in zip(FRONTIER_BATCH_GRID, row, strict=True):
+                if served is None:
                     continue
                 if not point_served(
                         max_batch_per_gpu=served["max_batch_per_gpu"],
@@ -524,12 +577,6 @@ def _restamp_layout(walked: dict, gpu_sku: str, cfg: ParallelConfig) -> dict:
                     str(seq), label, parallel_mode(cfg), num_gpus,
                     _batch_key(served["phases"]["decode"]["batch"]), served,
                     {}, None)
-                item["_law"] = 0
-                item["lawPoint"] = {
-                    "B": served["phases"]["decode"]["batch"],
-                    "s_input": seq, "s_output": GALLERY_OUTPUT_TOKENS,
-                    "s_prefix": 0, "s_verify": 1, "rho": 1,
-                }
                 theory.append(item)
                 byPoint[(str(seq), served["phases"]["decode"]["batch"])] = item
         if walked.get("speculative"):
@@ -538,24 +585,17 @@ def _restamp_layout(walked: dict, gpu_sku: str, cfg: ParallelConfig) -> dict:
             draftRecords = {}
         for textK, draftRecord in draftRecords.items():
             k = int(textK)
-            lawIndex = 0
-            for seq in GALLERY_SEQ_LENS:
-                for batchPoint in FRONTIER_BATCH_GRID:
-                    try:
-                        served = servingLawPoint(
-                            draftRecord, card=card, context=seq,
-                            outputTokens=GALLERY_OUTPUT_TOKENS,
-                            decodeBatch=batchPoint["decode_batch_size"],
-                            prefillBatch=1, verifyWidth=k + 1,
-                            draftTokens=k,
-                            acceptanceRate=FRONTIER_ACCEPTANCE_DEFAULT,
-                            comm_latency_us=FrontierView(gpu_sku).comm_latency_us,
-                            launch_floor_us=FrontierView(gpu_sku).launch_floor_us)
-                    except Exception as exc:
-                        draftErrors.append({
-                            "layout": label, "draft_tokens": k,
-                            "error": str(exc),
-                        })
+            try:
+                draftPoints = rows(draftRecord, draft_tokens=k)
+            except Exception as exc:
+                draftErrors.append({
+                    "layout": label, "draft_tokens": k, "error": str(exc),
+                })
+                continue
+            for seq, row in zip(GALLERY_SEQ_LENS, draftPoints, strict=True):
+                for batchPoint, served in zip(FRONTIER_BATCH_GRID, row,
+                                              strict=True):
+                    if served is None:
                         continue
                     if not point_served(
                             max_batch_per_gpu=served["max_decode_batch_per_gpu"],
@@ -568,26 +608,13 @@ def _restamp_layout(walked: dict, gpu_sku: str, cfg: ParallelConfig) -> dict:
                         item = _theory_item(
                             str(seq), label, parallel_mode(cfg), num_gpus,
                             _batch_key(batch), served, {}, None)
-                        item["lawPoint"] = {
-                            "B": batch, "s_input": seq,
-                            "s_output": GALLERY_OUTPUT_TOKENS,
-                            "s_prefix": 0, "s_verify": 1, "rho": 1,
-                        }
                         theory.append(item)
                         byPoint[(str(seq), batch)] = item
-                    item.setdefault("_draftLaws", {})[textK] = {
-                        "lawIndex": lawIndex,
-                        "point": {
-                            "B": batch, "s_input": seq,
-                            "s_output": GALLERY_OUTPUT_TOKENS,
-                            "s_prefix": 0, "s_verify": k + 1, "rho": 1,
-                        },
-                        "draftTokens": k,
-                    }
+                    item.setdefault("draftTimes", {})[textK] = served[
+                        "phases"]["decode"]["t_sol_s"]
         return {
             "theory": theory,
             "draft_errors": draftErrors,
-            "laws": laws,
         }
     if "refused" in walked or "error" in walked:
         return {k: walked[k] for k in ("refused", "error") if k in walked}
@@ -661,7 +688,8 @@ def _draft_points(draft: dict, theory: List[dict], gpu_sku: str) -> List[dict]:
     return errors
 
 
-def _restamp(model_id: str, walk: dict, gpu_sku: str) -> dict:
+def _restamp(model_id: str, walk: dict, gpu_sku: str,
+             view: Optional[FrontierView] = None) -> dict:
     """A model's frontier entry on `gpu_sku` off its class walk
     (`_layout_walk` of every layout any card of the class prices): the
     layouts a frontier on this card prices (`frontier_layouts`), each
@@ -670,8 +698,12 @@ def _restamp(model_id: str, walk: dict, gpu_sku: str) -> dict:
               for w in walk["layouts"]}
     layouts = [ParallelConfig.from_dict(p)
                for p in walk["layoutsByCard"][gpu_sku]]
-    results = [_restamp_layout(walked[json.dumps(cfg.to_dict(), sort_keys=True)],
-                             gpu_sku, cfg) for cfg in layouts]
+    walk_key = (
+        _Stored(model_id, _resolve_one(model_id)[2]).serving_key(view)
+        if view is not None and view.keeps_walk() else None)
+    results = [_restamp_layout(
+                   walked[json.dumps(cfg.to_dict(), sort_keys=True)],
+                   gpu_sku, cfg, walk_key, view) for cfg in layouts]
     entry = _fold(model_id, layouts, results)
     # Why a speculative view draws nothing for this model (no MTP draft).
     entry["draft_unavailable"] = draft_refusal(model_id)
@@ -685,22 +717,11 @@ def _fold(model_id: str, layouts: List[ParallelConfig], results: List[dict]) -> 
     summary: List[dict] = []
     theory: List[dict] = []
     draft_errors: List[dict] = []
-    laws: List[dict] = []
     for cfg, res in zip(layouts, results, strict=True):
-        lawOffset = len(laws)
-        laws.extend(res.get("laws") or [])
         row: Dict[str, Any] = {"layout": layout_label(cfg), "parallel": cfg.to_dict()}
         if "theory" in res:
             row["points"] = len(res["theory"])
-            for item in res["theory"]:
-                if "_law" in item:
-                    item["lawIndex"] = item.pop("_law") + lawOffset
-                drafts = item.pop("_draftLaws", None)
-                if drafts is not None:
-                    for draft in drafts.values():
-                        draft["lawIndex"] += lawOffset
-                    item["draftLaws"] = drafts
-                theory.append(item)
+            theory.extend(res["theory"])
             draft_errors.extend(res.get("draft_errors") or [])
         else:
             row.update({k: res[k] for k in ("refused", "error") if k in res})
@@ -711,7 +732,6 @@ def _fold(model_id: str, layouts: List[ParallelConfig], results: List[dict]) -> 
         "layouts": summary,
         "_theory": theory,
         "_draft_errors": draft_errors,
-        "_laws": laws,
         # Every layout failing (not refused) is the model's failure.
         "error": (failed[0]["error"] if failed and len(failed) == len(summary)
                   else None),
@@ -734,25 +754,11 @@ def _public_entry(entry: dict) -> dict:
     return {k: v for k, v in entry.items() if not k.startswith("_")}
 
 
-def _law_time(law: dict, point: dict, view: FrontierView) -> float:
-    """A kept decode law's step time at `point` on the view's card and
-    floors. The card enters through `cardBinding`, which refuses a card the
-    law's walk card (`walked_on`) does not walk alike."""
-    card = cardBinding(
-        {"walked_on": law["walked_on"],
-         "phases": {"decode": {"law": law["law"],
-                               "collectives": law.get("collectives") or []}}},
-        Card.of(view.gpu_sku), comm_latency_us=view.comm_latency_us,
-        launch_floor_us=view.launch_floor_us)
-    return float(LawGraph.from_json(law["law"]).evaluate(
-        {**card, **point})["t_sol_s"])
-
-
 def _at_view(item: dict, view: FrontierView,
-             laws: Optional[List[dict]] = None) -> Optional[dict]:
+             ) -> Optional[dict]:
     """A theory point with its decode step under the view: the step's
-    time off its form (`FloorForm.at`) at the view's floors — the plain
-    step's, or with K drafted tokens the speculative step's at that K — the
+    time already projected at the entry's floors — the plain step's, or with
+    K drafted tokens the speculative step's at that K — the
     tokens a step keeps at the view's acceptance (`phases.step_tokens`), and
     its throughput off those (`phases.phase_throughput`, the estimate's own
     reading). None when the point has no step under the view: no form at
@@ -764,27 +770,13 @@ def _at_view(item: dict, view: FrontierView,
     dec = dict(sol["phases"]["decode"])
     if not k and dec.get("speculative_draft"):
         return None
-    if not k and "lawIndex" in item:
-        dec["t_sol_s"] = _law_time((laws or [])[item["lawIndex"]],
-                                   item["lawPoint"], view)
-        dec["throughput"] = phase_throughput(
-            dec,
-            unique_tokens_multiplier=dec["throughput"]["groups"],
-            num_gpus=dec["throughput"]["num_gpus"])
-        return {**item, "sol": {**sol, "phases": {
-            **sol["phases"], "decode": dec}}}
-    draftLaw = (item.get("draftLaws") or {}).get(str(k)) if k else None
-    evaluatedLaw = False
-    if draftLaw is not None:
-        dec["t_sol_s"] = _law_time((laws or [])[draftLaw["lawIndex"]],
-                                   draftLaw["point"], view)
-        evaluatedLaw = True
-        form = True
+    draftTime = (item.get("draftTimes") or {}).get(str(k)) if k else None
+    if draftTime is not None:
+        dec["t_sol_s"] = draftTime
     else:
         form = (item.get("draft") or {}).get(str(k)) if k else item.get("floors")
-    if form is None:
-        return None if k else item
-    if not evaluatedLaw:
+        if form is None:
+            return None if k else item
         dec["t_sol_s"] = FloorForm.from_json(form).at(*view.floors_s())
     if k:
         binding = dict(dec["binding"])
@@ -959,7 +951,7 @@ def _draw(core: dict, view: FrontierView, state: str,
             batch_key=point.get("batch_key", "max"),
             draft_tokens=int(view.draft_tokens),
             acceptance=float(view.acceptance_rate), ep_load_factor=1.0)
-        item = _at_view(point, view, core.get("_laws"))
+        item = _at_view(point, view)
         if item is None:
             records.append(CloudRecord.unanswered(
                 coordinates, "layout",
@@ -1046,27 +1038,36 @@ class _Stored(NamedTuple):
         return of_render(kind, self.version, [schema, self.model_id,
                                               *parts], scope).key
 
+    def serving_key(self, view: FrontierView) -> ServingWalkKey:
+        """The key of this model's serving-walk bundle for the view's card's
+        walk class (`ServingWalkKey.of_card` — the one place a card enters
+        a projection key)."""
+        return ServingWalkKey.of_card(
+            self.version, model=self.model_id,
+            card=Card.of(view.gpu_sku),
+            facts=ServingWalkFacts.producer())
+
     def walk_identity(self, view: FrontierView):
         """The shared identity of this model's serving-walk bundle for the
-        walk class of the view's card (`servingWalkIdentity`): one bundle per
+        walk class of the view's card (`ServingWalkKey`): one bundle per
         class, never another class's."""
-        return servingWalkIdentity(
-            self.version, model=self.model_id,
-            precision=_GALLERY_PRECISION.key, card=Card.of(view.gpu_sku))
+        return self.serving_key(view).identity
 
     def keep_walk(self, view: FrontierView, walk: dict) -> None:
         """Keep a model's class walk, when the view's is the kept one."""
         if not (self.version and view.keeps_walk()):
             return False
+        walk_key = self.serving_key(view)
         return sharedSolPool.write(
-            self.walk_identity(view),
-            ((layoutRecordName(item["parallel"]), item)
+            walk_key.identity,
+            ((StepLawKey.of_layout(walk_key, item["parallel"]).record_name,
+              item)
              for item in walk["layouts"]),
             metadata={
                 "cards": list(walk["cards"]),
                 "layoutsByCard": walk["layoutsByCard"],
                 "contexts": list(GALLERY_SEQ_LENS),
-                "facts": producerWalkFacts(),
+                "facts": ServingWalkFacts.producer().to_json(),
                 "recordSchema": walkRecordSchema,
             })
 
@@ -1077,23 +1078,25 @@ class _Stored(NamedTuple):
         read one layout at a time; only the model's walk being drawn enters
         objects, not every model in the pool.
         """
-        identity = self.walk_identity(view)
-        manifest = sharedSolPool.manifest(identity.key)
+        walk_key = self.serving_key(view)
+        bundle_key = walk_key.identity.key
+        manifest = sharedSolPool.manifest(bundle_key)
         if not walkManifestIsValid(manifest):
             return None
         metadata = manifest.get("metadata") or {}
         if view.gpu_sku not in metadata.get("layoutsByCard", {}):
             return None
-        wantedNames = {layoutRecordName(layout) for layout in
+        wantedNames = {StepLawKey.of_layout(walk_key, layout).record_name
+                       for layout in
                        metadata["layoutsByCard"][view.gpu_sku]}
-        recordIds = sharedSolPool.recordIds(identity.key)
+        recordIds = sharedSolPool.recordIds(bundle_key)
         if recordIds is None:
             return None
         layouts = []
-        for recordName in recordIds:
-            if recordName not in wantedNames:
+        for record_name in recordIds:
+            if record_name not in wantedNames:
                 continue
-            item = sharedSolPool.record(identity.key, recordName)
+            item = sharedSolPool.record(bundle_key, record_name)
             if item is None:
                 return None
             layouts.append(item)
@@ -1101,12 +1104,17 @@ class _Stored(NamedTuple):
 
     def entry_key(self, view: FrontierView) -> str:
         """The entry's: under the constant scope `none` (SOL: no
-        measurement moves it), not the floors, K or acceptance (each point
-        carries its step as a function of them)."""
-        return self._key("gallery-frontier", view.walk_parts(), NO_MEASUREMENTS)
+        measurement moves it), in the form the view reads
+        (`FrontierView.entry_parts`) — not the K or acceptance, and for a law
+        entry not the floors (each point carries its step as a function of
+        them)."""
+        return self._key("gallery-frontier", view.entry_parts(),
+                         NO_MEASUREMENTS)
 
     def measures_key(self, view: FrontierView) -> str:
-        return self._key("gallery-frontier-measures", view.walk_parts(),
+        """The measures part, in its entry's point order: keyed as the entry
+        is, so a part is only ever read beside the entry it was cut from."""
+        return self._key("gallery-frontier-measures", view.entry_parts(),
                          NO_MEASUREMENTS)
 
     def rates_key(self, view: FrontierView, scope: Any) -> str:
@@ -1241,7 +1249,7 @@ def _frontier_read(model_id: str, view: FrontierView,
             walk = stored.shared_walk(view)
             if walk is not None and view.gpu_sku in walk["layoutsByCard"]:
                 return {"drawn": _keep_and_draw(
-                    stored, view, _restamp(model_id, walk, view.gpu_sku),
+                    stored, view, _restamp(model_id, walk, view.gpu_sku, view),
                     track)}
     try:
         plan = _walk_plan(resolved, view)
@@ -1311,8 +1319,8 @@ def _finish_frontier(model_id: str, view: FrontierView, plan: dict,
                                 zip(plan["layouts"], results, strict=True)]}
     stored = _Stored(model_id, _resolve_one(model_id)[2])
     stored.keep_walk(view, walk)
-    return _keep_and_draw(stored, view, _restamp(model_id, walk, view.gpu_sku),
-                          track)
+    return _keep_and_draw(
+        stored, view, _restamp(model_id, walk, view.gpu_sku, view), track)
 
 
 def _keepSharedWalk(model_id: str, view: FrontierView, plan: dict,
@@ -1336,38 +1344,42 @@ async def keepSharedWalk(model_id: str, gpu_sku: str) -> bool:
         return False
     view = FrontierView(gpu_sku)
     stored = _Stored(model_id, version)
-    identity = stored.walk_identity(view)
-    recordIds = sharedSolPool.recordIds(identity.key)
+    walk_key = stored.serving_key(view)
+    bundle_key = walk_key.identity.key
+    recordIds = sharedSolPool.recordIds(bundle_key)
     plan = _walk_plan(resolved, view, scaling=True)
-    wanted = {layoutRecordName(layout) for layout in plan["layouts"]}
+    stepKeys = [StepLawKey.of_layout(walk_key, layout)
+                for layout in plan["layouts"]]
+    wanted = {key.record_name for key in stepKeys}
     existing = {}
     if recordIds is not None:
-        if walkManifestIsValid(sharedSolPool.manifest(identity.key)):
+        if walkManifestIsValid(sharedSolPool.manifest(bundle_key)):
             for name in wanted:
-                record = sharedSolPool.record(identity.key, name)
+                record = sharedSolPool.record(bundle_key, name)
                 if (record is not None
                         and record.get("walk", {}).get("schema") == walkRecordSchema):
                     existing[name] = record
         if len(existing) == len(wanted):
             return True
     layouts = [ParallelConfig.from_dict(layout) for layout in plan["layouts"]
-               if layoutRecordName(layout) not in existing]
+               if StepLawKey.of_layout(walk_key, layout).record_name
+               not in existing]
     results = await map_off_loop(
         _layout_law, [(model_id, plan["cards"], float(view.gpu_memory_fraction),
                        _GALLERY_PRECISION.canonical(), layout)
                       for layout in layouts])
     computed = {
-        layoutRecordName(layout): {
+        StepLawKey.of_layout(walk_key, layout).record_name: {
             "parallel": layout.to_dict(), "walk": result}
         for layout, result in zip(layouts, results, strict=True)}
     return sharedSolPool.write(
-        identity,
+        walk_key.identity,
         ((name, existing.get(name) or computed[name])
-         for name in map(layoutRecordName, plan["layouts"])),
+         for name in (key.record_name for key in stepKeys)),
         metadata={
             "cards": list(plan["cards"]),
             "layoutsByCard": plan["layoutsByCard"],
-            "facts": producerWalkFacts(),
+            "facts": ServingWalkFacts.producer().to_json(),
             "recordSchema": walkRecordSchema,
         })
 

@@ -49,21 +49,16 @@ from backend.inference.capacity import (CapacitySweepPlan, SweepCloudDim,
                                         iter_sweep_cell, point_served)
 from backend.inference.card import Card
 from backend.inference.frontier import frontier_view
-from backend.inference.module_rows import served
-from backend.inference.defaults import (
-    COMM_LATENCY_US_DEFAULT,
-    LAUNCH_FLOOR_US_DEFAULT,
-)
 from backend.inference.sol_data import (
-    layoutRecordName,
-    servingContexts,
-    producerWalkFacts,
-    servingWalkIdentity,
-    walkFacts,
+    ServingWalkKey,
     walkManifestIsValid,
 )
 from backend.inference.sol_data import sharedSolPool
-from backend.inference.sol_law import servingLawPoint
+from backend.inference.serving_projection import (
+    PublicServingLawRequest,
+    projectServingLawPoints,
+)
+from backend.inference.serving_view import servingLawPointView
 from backend.measure import lookup as _measure_lookup
 from backend.inference.parallel_sweep import (
     PER_POINT_FIELDS,
@@ -208,28 +203,20 @@ def _sharedWalkResults(sweep: _CachedSweep, plan: Any) -> dict[int, Any]:
     if sweep.kind not in ("parallel", "sweep") or not getattr(plan, "cells", None):
         return {}
 
+    requestAxes: dict[str, Any]
+
     if sweep.kind == "sweep":
         knobs = getattr(plan, "knobs", None)
         points = getattr(plan, "points", None)
         if (not getattr(plan, "gridded", False) or knobs is None
                 or points is None):
             return {}
-        if knobs.measurement_scope is not None and (
-                knobs.measurement_scope is not NO_MEASUREMENTS):
-            return {}
-        if any(context not in servingContexts
-               for context in plan.seq_lens):
-            return {}
-        if any(int(prefix) != 0 or int(width) != 1
-               for _context, prefix, width in zip(
-                   plan.seq_lens, plan.s_prefixes, plan.s_verifies, strict=True)):
-            return {}
         environment = {
             "avg_output_tokens": plan.avg_output_tokens,
             "gpu_memory_fraction": knobs.gpu_memory_fraction,
             "precision": knobs.precision,
-            "s_prefix_cached": 0,
-            "s_verify": 1,
+            "s_prefix_cached": knobs.s_prefix_cached,
+            "s_verify": knobs.s_verify,
             "acceptance_rate": knobs.acceptance_rate,
             "speculative_draft": knobs.speculative_draft,
             "include_aux_weights": knobs.include_aux_weights,
@@ -239,32 +226,67 @@ def _sharedWalkResults(sweep: _CachedSweep, plan: Any) -> dict[int, Any]:
             "kv_block_size": knobs.kv_block_size,
             "prefill_chunk_size": plan.prefill_chunk_size,
             "ep_load_factor": knobs.ep_load_factor,
+            "comm_latency_us": knobs.comm_latency_us,
+            "launch_floor_us": knobs.launch_floor_us,
         }
-        if any(prefill != 1 for _key, prefill, _decode in points):
+        contexts = tuple(int(context) for context in plan.seq_lens)
+        decode_batches = tuple(
+            decode for _key, _prefill, decode in points)
+        requestAxes = {
+            "environment": environment,
+            "contexts": contexts,
+            "decode_batches": decode_batches,
+            "prefill_batches": tuple(
+                int(prefill) for _key, prefill, _decode in points),
+            "prefix_tokens": tuple(
+                int(prefix) for prefix in plan.s_prefixes),
+            "verify_widths": tuple(
+                int(width) for width in plan.s_verifies),
+            "measurement_scope": knobs.measurement_scope,
+        }
+        if not PublicServingLawRequest.covers(
+                environment=environment, contexts=contexts,
+                measurement_scope=knobs.measurement_scope):
             return {}
+
+        def gridRequest(walk: ServingWalkKey, card: str,
+                        layout: Any) -> PublicServingLawRequest:
+            return PublicServingLawRequest(
+                walk=walk, card=card, layout=layout, **requestAxes)
+
         modelId = knobs.model_id
     else:
         if plan.batch != "max":
             return {}
         payload = plan.cells[0].payload
         environment = payload
-        if int(payload["avg_input_tokens"]) not in servingContexts:
+        requestAxes = {
+            "environment": environment,
+            "contexts": (int(payload["avg_input_tokens"]),),
+            "decode_batches": (None,),
+            "prefill_batches": (1,),
+            "prefix_tokens": (int(payload.get("s_prefix_cached") or 0),),
+            "verify_widths": (int(payload.get("s_verify") or 1),),
+            "measurement_scope": payload.get("measurement_scope"),
+        }
+        if not PublicServingLawRequest.covers(
+                environment=environment,
+                contexts=requestAxes["contexts"],
+                measurement_scope=payload.get("measurement_scope")):
             return {}
+
+        def gridRequest(walk: ServingWalkKey, card: str,
+                        layout: Any) -> PublicServingLawRequest:
+            return PublicServingLawRequest(
+                walk=walk, card=card, layout=layout, **requestAxes)
+
         modelId = payload["model_id"]
 
-    if walkFacts(environment) != producerWalkFacts():
-        return {}
-    if (float(environment.get("comm_latency_us") or COMM_LATENCY_US_DEFAULT)
-            != COMM_LATENCY_US_DEFAULT
-            or float(environment.get("launch_floor_us")
-                     or LAUNCH_FLOOR_US_DEFAULT)
-            != LAUNCH_FLOOR_US_DEFAULT):
-        return {}
     resolved = resolved_spec_for(modelId)
     if resolved is None:
         return {}
     version = result_version(resolved)
-    # One bundle per walk class (`servingWalkIdentity`): a card is projected
+    # One bundle per walk class (`ServingWalkKey.of_card`): a card is projected
     # only off its own class's records, each named by that card's class.
     classWalks: dict[str, Any] = {}
 
@@ -272,12 +294,12 @@ def _sharedWalkResults(sweep: _CachedSweep, plan: Any) -> dict[int, Any]:
         card = Card.of(sku)
         classKey = card.klass.key()
         if classKey not in classWalks:
-            identity = servingWalkIdentity(
+            walk_key = ServingWalkKey.of_card(
                 version, model=modelId,
-                precision=producerWalkFacts()["precision"], card=card)
-            manifest = sharedSolPool.manifest(identity.key)
+                card=card)
+            manifest = sharedSolPool.manifest(walk_key.identity.key)
             classWalks[classKey] = (
-                (identity, manifest.get("metadata") or {})
+                (walk_key, manifest.get("metadata") or {})
                 if walkManifestIsValid(manifest) else None)
         return classWalks[classKey]
 
@@ -288,33 +310,32 @@ def _sharedWalkResults(sweep: _CachedSweep, plan: Any) -> dict[int, Any]:
             modelWalk = classWalk(plan.gpu_sku)
             if modelWalk is None:
                 break
-            identity, metadata = modelWalk
+            walk_key, metadata = modelWalk
             if plan.gpu_sku not in metadata.get("layoutsByCard", {}):
                 break
-            item = sharedSolPool.record(
-                identity.key, layoutRecordName(plan.knobs.parallel))
+            projectionRequest = gridRequest(
+                walk_key, plan.gpu_sku, plan.knobs.parallel)
+            stepKey = projectionRequest.law_key
+            item = sharedSolPool.record(stepKey.bundle_key, stepKey.record_name)
             if item is None:
                 break
             law = item["walk"]
+            if "refused" in law or "error" in law:
+                break
+            points = [decode for _key, _prefill, decode in plan.points]
+            try:
+                projectedRows = projectServingLawPoints(law, projectionRequest)
+            except Exception:
+                break
             contexts = []
-            for context in plan.seq_lens:
-                pointsOut = []
-                for _key, _prefill, decode in plan.points:
-                    try:
-                        served = servingLawPoint(
-                            law, card=Card.of(plan.gpu_sku), context=context,
-                            outputTokens=plan.avg_output_tokens,
-                            decodeBatch=decode,
-                            prefillBatch=1,
-                            comm_latency_us=COMM_LATENCY_US_DEFAULT,
-                            launch_floor_us=LAUNCH_FLOOR_US_DEFAULT)
-                        pointsOut.append({
-                            "sol": served_sweep_point(served),
-                            "measures": {},
-                        })
-                    except Exception as exc:
-                        pointsOut.append({
-                            "sol": {"error": str(exc)}, "measures": {}})
+            for row in projectedRows:
+                # Drawing surfaces filter with `point_served`; the projection
+                # itself prices an over-batch or beyond-context point, exactly
+                # as the direct sweep does.
+                pointsOut = [{
+                    "sol": served_sweep_point(point),
+                    "measures": {},
+                } for point in row]
                 contexts.append(pointsOut)
             out[index] = contexts
             continue
@@ -326,13 +347,14 @@ def _sharedWalkResults(sweep: _CachedSweep, plan: Any) -> dict[int, Any]:
         walks = [(classWalk(skus[0]), skus) for skus in byClass.values()]
         if not walks or any(walk is None for walk, _skus in walks):
             break
-        for (identity, metadata), skus in walks:
+        for (walk_key, metadata), skus in walks:
             if any(sku not in metadata.get("layoutsByCard", {})
                    for sku in skus):
                 projected = None
                 break
-            item = sharedSolPool.record(
-                identity.key, layoutRecordName(cell.parallel))
+            firstRequest = gridRequest(walk_key, skus[0], cell.parallel)
+            stepKey = firstRequest.law_key
+            item = sharedSolPool.record(stepKey.bundle_key, stepKey.record_name)
             if item is None:
                 projected = None
                 break
@@ -344,36 +366,47 @@ def _sharedWalkResults(sweep: _CachedSweep, plan: Any) -> dict[int, Any]:
                 projected = {"error": law["error"]}
                 continue
             cards = {}
-            outputTokens = int(cell.payload["avg_output_tokens"])
+            failed = False
             for sku in skus:
                 try:
-                    served = servingLawPoint(
-                        law, card=Card.of(sku),
-                        context=int(cell.payload["avg_input_tokens"]),
-                        outputTokens=outputTokens,
-                        comm_latency_us=COMM_LATENCY_US_DEFAULT,
-                        launch_floor_us=LAUNCH_FLOOR_US_DEFAULT,
-                        prefillBatch=1)
+                    context = int(cell.payload["avg_input_tokens"])
+                    request = gridRequest(walk_key, sku, cell.parallel)
+                    ladderRequest = PublicServingLawRequest(
+                        walk=walk_key, card=sku, layout=cell.parallel,
+                        environment=request.environment,
+                        contexts=(context,),
+                        decode_batches=(None, *SCALING_DECODE_LADDER),
+                        prefill_batches=(
+                            1, *(1 for _ in SCALING_DECODE_LADDER)),
+                        prefix_tokens=request.prefix_tokens[:1],
+                        verify_widths=request.verify_widths[:1],
+                        measurement_scope=request.measurement_scope,
+                        draft_tokens=request.draft_tokens)
+                    projectedRow = projectServingLawPoints(
+                        law, ladderRequest)[0]
+                    served = projectedRow[0]
+                    byBatch = {
+                        batch: point for batch, point in zip(
+                            ladderRequest.decode_batches, projectedRow,
+                            strict=True)
+                    }
                     ladder = []
                     ceiling = int(served["max_decode_batch_per_gpu"] or 0)
                     beyond = bool(served["beyond_max_context"])
                     for batch in SCALING_DECODE_LADDER:
+                        point = byBatch[batch]
                         if not point_served(max_batch_per_gpu=ceiling,
                                             beyond_max_context=beyond,
                                             requests=int(batch)):
                             continue
-                        point = servingLawPoint(
-                            law, card=Card.of(sku),
-                            context=int(cell.payload["avg_input_tokens"]),
-                            outputTokens=outputTokens, decodeBatch=int(batch),
-                            comm_latency_us=COMM_LATENCY_US_DEFAULT,
-                            launch_floor_us=LAUNCH_FLOOR_US_DEFAULT)
                         ladder.append({
                             "phases": {"decode": point["phases"]["decode"]},
                             "batch_key": f"b{int(batch)}",
                             **({"beyond_max_context": True} if beyond else {}),
                         })
-                    if not beyond:
+                    if point_served(max_batch_per_gpu=ceiling,
+                                    beyond_max_context=beyond,
+                                    requests=1):
                         ladder.append({
                             "phases": {"decode": served["phases"]["decode"]},
                             "batch_key": "max",
@@ -381,7 +414,15 @@ def _sharedWalkResults(sweep: _CachedSweep, plan: Any) -> dict[int, Any]:
                     cards[sku] = {"sol": served, "measures": {},
                                   "ladder": ladder}
                 except Exception as exc:
-                    cards[sku] = {"error": str(exc)}
+                    _log.warning("serving-law projection failed for %s: %s",
+                                 sku, exc)
+                    failed = True
+                    break
+            if failed:
+                # One class's card the grid cannot answer: the whole cell is
+                # estimated, never drawn with that class's cards missing.
+                projected = None
+                break
             group = {"cards": cards}
             if projected is None:
                 projected = group
@@ -396,18 +437,6 @@ def _sharedWalkResults(sweep: _CachedSweep, plan: Any) -> dict[int, Any]:
     return out
 
 
-# Fields the Scaling / Compare charts never read: the per-op drill-down,
-# weight tree and formulas of each single-config estimate (~1 MB/seq).
-_SWEEP_DROP = frozenset({
-    "per_op_timing", "per_op_timing_decode", "per_op_timing_draft",
-    # The declaration parents' measured shares go with the rows they are
-    # shares of: a sweep ships no per-op rows, so nothing reads them.
-    "per_op_timing_measured_by_declaration",
-    "per_op_timing_decode_measured_by_declaration",
-    "weight_breakdown", "formulas", "vs_naive_delta", "gpu",
-})
-
-
 #: The estimate-sweep payload's schema, folded into its cache keys
 #: (`_sweep_version`): the payload is shaped here, outside the code the
 #: engine version hashes, so a change of its shape bumps this — bump on
@@ -416,9 +445,10 @@ _SWEEP_DROP = frozenset({
 #: rows or module table. v3: the batch's routing skew is a workload input
 #: (`ep_load_factor` beside the deployment, not inside its `parallel`), so
 #: a request that stated it in its parallel preset keys differently. v4:
-#: the answer keeps its decode point cloud (`decode_cloud`, not shipped). v5:
 #: that cloud states the one point-cloud vocabulary and keeps absent points.
-_ESTIMATE_SWEEP_PAYLOAD = "estimate-sweep-v5"
+#: v6: a point is the serving projection's public vocabulary, and the direct
+#: estimate is normalized through the same owner as a StepLaw projection.
+_ESTIMATE_SWEEP_PAYLOAD = "estimate-sweep-v6"
 
 #: The parallel answer's server-side point cloud changed to the one coordinate
 #: vocabulary and began keeping absent points, so its cached answers move once.
@@ -426,21 +456,8 @@ _PARALLEL_SWEEP_PAYLOAD = "parallel-sweep-v2"
 
 
 def served_sweep_point(result: Any) -> Any:
-    """One estimate as an estimate-sweep serves it: cached and served in this
-    shape, so a warm hit is byte-identical to a live response. No page draws
-    a sweep's point row by row: its per-op rows and an encoder stack's rows
-    and module table are not served (a point's phases carry no module
-    table, `batch_sweep.phase_at`)."""
-    if not isinstance(result, dict):
-        return result
-    out = served({k: v for k, v in result.items() if k not in _SWEEP_DROP})
-    encode = out.get("encode")
-    if encode and encode.get("stacks"):
-        out["encode"] = {**encode, "stacks": [
-            {k: v for k, v in stack.items()
-             if k not in ("per_op_timing", "flops_by_module")}
-            for stack in encode["stacks"]]}
-    return out
+    """The serving projection owner, kept under the sweep response's name."""
+    return servingLawPointView(result)
 
 
 def _estimate_sweep_env(req: InferenceEstimateSweepRequest) -> dict:

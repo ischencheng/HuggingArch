@@ -55,7 +55,8 @@ at deploy so the service can report which code it runs (the image has no
 `fly.toml` sets the VM (`shared-cpu-1x`, 2 GB), a 3 GB volume
 `huggingarch_cache` mounted at `/app/.cache`, rate limits (`ANALYZE_RPM`,
 `INFERENCE_RPM`), `SPEC_AGENT_MAX_CONCURRENT`, and the result-cache directories
-`HA_GALLERY_CACHE_DIR` / `HA_SWEEP_CACHE_DIR` under `/app/var` — outside the
+`HA_GALLERY_CACHE_DIR` / `HA_SWEEP_CACHE_DIR`
+under `/app/var` — outside the
 volume, so the mount does not hide the caches baked into the image.
 
 ### Continuous integration
@@ -276,6 +277,10 @@ artifact) only when the deployed source and engine data are the same; there is
 no automatic Supabase synchronization for this pool. The request-shaped result
 caches below do synchronize when Supabase is configured, but they are not the
 canonical law pool.
+
+Gallery and Scaling project the canonical serving laws in-process. The
+projection has no durable directory or remote tier beside the request caches;
+the compiled law program is memoized by its graph for the process's lifetime.
 
 ```bash
 flyctl ssh console -C "python -m backend.warm_caches"             # Gallery + Scaling

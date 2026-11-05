@@ -67,19 +67,26 @@ def _misstated(rows) -> list:
     return out
 
 
-#: The first case runs by default; the rest take minutes and are
-#: `regression`.
-CASES = [pytest.param(MODELS[0], {"tp_attention": 1}, id=f"{MODELS[0]}-tp1")] + [
+#: The first case runs by default and is a step that exists; a weight-refused
+#: layout walks no rows. The rest take minutes and are `regression`.
+CASES = [pytest.param(
+    MODELS[0], {"tp_attention": 8, "ep_moe": 8},
+    id=f"{MODELS[0]}-tp8ep8")] + [
     pytest.param(model_id, parallel, id=f"{model_id}-{name}",
                  marks=pytest.mark.regression)
     for model_id in MODELS
     for name, parallel in (("tp1", {"tp_attention": 1}),
                            ("tp8-ep8", {"tp_attention": 8, "ep_moe": 8}))
-    if (model_id, name) != (MODELS[0], "tp1")]
+    if (model_id, name) not in {
+        (MODELS[0], "tp1"), (MODELS[0], "tp8-ep8")}]
 
 
 @pytest.mark.parametrize(("model_id", "parallel"), CASES)
 def test_the_formula_evaluates_to_the_charge(model_id, parallel):
     result = _estimate(model_id, parallel)
+    if result.get("infeasibility_reason"):
+        assert "per_op_timing" not in result
+        assert "per_op_timing_decode" not in result
+        return
     for key in ("per_op_timing", "per_op_timing_decode"):
         assert _misstated(result[key]) == [], key

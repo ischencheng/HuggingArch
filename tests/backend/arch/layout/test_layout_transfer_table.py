@@ -12,6 +12,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from backend.arch import layout
 from backend.arch.layout import transfer_table as tt
 from backend.arch.layout.groups import ProcessGroupFamily
+from backend.arch.eval.refusal import LayoutRefusal
 
 
 def fam(name, *groups):
@@ -61,6 +62,11 @@ class TestVocabularyAndContracts(unittest.TestCase):
             tt.Derived((object(),))
         with self.assertRaisesRegex(TypeError, "Partial or None"):
             tt.Derived((REP8,), object())
+
+    def test_a_rejected_geometry_is_a_layout_refusal(self):
+        with self.assertRaisesRegex(LayoutRefusal, "outermost owner map"):
+            tt.Rejected("the outermost owner map changed").require(
+                "split", "node")
 
     def test_call_contract_rejects_malformed_shape_facts(self):
         with self.assertRaisesRegex(ValueError, "unknown axis relation"):

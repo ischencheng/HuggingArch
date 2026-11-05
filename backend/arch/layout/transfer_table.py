@@ -23,6 +23,7 @@ from typing import Any, Callable, Mapping, Optional, Tuple, Union
 import sympy as sp
 
 from backend.arch.eval.dim import require, require_equal, same_law
+from backend.arch.eval.refusal import LayoutRefusal
 
 from .groups import cross_replica_family, orthogonal, same
 from .layout import (
@@ -128,7 +129,7 @@ class Rejected:
             raise ValueError("Rejected requires a useful reason")
 
     def require(self, what: str, where: str) -> Derived:
-        raise ValueError(f"{where}: {what}: {self.reason}")
+        raise LayoutRefusal(f"{where}: {what}: {self.reason}")
 
 
 CellResult = Union[Derived, Rejected]
