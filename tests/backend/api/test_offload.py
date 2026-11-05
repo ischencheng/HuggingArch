@@ -624,3 +624,170 @@ def test_a_503_counts_the_jobs_the_work_finished(monkeypatch):
     finally:
         app.router.routes[:] = [r for r in app.router.routes
                                 if getattr(r, "path", "") != "/__test/jobs-done"]
+
+
+def test_a_freed_slot_goes_to_the_most_urgent_waiter():
+    """`PrioritySlots` grants a freed slot by urgency, read when the slot
+    frees — a waiter whose urgency changed while it queued is reordered —
+    and ties keep arrival order. A cancelled waiter gives up its place, and
+    one cancelled just after it was granted passes the slot on."""
+    import asyncio
+
+    async def scenario():
+        slots = offload.PrioritySlots(1)
+        urgency = {"a": 3, "b": 2, "c": 1, "d": 1}
+        order: list = []
+        release = asyncio.Event()
+
+        async def blocker():
+            async with slots.hold(lambda: 0):
+                await release.wait()
+
+        async def waiter(name):
+            async with slots.hold(lambda: urgency[name]):
+                order.append(name)
+
+        held = asyncio.ensure_future(blocker())
+        await asyncio.sleep(0)
+        tasks = {n: asyncio.ensure_future(waiter(n)) for n in "abcd"}
+        await asyncio.sleep(0)
+        urgency["a"] = 0                  # re-ranked while it queued
+        tasks["c"].cancel()               # gives up its place
+        release.set()
+        await held
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
+        return order
+
+    assert asyncio.run(scenario()) == ["a", "d", "b"]
+
+
+def test_the_view_asked_for_last_takes_the_next_slot(monkeypatch):
+    """Two works wait on one slot: the one a client asked for more recently
+    goes first — the GPU a gallery client switched to before the one it left
+    — and asking again makes a work the most recent again."""
+    import asyncio
+
+    async def scenario():
+        slots = offload.PrioritySlots(1)
+        order: list = []
+        release = asyncio.Event()
+
+        async def blocker():
+            async with slots.hold(lambda: 0):
+                await release.wait()
+
+        def work(name):
+            async def run():
+                async with slots.hold(offload.urgency()):
+                    order.append(name)
+                return name
+            return run
+
+        async def ask(key, name):
+            with pytest.raises(offload.StillComputing):
+                await offload.within_deadline(key, work(name))
+
+        held = asyncio.ensure_future(blocker())
+        await asyncio.sleep(0)
+        for key, name in asks:
+            await ask(f"{key}-{len(asks)}", name)
+        release.set()
+        await held
+        for _ in range(5):
+            await asyncio.sleep(0)
+        return order
+
+    monkeypatch.setattr(offload, "_deadline_s", 0.01)
+    # The client moved from view a to view b: b first (FIFO would say a).
+    asks = [("view-a", "a"), ("view-b", "b")]
+    assert asyncio.run(scenario()) == ["b", "a"]
+    # ... and came back to a: a is the most recent again.
+    asks = [("view-a", "a"), ("view-b", "b"), ("view-a", "a")]
+    assert asyncio.run(scenario()) == ["a", "b"]
+
+
+def test_the_clients_order_ranks_the_items_of_one_work(monkeypatch):
+    """Within one work, the items the client named first (`hint`: the model
+    it picked, then those on screen) take the slots first; an item it did
+    not name comes after every named one."""
+    import asyncio
+
+    async def scenario():
+        slots = offload.PrioritySlots(1)
+        order: list = []
+        release = asyncio.Event()
+
+        async def blocker():
+            async with slots.hold(lambda: 0):
+                await release.wait()
+
+        async def run():
+            async def item(name):
+                async with slots.hold(offload.urgency(name)):
+                    order.append(name)
+            await asyncio.gather(*(item(n) for n in ("m1", "m2", "m3")))
+            return order
+
+        held = asyncio.ensure_future(blocker())
+        await asyncio.sleep(0)
+        with pytest.raises(offload.StillComputing):
+            await offload.within_deadline("ranked", run, hint=["m3", "m2"])
+        release.set()
+        await held
+        offload.set_deadline(None)
+        return await offload.within_deadline("ranked", run)
+
+    monkeypatch.setattr(offload, "_deadline_s", 0.01)
+    try:
+        assert asyncio.run(scenario()) == ["m3", "m2", "m1"]
+    finally:
+        offload.set_deadline(None)
+
+
+def test_a_503_carries_the_published_items_the_client_lacks(monkeypatch):
+    """Work that publishes items as they land (`report_partial`) puts in
+    each 503 its head and the items past the client's cursor — all of them
+    for a cursor of another work — so a page draws each item once."""
+    import asyncio
+
+    async def publishing():
+        offload.report_partial(head={"seq_lens": [1024]})
+        offload.report_partial({"model_id": "m1"})
+        offload.report_partial({"model_id": "m2"})
+        await asyncio.sleep(1.0)
+        return {"done": True}
+
+    async def scenario():
+        got = []
+        for cursor in (None, "same", (0, 1)):
+            with pytest.raises(offload.StillComputing) as info:
+                await offload.within_deadline(
+                    "partial", publishing,
+                    cursor=(None if cursor is None else
+                            (got[0]["tag"], 1) if cursor == "same" else cursor))
+            got.append(info.value.partial)
+        return got
+
+    monkeypatch.setattr(offload, "_deadline_s", 0.05)
+    first, mine, foreign = asyncio.run(scenario())
+    assert first["head"] == {"seq_lens": [1024]}
+    assert first["count"] == 2
+    assert [i["model_id"] for i in first["items"]] == ["m1", "m2"]
+    assert mine["tag"] == first["tag"]
+    assert [i["model_id"] for i in mine["items"]] == ["m2"]
+    assert [i["model_id"] for i in foreign["items"]] == ["m1", "m2"]
+
+    @app.get("/__test/partial")
+    async def _partial():
+        return await offload.within_deadline("partial-route", publishing)
+
+    try:
+        with TestClient(app) as client:
+            body = client.get("/__test/partial").json()
+        assert body["reason"] == "still_computing"
+        assert body["partial"]["head"] == {"seq_lens": [1024]}
+        assert [i["model_id"] for i in body["partial"]["items"]] == ["m1", "m2"]
+    finally:
+        app.router.routes[:] = [r for r in app.router.routes
+                                if getattr(r, "path", "") != "/__test/partial"]
+    offload.report_partial({"model_id": "nobody"})   # outside a request: no-op

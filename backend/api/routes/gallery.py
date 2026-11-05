@@ -62,7 +62,10 @@ async def gallery_frontier(
                                        le=1000.0),
         draft_tokens: int = 0,
         acceptance_rate: float = Query(FRONTIER_ACCEPTANCE_DEFAULT, gt=0.0,
-                                       le=1.0)):
+                                       le=1.0),
+        priority: str = "",
+        have_tag: int = 0,
+        have: int = Query(0, ge=0)):
     """Every model's decode Pareto frontier on one GPU type — tokens/s per
     user against tokens/s per GPU, over every layout up to
     `FRONTIER_MAX_GPUS` and every per-GPU batch (`backend.api.gallery_frontier`).
@@ -74,7 +77,14 @@ async def gallery_frontier(
     defaults' (``python -m backend.warm_caches``). `draft_tokens` K > 0 (one
     of `FRONTIER_DRAFT_TOKENS`) reads the speculative view of the same
     entry: the MTP draft's K tokens kept at `acceptance_rate`; a model with
-    no MTP draft draws nothing there and says why."""
+    no MTP draft draws nothing there and says why.
+
+    While the view computes, each 503 carries the models finished since the
+    client's last one (`have_tag` / `have`: the work and how many of its
+    models the client holds), so the page draws each as it lands.
+    `priority` is the comma-separated model ids the client wants first —
+    the one it picked, then those on screen; it orders what is not started
+    yet and is not part of the view's identity."""
     if gpu_sku not in GALLERY_GPUS:
         raise HTTPException(
             400, f"the gallery frontier covers {', '.join(GALLERY_GPUS)}; "
@@ -87,4 +97,6 @@ async def gallery_frontier(
                         float(comm_latency_us), float(launch_floor_us),
                         int(draft_tokens), float(acceptance_rate))
     return await within_deadline(
-        frontier_request_key(view), lambda: build_frontier(view))
+        frontier_request_key(view), lambda: build_frontier(view),
+        hint=[m for m in priority.split(",") if m] if priority else None,
+        cursor=(have_tag, have))

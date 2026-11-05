@@ -188,3 +188,46 @@ def test_bound_and_intensity_columns_are_the_backends(browser_base):  # noqa: F8
             assert float(c["ai"]) == want_ai, c
     assert leaves and parents
     s.assert_clean()
+
+
+def test_a_parallel_sweep_draws_the_cells_that_landed_while_the_rest_compute(browser_base):  # noqa: F811
+    """A cold parallel sweep's 503 carries the server's assembly of the
+    cells finished so far: the panel draws it under a small corner note,
+    then the whole answer replaces it and the note goes."""
+    import json
+
+    def tp(xs):
+        return {"moe_enabled": True, "ladder": {"refused": [], "beyond_cap": {"cap": 512}},
+                "series": [{"gpu_sku": "B200", "points": [
+                    {"x": x, "feasible": True,
+                     "parallel": {"tp_attention": x, "tp_dense_ffn": x, "tp_moe_expert": x},
+                     "warnings": [], "prefill_tps_per_gpu": 1000.0, "decode_tps_per_gpu": 100.0}
+                    for x in xs]}]}
+
+    browser, base = browser_base
+    s = Session(browser, base)
+    calls = []
+    release = []
+
+    def sweep(route):
+        calls.append(1)
+        if not release:
+            route.fulfill(status=503, content_type="application/json", body=json.dumps({
+                "reason": "still_computing", "retry_after_s": 1,
+                "progress": {"done": 2, "total": 4},
+                "partial": {"tag": 3, "count": 0, "items": [],
+                            "head": {"by_mode": {"tp_tp": tp((2, 4))}}}}))
+        else:
+            route.fulfill(status=200, content_type="application/json",
+                          body=json.dumps({"by_mode": {"tp_tp": tp((2, 4, 8, 16))}}))
+
+    s.page.route("**/inference/estimate-parallel-sweep", sweep)
+    s.goto(_LINK)
+    s.page.wait_for_selector("#infer-scaling-mode-tp_tp", timeout=15000)
+    s.page.click("#infer-scaling-mode-tp_tp")
+    s.page.wait_for_selector("[data-sweep-partial]", timeout=15000)
+    assert "2 / 4" in s.page.inner_text("[data-sweep-partial]")
+    release.append(1)
+    s.page.wait_for_selector("[data-sweep-partial]", state="detached", timeout=15000)
+    s.errors = [e for e in s.errors if "503" not in e]
+    s.assert_clean()

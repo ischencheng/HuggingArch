@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { fetchJson, isAbort, type StillComputing } from "../api";
 import { ComputeProgress } from "../ProgressBar";
 import axes from "../gallery/axes.json";
@@ -223,6 +223,10 @@ export function Gallery() {
   const [frontTry, setFrontTry] = useState(0);
   const [kvPrec, setKvPrec] = useState(inbound.kv || AS_SHIPPED);
   const [picked, setPicked] = useState<Record<string, boolean> | null>(null);
+  // The models the frontier should price first: those on the chart (the
+  // picked ones, or the default top-by-params). Sent with every retry, so a
+  // model picked while the view computes jumps the server's queue.
+  const priorityRef = useRef<string[]>([]);
   // The floors the frontier is asked under: the server's defaults
   // (`/inference/defaults`) until edited; null until they are known. An
   // edit applies on blur / Enter, not per keystroke — each point's step is
@@ -322,8 +326,30 @@ export function Gallery() {
       query.acceptance_rate = String(draft.alpha);
     }
     const key = frontierKey(gpuSku, floors, draft);
-    fetchJson<FrontierPayload>(`/gallery/frontier?${new URLSearchParams(query)}`,
-      { signal: ctrl.signal }, (info: StillComputing) => {
+    // The models the server published so far for this view, drawn as they
+    // land; the cursor tells the server which it need not send again.
+    const cursor = { tag: 0, count: 0 };
+    let arrived: FrontierModel[] = [];
+    const url = () => {
+      const q = new URLSearchParams(query);
+      if (priorityRef.current.length) q.set("priority", priorityRef.current.join(","));
+      if (cursor.tag) {
+        q.set("have_tag", String(cursor.tag));
+        q.set("have", String(cursor.count));
+      }
+      return `/gallery/frontier?${q}`;
+    };
+    fetchJson<FrontierPayload>(url, { signal: ctrl.signal }, (info: StillComputing) => {
+        const part = info.partial;
+        if (part) {
+          if (part.tag !== cursor.tag) arrived = [];
+          arrived = [...arrived, ...(part.items as FrontierModel[])];
+          cursor.tag = part.tag;
+          cursor.count = part.count;
+          if (part.head) {
+            setFront({ gpuSku, key, draft, data: { ...(part.head as FrontierPayload), models: arrived } });
+          }
+        }
         setFrontState({ phase: "loading", progress: info.progress, jobsDone: info.jobsDone });
       })
       .then((body) => {
@@ -377,6 +403,9 @@ export function Gallery() {
     return sortedFiltered.filter((m) => picked[m.model_id]);
   }, [sortedFiltered, picked]);
   const perfSet = useMemo(() => new Set(perfModels.map((m) => m.model_id)), [perfModels]);
+  useEffect(() => {
+    priorityRef.current = perfModels.map((m) => m.model_id);
+  }, [perfModels]);
   // One colour per plotted line: the palette is dealt over the checked
   // models (sorted by id, so a model keeps its colour while others toggle
   // around it as far as the order allows), not over all sixty — dealt over
@@ -559,7 +588,9 @@ export function Gallery() {
     && front.key !== frontierKey(gpuSku, floors, draft);
   // Checked models that draw no frontier at this context: every layout
   // refused or failed, or none serves this context.
+  // While the view computes, a model not yet arrived is pending, not missing.
   const frontMissing = front == null ? [] : perfModels
+    .filter((m) => !frontLoading || frontById.has(m.model_id))
     .filter((m) => !noDraft.has(m.model_id))
     .filter((m) => !(frontById.get(m.model_id)?.frontier?.[decCtx] || []).length)
     .map((m) => shortName(m.model_id));
@@ -634,14 +665,17 @@ export function Gallery() {
       </section>
 
       {galleryComputing ? (
-        <section id="g-computing" className="card mb-6 p-4 border-amber-200 bg-amber-50/70">
+        // A corner note, not a banner: the page draws each model as it
+        // lands, so what is still computing is a footnote to what is there.
+        <div id="g-computing" role="status" title={galleryComputing.note}
+          className="fixed bottom-4 right-4 z-40 max-w-xs rounded-md border border-amber-200 bg-white/95 px-3 py-2 text-xs text-gray-600 shadow-sm">
           <ComputeProgress
+            compact
             label={galleryComputing.label}
             progress={galleryComputing.progress}
             unit={galleryComputing.unit}
-            note={galleryComputing.note}
           />
-        </section>
+        </div>
       ) : null}
 
       <ScatterChart

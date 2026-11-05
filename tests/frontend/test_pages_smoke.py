@@ -1476,7 +1476,10 @@ def test_gallery_speculative_switch_reasks_the_frontier_under_its_draft(browser_
     before = s.count("/gallery/frontier")
     s.page.uncheck("#g-spec-on")
     assert s.wait_for(lambda: s.count("/gallery/frontier") > before)
-    assert set(s.requests["/gallery/frontier"][-1]["query"]) == {
+    # The plain view again: no draft in its identity (what the page holds and
+    # wants first ride along and are not part of it).
+    assert set(s.requests["/gallery/frontier"][-1]["query"]) - {
+        "priority", "have_tag", "have"} == {
         "gpu_sku", "comm_latency_us", "launch_floor_us"}
     # Once the plain frontier is in, every model draws again.
     assert s.wait_for(lambda: s.page.query_selector("#g-front-no-draft") is None)
@@ -2010,8 +2013,12 @@ def test_gallery_decode_frontier_follows_the_gpu_and_names_its_misses(browser_ba
     assert "Decode Pareto frontier — 1K context" in s.page.inner_text("main")
     s.page.wait_for_selector("#g-front-missing", timeout=15000)
     assert "DeepSeek-V3.2" in s.page.inner_text("#g-front-missing")
-    assert set(s.requests["/gallery/frontier"][0]["query"]) == {
-        "gpu_sku", "comm_latency_us", "launch_floor_us"}
+    # The view, plus what a cold view's retries carry: the models wanted
+    # first and what the page already holds (not part of the view).
+    query = set(s.requests["/gallery/frontier"][0]["query"])
+    assert {"gpu_sku", "comm_latency_us", "launch_floor_us"} <= query
+    assert query <= {"gpu_sku", "comm_latency_us", "launch_floor_us",
+                     "priority", "have_tag", "have"}
     assert s.count("/gallery/overview") == 0
     s.assert_clean()
 
@@ -2089,11 +2096,61 @@ def test_gallery_frontier_shows_a_progress_bar_while_computing(browser_base):
             '[role="progressbar"]', "els => els.map(e => e.getAttribute('aria-valuemax') || '')")
 
     assert s.wait_for(lambda: "4" in valuemaxes()), "no determinate progress bar while computing"
+    # A small corner note, not a banner; the long explanation is its tooltip.
     text = s.page.inner_text("#g-computing")
-    assert "/ 4 models" in text and "1,234 compute jobs finished" in text, text
+    assert "/ 4 models" in text, text
+    assert "1,234 compute jobs finished" in (s.page.get_attribute("#g-computing", "title") or "")
+    box = s.page.eval_on_selector("#g-computing", "e => getComputedStyle(e).position")
+    assert box == "fixed", box
     assert s.wait_for(lambda: len(calls) >= 3)
     s.page.wait_for_selector("#g-dec-tab-1024", timeout=15000)
     # The stubbed 503s the page retried through log as console resource errors.
+    s.errors = [e for e in s.errors if "503" not in e]
+    s.assert_clean()
+
+
+def test_gallery_draws_each_model_as_it_lands_and_asks_for_the_shown_ones_first(browser_base):
+    """While a cold frontier computes, each 503 carries the models finished
+    since the page's cursor: the page draws them at once, sends the cursor
+    back so they are not sent again, and names the models on its chart
+    first (`priority`). A model not arrived yet is pending, not missing."""
+    browser, base = browser_base
+    s = Session(browser, base)
+    calls = []
+    head = {k: v for k, v in _FRONTIER.items() if k != "models"}
+    first = _FRONTIER["models"][0]
+
+    def frontier(route):
+        calls.append(route.request.url)
+        if len(calls) == 1:
+            route.fulfill(status=503, content_type="application/json",
+                          body=json.dumps({"reason": "still_computing", "retry_after_s": 1,
+                                           "progress": {"done": 1, "total": 2},
+                                           "partial": {"tag": 7, "count": 1, "head": head,
+                                                       "items": [first]}}))
+        elif len(calls) == 2:
+            route.fulfill(status=503, content_type="application/json",
+                          body=json.dumps({"reason": "still_computing", "retry_after_s": 1,
+                                           "progress": {"done": 1, "total": 2},
+                                           "partial": {"tag": 7, "count": 1, "head": head,
+                                                       "items": []}}))
+        else:
+            route.fulfill(status=200, content_type="application/json",
+                          body=json.dumps(_FRONTIER))
+
+    s.page.route("**/gallery/frontier*", frontier)
+    s.goto("/gallery.html")
+    # The first model draws while the second computes ...
+    s.page.wait_for_selector("#g-dec-tab-1024", timeout=15000)
+    assert s.wait_for(lambda: len(calls) >= 2)
+    assert s.page.query_selector("#g-front-missing") is None, "a pending model read as missing"
+    # ... and the retry says what the page holds and what it wants first.
+    from urllib.parse import parse_qs, urlparse
+    retry = parse_qs(urlparse(calls[1]).query)
+    assert retry.get("have_tag") == ["7"] and retry.get("have") == ["1"], retry
+    assert "deepseek-ai/DeepSeek-V3" in (retry.get("priority") or [""])[0].split(","), retry
+    # The whole answer lands: now a model with no frontier is named.
+    s.page.wait_for_selector("#g-front-missing", timeout=15000)
     s.errors = [e for e in s.errors if "503" not in e]
     s.assert_clean()
 

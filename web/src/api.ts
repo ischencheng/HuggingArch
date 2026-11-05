@@ -57,11 +57,17 @@ function waitMs(ms: number, signal?: AbortSignal | null): Promise<void> {
   });
 }
 
+/** What a still-computing request's work published so far that the client
+ *  does not have yet (`partial` in the 503 body): the work's `tag`, how many
+ *  items it has published in all (`count`), the frame every item is drawn
+ *  under (`head`), and the items past the client's cursor. */
+export type Partial = { tag: number; count: number; head: Record<string, unknown> | null; items: unknown[] };
+
 /** How far a still-computing request's work got, when the server says
- *  (`progress` in the 503 body: steps done of steps in all), and how many
+ *  (`progress` in the 503 body: steps done of steps in all), how many
  *  compute jobs it has finished (`jobs_done`, which also moves between two
- *  steps). */
-export type StillComputing = { progress?: { done: number; total: number }; jobsDone?: number };
+ *  steps), and what it has published so far (`partial`). */
+export type StillComputing = { progress?: { done: number; total: number }; jobsDone?: number; partial?: Partial };
 
 /** The status line while the server is still computing what nobody asked
  *  for before: the request keeps waiting, so say how far it got. One text
@@ -80,8 +86,8 @@ async function retryable(response: Response): Promise<{ reason: string; retryMs:
   try {
     const body: unknown = await response.clone().json();
     if (!body || typeof body !== "object") return null;
-    const { reason, retry_after_s: after, progress, jobs_done: jobsDone } = body as {
-      reason?: unknown; retry_after_s?: unknown; progress?: unknown; jobs_done?: unknown;
+    const { reason, retry_after_s: after, progress, jobs_done: jobsDone, partial } = body as {
+      reason?: unknown; retry_after_s?: unknown; progress?: unknown; jobs_done?: unknown; partial?: unknown;
     };
     const budgetMs = typeof reason === "string" ? RETRY_BUDGET_MS[reason] : undefined;
     if (typeof reason !== "string" || budgetMs === undefined) return null;
@@ -90,6 +96,8 @@ async function retryable(response: Response): Promise<{ reason: string; retryMs:
       ? { progress: { done: p.done, total: p.total } }
       : {};
     if (typeof jobsDone === "number") info.jobsDone = jobsDone;
+    const part = partial as Partial | undefined;
+    if (part && typeof part.tag === "number" && Array.isArray(part.items)) info.partial = part;
     return { retryMs: (typeof after === "number" && after > 0 ? after : 5) * 1000, budgetMs, info, reason };
   } catch {
     return null;
@@ -102,7 +110,10 @@ export function isAbort(e: unknown): boolean {
 }
 
 export async function fetchJson<T>(
-  url: string,
+  /** The URL, or how to build it for each attempt — a request that tells
+   *  the server, on every retry, what it already holds and what it wants
+   *  first. */
+  url: string | (() => string),
   init?: RequestInit,
   /** Called each time the server answers "still computing" and the
    *  request waits to ask again. */
@@ -113,7 +124,7 @@ export async function fetchJson<T>(
   let lastMoved: string | undefined;
   for (;;) {
     try {
-      response = await fetch(url, init);
+      response = await fetch(typeof url === "string" ? url : url(), init);
     } catch (e) {
       if (isAbort(e)) throw e;
       const msg = e instanceof Error ? e.message : String(e);
@@ -125,9 +136,9 @@ export async function fetchJson<T>(
     // Work whose reported `done` or finished jobs advance is alive: the
     // budget restarts there, so a long computation that keeps finishing
     // jobs never reads as stuck.
-    const { progress, jobsDone } = waiting.info;
-    const moved = progress === undefined && jobsDone === undefined
-      ? undefined : `${progress?.done}:${jobsDone}`;
+    const { progress, jobsDone, partial } = waiting.info;
+    const moved = progress === undefined && jobsDone === undefined && partial === undefined
+      ? undefined : `${progress?.done}:${jobsDone}:${partial?.count}`;
     if (moved !== undefined && moved !== lastMoved) {
       lastMoved = moved;
       giveUpAt = Date.now() + waiting.budgetMs;

@@ -77,11 +77,15 @@ from backend.api.gallery_overview import (
     _resolve_one,
 )
 from backend.api.offload import (
+    PrioritySlots,
     ensure_spec_generation,
     map_off_loop,
+    report_partial,
     report_progress,
     run_off_loop,
+    run_ranked,
     spec_generation,
+    urgency,
 )
 from backend.arch.eval.precision import AS_SHIPPED
 from backend.arch.snapshots import iter_snapshot_ids
@@ -1391,8 +1395,11 @@ async def frontier_model(model_id: str, view: FrontierView,
     or each layout of the class walk its own compute job and the fold
     (`_finish_frontier`). Kernel Bench rows fold on after the SOL entry is
     in hand, so the lake's answer reaches the pricing and never the walk.
+    Every step queues at the model's urgency (`offload.urgency`): the model
+    a client picked, or has on screen, before the rest.
     """
-    got = await run_off_loop(_frontier_read, model_id, view, track)
+    got = await run_ranked(_frontier_read, model_id, view, track,
+                           name=model_id)
     readsMeasurements = track is not None and track[1] == "reads"
     if "drawn" in got and not readsMeasurements:
         return got["drawn"]
@@ -1404,37 +1411,54 @@ async def frontier_model(model_id: str, view: FrontierView,
         (_layout_walk if readsMeasurements else _layout_law),
         [(model_id, plan["cards"], float(view.gpu_memory_fraction),
           _GALLERY_PRECISION.canonical(), p)
-                      for p in plan["layouts"]])
-    return await run_off_loop(_finish_frontier, model_id, view, plan, results,
-                              track)
+                      for p in plan["layouts"]], name=model_id)
+    return await run_ranked(_finish_frontier, model_id, view, plan, results,
+                            track, name=model_id)
 
 
 async def build_frontier(view: FrontierView) -> dict:
     """Every model's decode frontier under `view`, `_model_concurrency`
-    models at a time, reporting how many have finished. The lake's version
-    is read once (`_view_scope`) and every model is drawn under that one
-    answer: one response reads one lake, and an unanswering lake costs one
-    timeout rather than one per model. A spec refined meanwhile serves
-    nothing (`ensure_spec_generation`)."""
+    models at a time, reporting how many have finished and publishing each
+    as it lands (`report_partial`), so a page draws it without waiting for
+    the slowest. Which model starts next is the client's order
+    (`offload.urgency`: picked, then on screen). The lake's version is read
+    once (`_view_scope`) and every model is drawn under that one answer: one
+    response reads one lake, and an unanswering lake costs one timeout
+    rather than one per model. A spec refined meanwhile serves nothing
+    (`ensure_spec_generation`)."""
     generation = spec_generation()
     model_ids = sorted(iter_snapshot_ids())
+    head = _frontier_head(view)
+    report_partial(head=head)
     track = await run_off_loop(_view_scope, view)
-    sem = asyncio.Semaphore(_model_concurrency())
+    slots = PrioritySlots(_model_concurrency())
     done = 0
     report_progress(done, len(model_ids))
 
     async def one(mid: str) -> dict:
         nonlocal done
-        async with sem:
+        async with slots.hold(urgency(mid)):
             entry = await frontier_model(mid, view, track)
         done += 1
         print(f"frontier {view.gpu_sku}: {done}/{len(model_ids)} · {mid}",
               flush=True)
         report_progress(done, len(model_ids))
+        report_partial(entry)
         return entry
 
     models = list(await asyncio.gather(*[one(m) for m in model_ids]))
     ensure_spec_generation(generation)
+    return {
+        **head,
+        "models": models,
+        "errors_count": sum(1 for m in models if m.get("error")),
+    }
+
+
+def _frontier_head(view: FrontierView) -> dict:
+    """What every model of a frontier response is drawn under: the view's
+    config and the contexts. The same head frames a partial answer
+    (`report_partial`) and the whole one."""
     return {
         "config": {
             "gpu_sku": view.gpu_sku,
@@ -1448,6 +1472,4 @@ async def build_frontier(view: FrontierView) -> dict:
             "precision": _GALLERY_PRECISION.to_json(),
         },
         "seq_lens": list(GALLERY_SEQ_LENS),
-        "models": models,
-        "errors_count": sum(1 for m in models if m.get("error")),
     }

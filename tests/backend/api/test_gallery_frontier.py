@@ -10,6 +10,9 @@ context is empty, no room for a request draws nothing).
 from __future__ import annotations
 
 import copy
+import time
+
+import pytest
 
 import backend.api.gallery_frontier as f
 from backend.inference.parallel_config import ParallelConfig
@@ -1023,3 +1026,48 @@ def test_a_kept_view_carries_its_coverage_and_floors_reuse_the_fold(
         other["drawn"]["frontier"][sk])
     assert f._frontier_read("test/Model", view)["drawn"]["measured_track"] == (
         first["measured_track"])
+
+
+def test_a_cold_frontier_publishes_each_model_in_the_clients_order(monkeypatch):
+    """While the frontier computes, each finished model is published with
+    the response's head (`offload.report_partial`), so a page draws it at
+    once; the model the client put first (`priority`) is started first."""
+    import asyncio
+
+    from backend.api import offload
+
+    monkeypatch.setattr(f, "_frontier_scope", lambda: ("none-scope", "none"))
+    monkeypatch.setattr(f, "_model_concurrency", lambda: 1)
+    monkeypatch.setattr(f, "iter_snapshot_ids", lambda: ["a/1", "b/2", "c/3"])
+    started: list = []
+
+    def read(model_id, view, got=None):
+        started.append(model_id)
+        time.sleep(0.05)
+        return {"drawn": {"model_id": model_id}}
+
+    monkeypatch.setattr(f, "_frontier_read", read)
+    view = f.FrontierView("B200")
+
+    async def scenario():
+        with pytest.raises(offload.StillComputing) as info:
+            await offload.within_deadline(
+                f.frontier_request_key(view), lambda: f.build_frontier(view),
+                hint=["c/3"])
+        partial = info.value.partial
+        offload.set_deadline(None)
+        whole = await offload.within_deadline(
+            f.frontier_request_key(view), lambda: f.build_frontier(view))
+        return partial, whole
+
+    monkeypatch.setattr(offload, "_deadline_s", 0.08)
+    try:
+        partial, whole = asyncio.run(scenario())
+    finally:
+        offload.set_deadline(None)
+    assert partial["head"]["seq_lens"] == list(GALLERY_SEQ_LENS)
+    assert partial["head"]["config"]["gpu_sku"] == "B200"
+    assert [m["model_id"] for m in partial["items"]][:1] == ["c/3"]
+    assert started[0] == "c/3"
+    assert [m["model_id"] for m in whole["models"]] == ["a/1", "b/2", "c/3"]
+    assert {k: whole[k] for k in partial["head"]} == partial["head"]

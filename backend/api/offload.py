@@ -35,6 +35,17 @@ analysis, an estimate, a sweep, the gallery) hands its work here instead:
     each, so a sweep spreads across the workers. With `progress=True` it
     counts the finished cells into the work's progress (`report_progress`),
     so a retry's 503 says how many of the sweep's cells are done.
+  * The cells of every request share one set of slots (`_cell_slots`), and
+    a free slot goes to the most urgent waiter, not the oldest
+    (`PrioritySlots`): work a client polled most recently first — the
+    view on screen before a view the client left — and within one work the
+    items the client named first (`within_deadline(..., hint=)`: the models
+    on screen, the one it picked). A single job (`offload`, an estimate)
+    takes no slot, so the cells never hold up the request a user waits on.
+  * Work that yields results one item at a time publishes them as it goes
+    (`report_partial`); the 503 carries the items a client does not have yet
+    (`within_deadline(..., cursor=)`), so a page draws each as it lands
+    instead of waiting for the slowest.
 
 `fn` is a top-level function and its arguments are picklable — the pool
 runs it in another process.
@@ -42,6 +53,7 @@ runs it in another process.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import hashlib
 import itertools
@@ -51,7 +63,8 @@ import pickle
 import time
 import weakref
 from concurrent.futures.process import BrokenProcessPool
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import (Any, AsyncIterator, Awaitable, Callable, Dict, List,
+                    Optional, Sequence, Tuple, TypeVar)
 
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, Response
@@ -96,10 +109,15 @@ class StillComputing(Exception):
 
     def __init__(self, message: str = "",
                  progress: Optional[Tuple[int, int]] = None,
-                 jobs_done: Optional[int] = None):
+                 jobs_done: Optional[int] = None,
+                 partial: Optional[Dict[str, Any]] = None):
         super().__init__(message)
         self.progress = progress
         self.jobs_done = jobs_done
+        #: The items the work has published that the client does not have
+        #: yet (`report_partial`): `{"tag", "count", "head", "items"}`, or
+        #: None for work that publishes none.
+        self.partial = partial
 
 
 class SpecChanged(StillComputing):
@@ -206,29 +224,117 @@ async def run_off_loop(fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _
     return out
 
 
+class PrioritySlots:
+    """`n` slots, each granted to the most urgent waiter.
+
+    A waiter's urgency is a zero-argument callable read when a slot is
+    granted, not when the waiter arrived: a client that switches view or
+    picks another model reorders what is already queued. Grants happen on
+    the next turn of the loop, so waiters that arrive together — the models
+    of one frontier, gathered at once — are ranked together rather than the
+    first come taking the free slots. Ties go to the earlier waiter, so
+    without urgencies this is a FIFO semaphore."""
+
+    def __init__(self, n: int) -> None:
+        self._free = n
+        self._seq = itertools.count()
+        self._waiters: List[Tuple[Callable[[], Any], int, "asyncio.Future[None]"]] = []
+        self._granting = False
+
+    @contextlib.asynccontextmanager
+    async def hold(self, urgency: Callable[[], Any]) -> AsyncIterator[None]:
+        fut: "asyncio.Future[None]" = asyncio.get_running_loop().create_future()
+        entry = (urgency, next(self._seq), fut)
+        self._waiters.append(entry)
+        self._schedule()
+        try:
+            await fut
+        except asyncio.CancelledError:
+            if fut.done() and not fut.cancelled():
+                self._release()        # granted, then cancelled: pass it on
+            elif entry in self._waiters:
+                self._waiters.remove(entry)
+            raise
+        try:
+            yield
+        finally:
+            self._release()
+
+    def _release(self) -> None:
+        self._free += 1
+        self._schedule()
+
+    def _schedule(self) -> None:
+        if not self._granting:
+            self._granting = True
+            asyncio.get_running_loop().call_soon(self._grant)
+
+    def _grant(self) -> None:
+        self._granting = False
+        self._waiters = [w for w in self._waiters if not w[2].done()]
+        while self._free > 0 and self._waiters:
+            nxt = min(self._waiters, key=lambda w: (w[0](), w[1]))
+            self._waiters.remove(nxt)
+            self._free -= 1
+            nxt[2].set_result(None)
+
+
+def urgency(name: Optional[str] = None) -> Callable[[], Any]:
+    """How urgent a slot is for the work this task runs for, read when a
+    slot frees: work asked for more recently first (the view a client is
+    on), then `name`'s place in the order the client asked for (`hint`).
+    Outside a request (the warm job) every waiter ties and order is FIFO."""
+    work = _current_work.get()
+    if work is None:
+        return lambda: (0.0, 0)
+
+    def read() -> Tuple[float, int]:
+        rank = len(work.hint)
+        if name is not None:
+            rank = work.hint.get(name, rank)
+        return (-work.asked_at, rank)
+
+    return read
+
+
 #: Per event loop: the slots sweep cells hold while in the pool
 #: (`_cell_slots`).
-_cell_slot_tables: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = (
+_cell_slot_tables: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, PrioritySlots]" = (
     weakref.WeakKeyDictionary())
 
 
-def _cell_slots() -> asyncio.Semaphore:
+def _cell_slots() -> PrioritySlots:
     """Every worker but one, for sweep cells. A sweep is hundreds of cells;
     handed to the pool together they fill its one FIFO queue, and a request
     that is a single job — a one-second lookup, an estimate — waits behind
     every one of them (after a restart `/supported-models` sat behind the
     Scaling sweeps). Capped, the cells leave a worker to the single jobs;
-    a one-worker pool still bounds the wait to one cell."""
+    a one-worker pool still bounds the wait to one cell. A freed slot goes
+    to the most urgent cell (`PrioritySlots`, `urgency`)."""
     loop = asyncio.get_running_loop()
     slots = _cell_slot_tables.get(loop)
     if slots is None:
-        slots = _cell_slot_tables[loop] = asyncio.Semaphore(
+        slots = _cell_slot_tables[loop] = PrioritySlots(
             max(1, pool.worker_count() - 1))
     return slots
 
 
+async def run_ranked(fn: Callable[..., _T], /, *args: Any,
+                     name: Optional[str] = None) -> _T:
+    """`run_off_loop` for one job of a batch — a step of one model of the
+    gallery — in a cell slot at `name`'s urgency (`urgency`), so a batch's
+    steps queue with its cells and leave the single jobs their worker."""
+    if not _off_process:
+        return await run_off_loop(fn, *args)
+    async with _cell_slots().hold(urgency(name)):
+        return await run_off_loop(fn, *args)
+
+
 async def map_off_loop(fn: Callable[[Any], _T], items: List[Any],
-                       *, progress: bool = False) -> List[_T]:
+                       *, progress: bool = False,
+                       name: Optional[str] = None,
+                       on_result: Optional[Callable[[int, _T], None]] = None
+                       ) -> List[_T]:
     """`fn` over `items`, in order — the cells of a sweep. In the server each
     cell is its own compute job, so one sweep spreads across the workers
     beside every other request's jobs, in at most every worker but one at a
@@ -237,7 +343,10 @@ async def map_off_loop(fn: Callable[[Any], _T], items: List[Any],
     cells are counted into the work's progress (`report_progress`), so a
     caller that misses the deadline reads "k of n cells done" in its 503;
     the count is per cell in the server, start/end elsewhere (a thread's
-    serial map has no between to report)."""
+    serial map has no between to report). `name` is what the client's order
+    knows these cells by (`urgency`) — the model they belong to.
+    `on_result(index, result)` is told of each cell as it finishes, in the
+    server (a thread's serial map has no between: it is told of none)."""
     if _off_process:
         slots = _cell_slots()
         done = 0
@@ -245,16 +354,21 @@ async def map_off_loop(fn: Callable[[Any], _T], items: List[Any],
         if progress:
             report_progress(0, total)
 
-        async def cell(item: Any) -> _T:
+        rank = urgency(name)
+
+        async def cell(index: int, item: Any) -> _T:
             nonlocal done
-            async with slots:
+            async with slots.hold(rank):
                 out = await run_off_loop(fn, item)
             if progress:
                 done += 1
                 report_progress(done, total)
+            if on_result is not None:
+                on_result(index, out)
             return out
 
-        return list(await asyncio.gather(*(cell(item) for item in items)))
+        return list(await asyncio.gather(
+            *(cell(i, item) for i, item in enumerate(items))))
     if progress:
         report_progress(0, len(items))
         out = await asyncio.to_thread(pool.map_cells, fn, items)
@@ -268,8 +382,9 @@ class _Work:
     got (`report_progress`), how many compute jobs it finished, and how many
     requests wait on it now."""
 
-    __slots__ = ("__weakref__", "abandoned", "held_until", "jobs_done",
-                 "left_at", "progress", "tag", "task", "waiting")
+    __slots__ = ("__weakref__", "abandoned", "asked_at", "held_until", "hint",
+                 "jobs_done", "left_at", "partial_head", "partial_items",
+                 "progress", "tag", "task", "waiting")
 
     def __init__(self) -> None:
         self.task: "asyncio.Task[Any]"
@@ -279,6 +394,14 @@ class _Work:
         self.jobs_done = 0
         self.waiting = 0
         self.left_at: Optional[float] = None
+        #: When a request last asked for this work: the more recent, the
+        #: more urgent its cells (`urgency`).
+        self.asked_at = time.monotonic()
+        #: The client's order of this work's items, by name (`urgency`).
+        self.hint: Dict[str, int] = {}
+        #: What the work published so far (`report_partial`).
+        self.partial_head: Optional[Dict[str, Any]] = None
+        self.partial_items: List[Any] = []
         #: What this work's jobs are tagged with on the pool's progress
         #: channel (`_reporting`). An int, so it crosses to a worker and
         #: back by value and holds no reference to the work itself.
@@ -367,6 +490,22 @@ def report_progress(done: int, total: int) -> None:
     work.progress = (int(done), int(total))
 
 
+def report_partial(item: Any = None, *,
+                   head: Optional[Dict[str, Any]] = None) -> None:
+    """Publish one finished item of the work this task runs for — and, once,
+    the `head` every item is drawn under (the page's frame: its axes, its
+    config) — for a request that misses the deadline to take with its 503
+    (`within_deadline(..., cursor=)`). A no-op outside a request (the warm
+    job, the CLI: nobody draws a partial answer)."""
+    work = _current_work.get()
+    if work is None:
+        return
+    if head is not None:
+        work.partial_head = head
+    if item is not None:
+        work.partial_items.append(item)
+
+
 # Per event loop: a task belongs to the loop that runs it (a test client
 # starts a loop of its own).
 _tables: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Dict[str, _Work]]" = (
@@ -419,9 +558,17 @@ def _own(value: _T) -> _T:
     return own  # type: ignore[return-value]
 
 
-async def within_deadline(key: str, start: Callable[[], Awaitable[_T]]) -> _T:
+async def within_deadline(key: str, start: Callable[[], Awaitable[_T]], *,
+                          hint: Optional[Sequence[str]] = None,
+                          cursor: Optional[Tuple[int, int]] = None) -> _T:
     """The result of the work `start()` begins for `key` — joined if that
-    work is already running or held — or `StillComputing` past the deadline."""
+    work is already running or held — or `StillComputing` past the deadline.
+
+    Asking makes the work the most recently asked for (`urgency`); `hint`,
+    when given, is the order the client wants its items in. `cursor` is
+    `(tag, count)`: the work and how many of its published items the client
+    already has; the 503 carries the rest (all of them when the tag is not
+    this work's — the work was cancelled and begun again)."""
     table = _table()
     _expire(table)
     work = table.get(key)
@@ -434,6 +581,9 @@ async def within_deadline(key: str, start: Callable[[], Awaitable[_T]]) -> _T:
             _current_work.reset(token)
         table[key] = work
         work.task.add_done_callback(lambda _t, w=work: _settle(table, key, w))
+    work.asked_at = time.monotonic()
+    if hint is not None:
+        work.hint = {name: i for i, name in enumerate(hint)}
     work.waiting += 1
     try:
         if _deadline_s is None:
@@ -446,11 +596,20 @@ async def within_deadline(key: str, start: Callable[[], Awaitable[_T]]) -> _T:
             # The ledger is read now, so take what the workers reported
             # since the last fold first.
             _fold_progress()
+            partial = None
+            if work.partial_head is not None or work.partial_items:
+                have = (cursor[1] if cursor is not None
+                        and cursor[0] == work.tag else 0)
+                partial = {"tag": work.tag,
+                           "count": len(work.partial_items),
+                           "head": work.partial_head,
+                           "items": work.partial_items[have:]}
             raise StillComputing(
                 "Still computing — the result is not ready yet. Retry in a "
                 "few seconds; the computation continues while it is asked "
                 "for.",
-                progress=work.progress, jobs_done=work.jobs_done) from None
+                progress=work.progress, jobs_done=work.jobs_done,
+                partial=partial) from None
     finally:
         work.leave(table, key)
 

@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.encoders import jsonable_encoder
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -140,6 +141,8 @@ async def _compute_not_ready(_request, exc: Exception):
             content["progress"] = {"done": done, "total": total}
         if exc.jobs_done is not None:
             content["jobs_done"] = exc.jobs_done
+        if exc.partial is not None:
+            content["partial"] = jsonable_encoder(exc.partial)
     return JSONResponse(
         status_code=503,
         headers={"Retry-After": str(_offload.RETRY_AFTER_S)},

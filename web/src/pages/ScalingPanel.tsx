@@ -696,7 +696,7 @@ function ParallelSection({
     content = <div className="text-xs text-red-500 text-center py-6">{status.text}</div>;
   } else if (!blob) {
     content = status
-      ? <div className="py-6 flex justify-center"><ComputeProgress label={status.text} progress={status.progress} /></div>
+      ? <div className="py-6 flex justify-center text-xs text-gray-400"><ComputeProgress compact label={status.text} progress={status.progress} /></div>
       : <div className="text-xs text-red-500 text-center py-6">{MODE_LABEL[mode]}: sweep load failed</div>;
   } else if (blob.unavailable) {
     // Every layout of this mode was invalid for this model (e.g. CP over a
@@ -750,11 +750,15 @@ function ParallelSection({
     const pre = build("prefill");
     const dec = build("decode");
     if (pre.every((s) => !s.points.length) && dec.every((s) => !s.points.length)) {
-      content = (
-        <div className="text-xs text-amber-700 text-center py-8">
-          No GPU × degree fits (weights over budget).
-        </div>
-      );
+      // Still computing: the cells that landed so far fit nothing, the rest
+      // may — not a verdict yet.
+      content = status
+        ? <div className="py-6 flex justify-center"><ComputeProgress compact label={status.text} progress={status.progress} /></div>
+        : (
+          <div className="text-xs text-amber-700 text-center py-8">
+            No GPU × degree fits (weights over budget).
+          </div>
+        );
     } else {
       const xTitle = mode === "tp_tp" ? "TP degree (= #GPUs)" : "EP degree (= #GPUs)";
       const xUnit = mode === "tp_tp" ? "TP" : "EP";
@@ -805,6 +809,18 @@ function ParallelSection({
       </div>
     ) : null;
     content = <>{pastNote}{content}{showMeasured ? <MeasuredRule /> : null}<LadderNotes blob={blob} unit={mode === "tp_tp" ? "TP" : "EP"} /></>;
+  }
+  // Drawn from the cells that landed while the rest compute: a small note
+  // in the corner says so, not a bar over the chart.
+  if (blob && status && !status.failed) {
+    content = (
+      <>
+        <div data-sweep-partial className="flex justify-end mb-1 text-11 text-gray-400">
+          <ComputeProgress compact label="computing" progress={status.progress} unit="cells" />
+        </div>
+        {content}
+      </>
+    );
   }
 
   return (
@@ -1547,7 +1563,16 @@ export function ScalingPanel(props: {
     setParStatus({ text: "Loading…" });
     setParMeasNote(null);
     fetchSweepCached<ParResp>(path, sol, { signal: ctrl.signal },
-      (info) => { if (my === parSeq.current) setParStatus({ text: stillComputingNote(info), progress: info.progress }); })
+      (info) => {
+        if (my !== parSeq.current) return;
+        // The cells finished so far, assembled by the server: drawn now,
+        // replaced by the whole answer when it lands.
+        if (info.partial?.head) {
+          const part = info.partial.head as ParResp;
+          setByMode(part.by_mode || (part.mode ? { [part.mode]: part } : {}));
+        }
+        setParStatus({ text: stillComputingNote(info), progress: info.progress });
+      })
       .then((resp) => {
         if (my !== parSeq.current) return;
         show(resp);
@@ -1658,7 +1683,7 @@ export function ScalingPanel(props: {
           // otherwise the two sweeps finishing out of order make the page jump.
           <div className="text-xs text-gray-400 text-center py-4 mb-2">
             {status.progress
-              ? <ComputeProgress label={status.text} progress={status.progress} />
+              ? <ComputeProgress compact label={status.text} progress={status.progress} />
               : status.text}
           </div>
         ) : (

@@ -13,8 +13,9 @@ import asyncio
 import logging
 import os
 import pathlib
+import dataclasses
 from dataclasses import dataclass, field
-from typing import (Any, Callable, FrozenSet, Iterator, List, Mapping,
+from typing import (Any, Callable, Dict, FrozenSet, Iterator, List, Mapping,
                     Optional, Tuple, get_args)
 
 from fastapi.responses import Response
@@ -39,6 +40,7 @@ from backend.api.offload import (
     ensure_spec_generation,
     map_off_loop,
     render_json,
+    report_partial,
     report_progress,
     spec_generation,
     within_deadline,
@@ -597,12 +599,18 @@ class _CachedSweep:
     #: cells lets the server count the cells instead
     #: (`map_off_loop(progress=True)`), one writer either way.
     steps_are_progress: bool = False
+    #: Whether the answer of some of the cells is an answer: a plan of many
+    #: independent cells (`ParallelSweepPlan`) assembles the cells it has —
+    #: the points not there yet are simply absent — so a page can draw a
+    #: sweep as its cells land (`_publish_partials`). A one-cell plan has
+    #: nothing in between.
+    assembles_partially: bool = False
 
 
 _PARALLEL = _CachedSweep("parallel", _parallel_plan, _parallel_cells,
                          _layout_cell_step_count, _layout_cell_steps,
                          _layout_cell_of_steps, _parallel_assemble,
-                         cloud="decode_cloud")
+                         cloud="decode_cloud", assembles_partially=True)
 _ESTIMATE = _CachedSweep("sweep", _estimate_plan, _estimate_cells,
                          _estimate_cell_step_count, _estimate_cell_steps,
                          _estimate_cell_of_steps, _estimate_assemble,
@@ -755,6 +763,36 @@ def _sweep_finish(sweep: _CachedSweep, start: _SweepStart, results: list,
     return _answer(sweep, out, render)
 
 
+#: How often a sweep that assembles partially republishes what it has.
+_PARTIAL_EVERY_S = 2.0
+
+
+def _partial_answer(sweep: _CachedSweep, start: _SweepStart,
+                    have: Dict[int, Any]) -> dict:
+    """The answer of the cells finished so far (`have`, by cell index, the
+    reused ones among them): the plan narrowed to those cells, assembled as
+    the whole one is (`sweep.assemble`), never stored."""
+    cells = sweep.cells(start.plan)
+    done = sorted(have)
+    part = dataclasses.replace(start.plan, cells=[cells[i] for i in done])
+    return sweep.assemble(part, [have[i] for i in done])
+
+
+async def _publish_partials(sweep: _CachedSweep, start: _SweepStart,
+                            have: Dict[int, Any], moved: asyncio.Event) -> None:
+    """While the cells run, republish the answer of those finished
+    (`offload.report_partial`) when one has landed since, at most every
+    `_PARTIAL_EVERY_S`; assembled on a thread, off the loop. Runs until
+    cancelled."""
+    while True:
+        await moved.wait()
+        moved.clear()
+        snapshot = dict(have)
+        report_partial(head=await asyncio.to_thread(
+            _partial_answer, sweep, start, snapshot))
+        await asyncio.sleep(_PARTIAL_EVERY_S)
+
+
 async def _run_sweep(sweep: _CachedSweep, req: Any, render: bool) -> Any:
     """The one place a Scaling-panel sweep is keyed, computed, and stored —
     so the warm job fills the SAME key the endpoint reads and a warmed value
@@ -790,9 +828,31 @@ async def _run_sweep(sweep: _CachedSweep, req: Any, render: bool) -> Any:
              for i, cell in enumerate(cells) if i not in start.reused]
     if not sweep.steps_are_progress:
         report_progress(0, len(cells))
-    computed = (await map_off_loop(_run_cell, items,
-                                   progress=not sweep.steps_are_progress)
-                if items else [])
+    # A sweep a page can draw cell by cell publishes what it has as it goes;
+    # a measured one does not — its points read the lake once, at the end.
+    publisher = None
+    on_result = None
+    if sweep.assembles_partially and not start.reads and items:
+        have: Dict[int, Any] = dict(start.reused)
+        moved = asyncio.Event()
+        computedAt = [i for i in range(len(cells)) if i not in start.reused]
+
+        def on_result(position: int, result: Any) -> None:
+            have[computedAt[position]] = result
+            moved.set()
+
+        if have:
+            moved.set()
+        publisher = asyncio.ensure_future(
+            _publish_partials(sweep, start, have, moved))
+    try:
+        computed = (await map_off_loop(_run_cell, items,
+                                       progress=not sweep.steps_are_progress,
+                                       on_result=on_result)
+                    if items else [])
+    finally:
+        if publisher is not None:
+            publisher.cancel()
     results = []
     for index, _cell in enumerate(cells):
         if index in start.reused:
