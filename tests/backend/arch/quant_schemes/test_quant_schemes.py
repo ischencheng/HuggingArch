@@ -269,14 +269,14 @@ class TestSchemeYamlValidation(unittest.TestCase):
         `compressed-tensors` is mid-migration — `tile_2d` is a shape while
         `group` / `channel` / `tensor` are still counts — and this is what
         makes that state safe rather than merely tolerated."""
-        from backend.arch.eval.scheme_dialect import _shape_product, _eval_formula
+        from backend.arch.eval.scheme_dialect import _shape_product, eval_formula
         bind = {"in_": 576, "out": 7168, "block_h": 128, "block_w": 128}
         shape = ["(in_ + block_h - 1) // block_h",
                  "(out + block_w - 1) // block_w"]
         count = ("((in_ + block_h - 1) // block_h) "
                  "* ((out + block_w - 1) // block_w)")
         self.assertEqual(_shape_product(shape, bind),
-                         _eval_formula(count, bind))
+                         eval_formula(count, bind))
         self.assertEqual(_shape_product(shape, bind), 5 * 56)
 
     def test_invalid_quantization_status_rejected(self):

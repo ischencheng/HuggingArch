@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 _PREDICATE_TRUE_FALSE = re.compile(r"\b(true|false)\b")
 
 
-def _eval_predicate(expr_str: str, bindings: Dict[str, Any]) -> bool:
+def eval_predicate(expr_str: str, bindings: Dict[str, Any]) -> bool:
     """Evaluate a YAML-author `when:` predicate against `bindings`.
 
     Supports: `==`, `!=`, `and`, `or`, `not`, parens, name references,
@@ -124,11 +124,11 @@ def _shape_product(axes, bindings: Dict[str, Any]) -> int:
     """
     total = 1
     for axis in axes:
-        total *= _eval_formula(axis, bindings)
+        total *= eval_formula(axis, bindings)
     return total
 
 
-def _formula_symbols(formula: str) -> FrozenSet[str]:
+def formula_symbols(formula: str) -> FrozenSet[str]:
     """Return the identifiers consumed by one arithmetic formula.
 
     This uses the dialect's own keyword rewrite and parser so projection
@@ -155,7 +155,7 @@ def _formula_symbols(formula: str) -> FrozenSet[str]:
     )
 
 
-def _eval_formula(formula: str, bindings: Dict[str, Any]) -> int:
+def eval_formula(formula: str, bindings: Dict[str, Any]) -> int:
     """Evaluate an arithmetic formula like `(in * out) / group_size`
     against `bindings`. Supports +, -, *, /, //, %, **, parens, unary
     minus, integer literals, identifier references. AST-walked with
@@ -251,7 +251,7 @@ def _eval_formula(formula: str, bindings: Dict[str, Any]) -> int:
 
 
 
-def _logical_dtype_label(numeric_format: Optional[str], logical_bits: int,
+def logical_dtype_label(numeric_format: Optional[str], logical_bits: int,
                           storage_dtype: str) -> str:
     """Translate `(numeric_format selection, logical bits)` → display label.
 
@@ -293,7 +293,7 @@ def _logical_dtype_label(numeric_format: Optional[str], logical_bits: int,
         f"({storage_dtype!r}), which is the packaging and not the format")
 
 
-def _select_numeric_format(
+def select_numeric_format(
     scheme: QuantScheme,
     per_role_bindings: Dict[str, Any],
 ) -> Optional[str]:
@@ -301,6 +301,6 @@ def _select_numeric_format(
     rule's format. None if no rules registered (informational only).
     """
     for when, fmt in scheme.numeric_format_resolver:
-        if _eval_predicate(when, per_role_bindings):
+        if eval_predicate(when, per_role_bindings):
             return fmt
     return None

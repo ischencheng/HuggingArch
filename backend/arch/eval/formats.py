@@ -81,6 +81,8 @@ from ..dtypes import dtype_bytes as _dtype_bytes
 from .dim import exact_div
 from .program import Stack
 from .refusal import SpecRefusal
+from .scheme_dialect import (eval_formula, eval_predicate, formula_symbols,
+                             logical_dtype_label, select_numeric_format)
 from .storage import StorageKind
 from .values import Extent, product
 
@@ -242,11 +244,8 @@ class TensorFormat:
         """
         if self.scheme is None:
             return self.storage_dtype
-        from .scheme_dialect import (
-            _logical_dtype_label, _select_numeric_format,
-        )
-        return _logical_dtype_label(
-            _select_numeric_format(self.scheme, dict(self.bindings)),
+        return logical_dtype_label(
+            select_numeric_format(self.scheme, dict(self.bindings)),
             int(self.num_bits), self.storage_dtype)
 
     @property
@@ -383,9 +382,8 @@ class TensorFormat:
                     f"{metadata.name}: metadata declaration provides only "
                     "cardinality, not a physical shape"
                 )
-            from .scheme_dialect import _formula_symbols
             dependencies = frozenset().union(
-                *(_formula_symbols(axis) for axis in geometry.axes)
+                *(formula_symbols(axis) for axis in geometry.axes)
             )
             if dependencies.intersection({"in", "out"}):
                 if geometry.stored_transform == "matrix":
@@ -1282,9 +1280,8 @@ def _metadata_stored_transform(
     """Record the typed stored-axis view consumed by a metadata formula."""
     if stored is None or not axes:
         return None
-    from .scheme_dialect import _formula_symbols
     dependencies = frozenset().union(
-        *(_formula_symbols(str(axis)) for axis in axes)
+        *(formula_symbols(str(axis)) for axis in axes)
     )
     if not dependencies.intersection({"in", "out"}):
         return None
@@ -1306,15 +1303,13 @@ def _cardinality(formula: str, bound: Mapping[str, Any]) -> Extent:
     exactly that — keyword rewrite plus a whitelisted AST walk — so this defers
     to it rather than growing a second dialect that would drift.
     """
-    from .scheme_dialect import _eval_formula
-    return _eval_formula(formula, dict(bound))
+    return eval_formula(formula, dict(bound))
 
 
 def _predicate(when: str, bound: Mapping[str, Any]) -> bool:
     """A sibling's `when:` — same symbol space, same evaluator."""
-    from .scheme_dialect import _eval_predicate
     try:
-        return bool(_eval_predicate(when, dict(bound)))
+        return bool(eval_predicate(when, dict(bound)))
     except (KeyError, ValueError, TypeError):
         # Unresolvable predicate: emit the sibling. An unstated scale is a
         # silent under-count of storage; a spurious one shows up as a number

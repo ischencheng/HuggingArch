@@ -37,7 +37,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from backend.arch.activation_formats import ACTIVATION_FORMATS
-from backend.arch.eval.scheme_dialect import _eval_predicate
+from backend.arch.eval.scheme_dialect import eval_predicate
 
 
 # Tight enum for storage-vs-logical packing ratios. Any other value is
@@ -656,7 +656,7 @@ class ActivationDeclaration:
                 f"({sorted(rules)}); add the treatment with the activation "
                 f"format its kernel quantises to.")
         for when, fmt in rules[treatment]:
-            if bool(_eval_predicate(when, dict(bindings))):
+            if bool(eval_predicate(when, dict(bindings))):
                 return fmt
         raise ValueError(
             f"quant_schemes/{scheme_name}.yaml: no `activation` rule of "

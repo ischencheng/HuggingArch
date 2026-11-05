@@ -9,62 +9,62 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from backend.arch.eval.scheme_dialect import (
-    _eval_formula,
-    _eval_predicate,
+    eval_formula,
+    eval_predicate,
 )
 
 
 class TestPredicateEval(unittest.TestCase):
 
     def test_simple_equality(self):
-        self.assertTrue(_eval_predicate("symmetric == false", {"symmetric": False}))
-        self.assertFalse(_eval_predicate("symmetric == false", {"symmetric": True}))
+        self.assertTrue(eval_predicate("symmetric == false", {"symmetric": False}))
+        self.assertFalse(eval_predicate("symmetric == false", {"symmetric": True}))
 
     def test_string_comparison(self):
-        self.assertTrue(_eval_predicate("type == 'int'", {"type": "int"}))
-        self.assertFalse(_eval_predicate("type == 'int'", {"type": "float"}))
+        self.assertTrue(eval_predicate("type == 'int'", {"type": "int"}))
+        self.assertFalse(eval_predicate("type == 'int'", {"type": "float"}))
 
     def test_compound_and(self):
         bindings = {"type": "int", "num_bits": 4}
-        self.assertTrue(_eval_predicate("type == 'int' and num_bits == 4", bindings))
-        self.assertFalse(_eval_predicate("type == 'int' and num_bits == 8", bindings))
+        self.assertTrue(eval_predicate("type == 'int' and num_bits == 4", bindings))
+        self.assertFalse(eval_predicate("type == 'int' and num_bits == 8", bindings))
 
     def test_compound_or(self):
         bindings = {"num_bits": 4}
-        self.assertTrue(_eval_predicate(
+        self.assertTrue(eval_predicate(
             "num_bits == 4 or num_bits == 8", bindings,
         ))
-        self.assertFalse(_eval_predicate(
+        self.assertFalse(eval_predicate(
             "num_bits == 16 or num_bits == 32", bindings,
         ))
 
     def test_negation(self):
-        self.assertTrue(_eval_predicate("not (num_bits == 8)", {"num_bits": 4}))
+        self.assertTrue(eval_predicate("not (num_bits == 8)", {"num_bits": 4}))
 
     def test_true_false_keywords(self):
-        self.assertTrue(_eval_predicate("true", {}))
-        self.assertFalse(_eval_predicate("false", {}))
+        self.assertTrue(eval_predicate("true", {}))
+        self.assertFalse(eval_predicate("false", {}))
 
     def test_unbound_name_rejected(self):
         with self.assertRaisesRegex(ValueError, "unbound name"):
-            _eval_predicate("foo == 1", {})
+            eval_predicate("foo == 1", {})
 
     def test_unsupported_node_rejected(self):
         with self.assertRaisesRegex(ValueError, "unsupported"):
-            _eval_predicate("len(x) == 1", {"x": [1, 2]})
+            eval_predicate("len(x) == 1", {"x": [1, 2]})
 
 
 class TestFormulaEval(unittest.TestCase):
 
     def test_simple_product(self):
         self.assertEqual(
-            _eval_formula("in * out", {"in": 7168, "out": 3072}),
+            eval_formula("in * out", {"in": 7168, "out": 3072}),
             22020096,
         )
 
     def test_division_by_group_size(self):
         self.assertEqual(
-            _eval_formula(
+            eval_formula(
                 "(in * out) / group_size",
                 {"in": 7168, "out": 3072, "group_size": 32},
             ),
@@ -73,7 +73,7 @@ class TestFormulaEval(unittest.TestCase):
 
     def test_per_tile_2d(self):
         self.assertEqual(
-            _eval_formula(
+            eval_formula(
                 "(in / block_h) * (out / block_w)",
                 {"in": 7168, "out": 7168, "block_h": 128, "block_w": 128},
             ),
@@ -81,22 +81,22 @@ class TestFormulaEval(unittest.TestCase):
         )
 
     def test_constant_one(self):
-        self.assertEqual(_eval_formula("1", {}), 1)
+        self.assertEqual(eval_formula("1", {}), 1)
 
     def test_unbound_symbol_rejected(self):
         with self.assertRaisesRegex(ValueError, "unbound symbol"):
-            _eval_formula("in * mystery", {"in": 4})
+            eval_formula("in * mystery", {"in": 4})
 
     def test_floor_div_works(self):
-        self.assertEqual(_eval_formula("in // 2", {"in": 7}), 3)
+        self.assertEqual(eval_formula("in // 2", {"in": 7}), 3)
 
     def test_true_division_refuses_a_fractional_axis(self):
         with self.assertRaisesRegex(ValueError, "did not evaluate to an integer"):
-            _eval_formula("in / group_size", {"in": 33, "group_size": 32})
+            eval_formula("in / group_size", {"in": 33, "group_size": 32})
 
     def test_true_division_is_exact_above_float_precision(self):
         self.assertEqual(
-            _eval_formula(
+            eval_formula(
                 "(in * out) / group_size",
                 {"in": 9007199254740993, "out": 32, "group_size": 32},
             ),
@@ -116,14 +116,14 @@ class TestEveryFormatHasALabelOfItsOwn(unittest.TestCase):
     """
 
     def test_a_numeric_format_with_no_label_is_not_its_container(self):
-        from backend.arch.eval.scheme_dialect import _logical_dtype_label
-        self.assertEqual(_logical_dtype_label("mx_e2m1", 4, "U8"), "MXFP4")
-        self.assertEqual(_logical_dtype_label("fp_e2m1", 4, "U8"), "FP4")
+        from backend.arch.eval.scheme_dialect import logical_dtype_label
+        self.assertEqual(logical_dtype_label("mx_e2m1", 4, "U8"), "MXFP4")
+        self.assertEqual(logical_dtype_label("fp_e2m1", 4, "U8"), "FP4")
         # Unquantized: no format was selected, so the storage dtype IS the
         # dtype and that is the one case it may be returned.
-        self.assertEqual(_logical_dtype_label(None, 16, "BF16"), "BF16")
+        self.assertEqual(logical_dtype_label(None, 16, "BF16"), "BF16")
         with self.assertRaisesRegex(ValueError, "no dtype label"):
-            _logical_dtype_label("fp_e3m2", 6, "U8")
+            logical_dtype_label("fp_e3m2", 6, "U8")
 
     def test_mx_and_nv_fp4_are_two_labels(self):
         # Same element type, different format: NVFP4's scale is an FP8
@@ -134,15 +134,15 @@ class TestEveryFormatHasALabelOfItsOwn(unittest.TestCase):
         # distinction being inferred from the scale it happens to carry.
         from backend.arch.dtypes import corpus_token
         from backend.arch.eval.scheme_dialect import (
-            _logical_dtype_label, _select_numeric_format,
+            logical_dtype_label, select_numeric_format,
         )
         from backend.arch.quant_schemes import scheme_named
         got = {}
         for name in ("mxfp4", "mxfp4-pack-quantized", "mxfp4-dot-suffix",
                      "nvfp4", "fp4"):
             scheme = scheme_named(name)
-            fmt = _select_numeric_format(scheme, dict(scheme.deployment_fields))
-            got[name] = corpus_token(_logical_dtype_label(fmt, 4, "U8"))
+            fmt = select_numeric_format(scheme, dict(scheme.deployment_fields))
+            got[name] = corpus_token(logical_dtype_label(fmt, 4, "U8"))
         self.assertEqual(got["mxfp4"], "mxfp4")
         self.assertEqual(got["mxfp4-pack-quantized"], "mxfp4")
         # The third MX layout: DeepSeek's `.weight` / `.scale` convention,
