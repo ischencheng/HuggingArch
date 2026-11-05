@@ -10,7 +10,6 @@ context is empty, no room for a request draws nothing).
 from __future__ import annotations
 
 import copy
-import time
 
 import pytest
 
@@ -1030,10 +1029,13 @@ def test_a_kept_view_carries_its_coverage_and_floors_reuse_the_fold(
         first["measured_track"])
 
 
-def test_a_cold_frontier_publishes_each_model_in_the_clients_order(monkeypatch):
+def test_a_cold_frontier_publishes_kept_models_at_once_and_computes_in_the_clients_order(
+        monkeypatch):
     """While the frontier computes, each finished model is published with
     the response's head (`offload.report_partial`), so a page draws it at
-    once; the model the client put first (`priority`) is started first."""
+    once. A model already kept lands first even when the client did not ask
+    for it — its read waits behind nothing that computes — and of the models
+    that compute, the one the client put first (`priority`) computes first."""
     import asyncio
 
     from backend.api import offload
@@ -1041,28 +1043,35 @@ def test_a_cold_frontier_publishes_each_model_in_the_clients_order(monkeypatch):
     monkeypatch.setattr(f, "_frontier_scope", lambda: ("none-scope", "none"))
     monkeypatch.setattr(f, "_model_concurrency", lambda: 1)
     monkeypatch.setattr(f, "iter_snapshot_ids", lambda: ["a/1", "b/2", "c/3"])
-    started: list = []
 
     def read(model_id, view, got=None):
-        started.append(model_id)
-        time.sleep(0.05)
-        return {"drawn": {"model_id": model_id}}
+        if model_id == "c/3":
+            return {"drawn": {"model_id": model_id}}
+        return {"walk": {"cards": [], "layouts": []}}
+
+    computed: list = []
+
+    async def compute(model_id, view, track, got):
+        computed.append(model_id)
+        await asyncio.sleep(0.3)
+        return {"model_id": model_id}
 
     monkeypatch.setattr(f, "_frontier_read", read)
+    monkeypatch.setattr(f, "_compute_frontier", compute)
     view = f.FrontierView("B200")
 
     async def scenario():
         with pytest.raises(offload.StillComputing) as info:
             await offload.within_deadline(
                 f.frontier_request_key(view), lambda: f.build_frontier(view),
-                hint=["c/3"])
+                hint=["b/2"])
         partial = info.value.partial
         offload.set_deadline(None)
         whole = await offload.within_deadline(
             f.frontier_request_key(view), lambda: f.build_frontier(view))
         return partial, whole
 
-    monkeypatch.setattr(offload, "_deadline_s", 0.08)
+    monkeypatch.setattr(offload, "_deadline_s", 0.15)
     try:
         partial, whole = asyncio.run(scenario())
     finally:
@@ -1070,6 +1079,6 @@ def test_a_cold_frontier_publishes_each_model_in_the_clients_order(monkeypatch):
     assert partial["head"]["seq_lens"] == list(GALLERY_SEQ_LENS)
     assert partial["head"]["config"]["gpu_sku"] == "B200"
     assert [m["model_id"] for m in partial["items"]][:1] == ["c/3"]
-    assert started[0] == "c/3"
+    assert computed == ["b/2", "a/1"]
     assert [m["model_id"] for m in whole["models"]] == ["a/1", "b/2", "c/3"]
     assert {k: whole[k] for k in partial["head"]} == partial["head"]

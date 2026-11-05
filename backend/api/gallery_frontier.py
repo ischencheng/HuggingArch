@@ -1403,20 +1403,34 @@ async def keepSharedWalk(model_id: str, gpu_sku: str) -> bool:
 
 
 async def frontier_model(model_id: str, view: FrontierView,
-                         track: Optional[Track] = None) -> dict:
+                         track: Optional[Track] = None, *,
+                         compute: Optional[PrioritySlots] = None) -> dict:
     """One model's frontier under `view` and `track`: read off the caches —
     the view's drawing, its entry, or its class walk priced on its card —
     or each layout of the class walk its own compute job and the fold
     (`_finish_frontier`). Kernel Bench rows fold on after the SOL entry is
     in hand, so the lake's answer reaches the pricing and never the walk.
-    Every step queues at the model's urgency (`offload.urgency`): the model
-    a client picked, or has on screen, before the rest.
-    """
-    got = await run_ranked(_frontier_read, model_id, view, track,
-                           name=model_id)
+
+    The read is one quick job and queues for nothing, so a model already
+    kept lands at once whatever is computing. Only a model that computes
+    holds one of `compute` (the frontier's model slots), and its steps queue
+    at its urgency (`offload.urgency`): the model a client picked, or has on
+    screen, before the rest."""
+    got = await run_off_loop(_frontier_read, model_id, view, track)
     readsMeasurements = track is not None and track[1] == "reads"
     if "drawn" in got and not readsMeasurements:
         return got["drawn"]
+    if compute is None:
+        return await _compute_frontier(model_id, view, track, got)
+    async with compute.hold(urgency(model_id)):
+        return await _compute_frontier(model_id, view, track, got)
+
+
+async def _compute_frontier(model_id: str, view: FrontierView,
+                            track: Optional[Track], got: dict) -> dict:
+    """The frontier of a model its read did not answer: each layout a job,
+    then the fold."""
+    readsMeasurements = track is not None and track[1] == "reads"
     if readsMeasurements:
         plan = _walk_plan(_resolve_one(model_id)[1], view)
     else:
@@ -1432,10 +1446,12 @@ async def frontier_model(model_id: str, view: FrontierView,
 
 async def build_frontier(view: FrontierView) -> dict:
     """Every model's decode frontier under `view`, `_model_concurrency`
-    models at a time, reporting how many have finished and publishing each
-    as it lands (`report_partial`), so a page draws it without waiting for
-    the slowest. Which model starts next is the client's order
-    (`offload.urgency`: picked, then on screen). The lake's version is read
+    models computing at a time, reporting how many have finished and
+    publishing each as it lands (`report_partial`), so a page draws it
+    without waiting for the slowest. Every model is read first, at once: a
+    kept one lands without waiting behind one that computes. Which model
+    computes next is the client's order (`offload.urgency`: picked, then on
+    screen). The lake's version is read
     once (`_view_scope`) and every model is drawn under that one answer: one
     response reads one lake, and an unanswering lake costs one timeout
     rather than one per model. A spec refined meanwhile serves nothing
@@ -1451,8 +1467,7 @@ async def build_frontier(view: FrontierView) -> dict:
 
     async def one(mid: str) -> dict:
         nonlocal done
-        async with slots.hold(urgency(mid)):
-            entry = await frontier_model(mid, view, track)
+        entry = await frontier_model(mid, view, track, compute=slots)
         done += 1
         print(f"frontier {view.gpu_sku}: {done}/{len(model_ids)} · {mid}",
               flush=True)

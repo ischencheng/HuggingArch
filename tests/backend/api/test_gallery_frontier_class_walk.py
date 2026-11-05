@@ -199,18 +199,21 @@ def test_a_dtype_the_class_has_no_peak_for_is_refused_on_each_card():
 @pytest.mark.parametrize("gpu", ["B200", "H100-SXM"])
 def test_each_card_prices_the_layouts_its_own_frontier_enumerates(gpu):
     """The model walk covers every frontier layout of the card's walk class
-    — that class's cards only, since a law's rows are one class's — while
-    each card's entry is priced over its own (`frontier_layouts` on it)."""
+    — that class's cards only, since a law's rows are one class's — and
+    publishes them all for every card of the class (`layoutsByCard`: the
+    bundle is every consumer's), while each card's Gallery entry is priced
+    over its own (`galleryLayoutsByCard`: `frontier_layouts` on it)."""
     resolved = resolve_snapshot("Qwen/Qwen3-30B-A3B")
     plan = f._walk_plan(resolved, f.FrontierView(gpu))
     caps = sweep_caps({}, resolved=resolved)
     assert plan["cards"] == class_cards(gpu) and gpu in plan["cards"]
     for sku in plan["cards"]:
         own = [cfg.to_dict() for cfg in frontier_layouts(caps, sku)]
-        assert plan["layoutsByCard"][sku] == own
+        assert plan["galleryLayoutsByCard"][sku] == own
+        assert plan["layoutsByCard"][sku] == plan["layouts"]
         assert all(p in plan["layouts"] for p in own)
     assert all(ParallelConfig.from_dict(cfg).cluster_size <= FRONTIER_MAX_GPUS
-               for own in plan["layoutsByCard"].values() for cfg in own)
+               for own in plan["galleryLayoutsByCard"].values() for cfg in own)
     assert all(ParallelConfig.from_dict(cfg).cluster_size <= FRONTIER_MAX_GPUS
                for cfg in plan["layouts"])
     assert len(plan["layouts"]) == len({str(sorted(p.items()))
