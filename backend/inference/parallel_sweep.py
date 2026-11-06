@@ -377,7 +377,7 @@ def _per_gpu_tput(result: dict, phase: str, track: str = "sol") -> Optional[floa
 DecodeCloudDim = PointDim
 
 
-def decode_frontier(cloud: Sequence[dict], *, fix: Mapping[str, Any],
+def decode_frontier(cloud: Sequence[dict], *, fix: Mapping[str, Sequence[Any]],
                     group_by: Sequence[str]) -> dict:
     """A decode Pareto frontier view of the sweep's `decode_cloud`."""
     return frontier_view(cloud, dims=POINT_DIMS, fix=fix, group_by=group_by)

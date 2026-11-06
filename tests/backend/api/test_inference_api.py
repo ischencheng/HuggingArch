@@ -232,7 +232,7 @@ class TestDefaultsEndpoint:
         assert "decode_cloud" not in shipped
         cloud = asyncio.run(compute_parallel_sweep_cached(
             InferenceParallelSweepRequest(**sweep, sol_only=True)))["decode_cloud"]
-        fix, by = {"num_gpus": 2}, ["gpu_sku", "batch_key"]
+        fix, by = {"num_gpus": [2]}, ["gpu_sku", "batch_key"]
         r = client.post("/inference/parallel-sweep/frontier",
                         json={"sweep": sweep, "fix": fix, "group_by": by})
         assert r.status_code == 200, r.text

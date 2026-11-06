@@ -154,10 +154,10 @@ def pareto_front(points: List[dict], *, track: str = "sol") -> List[dict]:
 
 
 def frontier_view(cloud: Sequence[dict], *, dims: Sequence[str],
-                  fix: Mapping[str, Any], group_by: Sequence[str],
+                  fix: Mapping[str, Sequence[Any]], group_by: Sequence[str],
                   track: str = "sol") -> dict:
-    """The points of `cloud` whose `fix` dimensions hold the given values,
-    grouped by `group_by` (one line per group, in cloud order), each line
+    """The points of `cloud` whose `fix` dimensions each hold one of the given
+    values, grouped by `group_by` (one line per group, in cloud order), each line
     its `pareto_front` on `track`. `dims` are the dimensions the cloud's producer
     declares; a view naming another is refused.
 
@@ -169,7 +169,7 @@ def frontier_view(cloud: Sequence[dict], *, dims: Sequence[str],
             raise ValueError(f"unknown cloud dimension {d!r}; one of {tuple(dims)}")
 
     def admits(p: dict, skip: Optional[str] = None) -> bool:
-        return all(p[d] == v for d, v in fix.items() if d != skip)
+        return all(p[d] in vs for d, vs in fix.items() if d != skip)
 
     groups: Dict[Tuple[Any, ...], List[dict]] = {}
     for p in cloud:

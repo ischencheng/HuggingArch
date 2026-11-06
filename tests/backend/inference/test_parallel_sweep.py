@@ -429,8 +429,8 @@ class TestDecodeFrontier(unittest.TestCase):
                  pt("B300", "tp_tp", 8, 64, 120.0, 40.0),
                  pt("B300", "dp_ep", 16, 64, 130.0, 30.0),
                  pt("H200", "dp_ep", 8, 64, 60.0, 20.0)]
-        v = decode_frontier(cloud, fix={"gpu_sku": "B300", "num_gpus": 8},
-                          group_by=["mode"])
+        v = decode_frontier(cloud, fix={"gpu_sku": ["B300"], "num_gpus": [8]},
+                            group_by=["mode"])
         fronts = {s["group"]["mode"]: [(p["concurrent_requests"]) for p in s["frontier"]]
                   for s in v["series"]}
         self.assertEqual(fronts, {"dp_ep": [64, 128], "tp_tp": [64]})
@@ -439,8 +439,14 @@ class TestDecodeFrontier(unittest.TestCase):
         self.assertEqual(v["values"]["num_gpus"], [8, 16])
         self.assertEqual(v["values"]["gpu_sku"], ["B300", "H200"])
         self.assertEqual(v["values"]["batch_key"], ["b64", "b128", "b256"])
+        # A dimension holds a set: every point at any of its values is drawn.
+        both = decode_frontier(cloud, fix={"num_gpus": [8, 16], "mode": ["dp_ep"]},
+                               group_by=["gpu_sku", "num_gpus"])
+        self.assertEqual({(s["group"]["gpu_sku"], s["group"]["num_gpus"])
+                          for s in both["series"]},
+                         {("B300", 8), ("B300", 16), ("H200", 8)})
         with self.assertRaises(ValueError):
-            decode_frontier(cloud, fix={"layout": "x"}, group_by=[])
+            decode_frontier(cloud, fix={"layout": ["x"]}, group_by=[])
 
     def test_a_frontier_point_is_the_sweep_pinned_at_its_batch(self):
         # A second route: the same layout swept with its batch pinned (an

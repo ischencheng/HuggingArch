@@ -915,8 +915,9 @@ def _sweep_link() -> str:
 def test_decode_frontier_is_a_view_the_backend_draws_of_the_sweep(browser_base):
     """The Scaling panel's decode Pareto frontier asks the backend for a view
     of the parallel sweep it shows (the same body, so the same cache entry):
-    a hold control adds its value to `fix`, the lines control picks
-    `group_by`; the page draws what comes back and computes no front."""
+    a hold control adds each ticked value to `fix` (several of one dimension
+    at once), the lines control picks `group_by`; the page draws what comes
+    back and computes no front."""
     browser, base = browser_base
     s = Session(browser, base)
     s.goto("/inference.html#model=deepseek-ai%2FDeepSeek-V3&gpu=B200&ep=8&dp_attn=8")
@@ -927,16 +928,34 @@ def test_decode_frontier_is_a_view_the_backend_draws_of_the_sweep(browser_base):
     posted = s.requests["/inference/estimate-parallel-sweep"][-1]["body"]
     assert {**first["sweep"], "sol_only": True} == {**posted, "sol_only": True}
     assert first["fix"] == {} and first["group_by"] == ["gpu_sku"]
-    s.page.wait_for_selector("#infer-pareto-fix-mode option[value=tp_tp]", state="attached",
-                             timeout=10000)
-    s.page.select_option("#infer-pareto-fix-mode", "tp_tp")
-    assert s.wait_for(lambda: s.requests[view][-1]["body"]["fix"] == {"mode": "tp_tp"})
-    s.page.select_option("#infer-pareto-fix-num_gpus", "8")
+
+    def tick(control: str, value: str) -> None:
+        box = f"#{control} input[value='{value}']"
+        if not s.page.is_visible(box):
+            s.page.click(f"#{control} summary")
+        s.page.check(box)
+
+    s.page.wait_for_function(
+        "document.querySelectorAll('#infer-pareto-fix-mode input').length >= 2",
+        timeout=10000)
+    modes = s.page.eval_on_selector_all("#infer-pareto-fix-mode input",
+                                        "els => els.map(e => e.value)")
+    tick("infer-pareto-fix-mode", modes[0])
+    assert s.wait_for(lambda: s.requests[view][-1]["body"]["fix"] == {"mode": modes[:1]})
+    # A second value of the same dimension joins the first.
+    tick("infer-pareto-fix-mode", modes[1])
+    assert s.wait_for(lambda: s.requests[view][-1]["body"]["fix"] == {"mode": modes[:2]})
+    gpus = s.page.eval_on_selector_all("#infer-pareto-fix-num_gpus input",
+                                       "els => els.map(e => e.value)")
+    tick("infer-pareto-fix-num_gpus", gpus[0])
     assert s.wait_for(lambda: s.requests[view][-1]["body"]["fix"]
-                      == {"mode": "tp_tp", "num_gpus": 8})
-    s.page.select_option("#infer-pareto-lines", "batch")
+                      == {"mode": modes[:2], "num_gpus": [int(gpus[0])]})
+    tick("infer-pareto-lines", "batch_key")
     assert s.wait_for(lambda: s.requests[view][-1]["body"]["group_by"]
                       == ["gpu_sku", "batch_key"])
+    tick("infer-pareto-lines", "mode")
+    assert s.wait_for(lambda: s.requests[view][-1]["body"]["group_by"]
+                      == ["gpu_sku", "mode", "batch_key"])
     s.assert_clean()
 
 

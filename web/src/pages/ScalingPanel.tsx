@@ -882,15 +882,10 @@ const MODE_LINE: Record<ParSweepMode, { lineType: "solid" | "dashed" | "dotted";
   tp_tp: { lineType: "solid", symbol: "diamond" },
 };
 
-/** What each line of the frontier chart is one value of; the card is always
- *  among them (a line never mixes cards). */
-const PARETO_LINES: { key: string; label: string; by: CloudDim[] }[] = [
-  { key: "gpu", label: "GPU (best over every layout)", by: ["gpu_sku"] },
-  { key: "mode", label: "GPU × parallel mode", by: ["gpu_sku", "mode"] },
-  { key: "gpus", label: "GPU × GPU count", by: ["gpu_sku", "num_gpus"] },
-  { key: "layout", label: "GPU × layout", by: ["gpu_sku", "mode", "num_gpus"] },
-  { key: "batch", label: "GPU × decode batch", by: ["gpu_sku", "batch_key"] },
-];
+/** The dimensions a line of the frontier chart can be one value of, beside
+ *  the card (a line never mixes cards); with none picked, each card's line
+ *  is its best over every layout. */
+const LINE_DIMS: CloudDim[] = ["mode", "num_gpus", "batch_key"];
 
 const LINE_TYPES = ["solid", "dashed", "dotted"] as const;
 
@@ -900,6 +895,55 @@ function cloudLabel(d: CloudDim, v: CloudValue): string {
   if (d === "num_gpus") return `${v} GPU${v === 1 ? "" : "s"}`;
   if (d === "batch_key") return v === "max" ? "max batch" : `batch ${String(v).replace(/^b/, "")}`;
   return String(v);
+}
+
+/** A dimension's multi-select: a dropdown of its values, each a checkbox;
+ *  none ticked admits every value. */
+function MultiPick({
+  id, label, options, picked, text, onChange,
+}: {
+  id: string;
+  label: string;
+  options: CloudValue[];
+  picked: CloudValue[];
+  text: (v: CloudValue) => string;
+  onChange: (next: CloudValue[]) => void;
+}) {
+  const summary = picked.length ? picked.map(text).join(", ") : "any";
+  return (
+    <span className="inline-flex items-center gap-1.5 text-xs text-gray-500">
+      {label}
+      <details id={id} className="relative">
+        <summary className="list-none cursor-pointer text-xs border rounded px-1 py-0.5 bg-white text-gray-800 max-w-[12rem] truncate"
+          title={summary}>
+          {summary} ▾
+        </summary>
+        <div className="absolute z-20 mt-1 min-w-full bg-white border rounded shadow-sm py-1">
+          {options.map((v) => {
+            const on = picked.some((x) => x === v);
+            return (
+              <label key={String(v)} className="flex items-center gap-1.5 px-2 py-0.5 whitespace-nowrap cursor-pointer hover:bg-gray-50 text-gray-700">
+                <input
+                  type="checkbox"
+                  className="accent-gray-700"
+                  value={String(v)}
+                  checked={on}
+                  onChange={() => onChange(on ? picked.filter((x) => x !== v) : [...picked, v])}
+                />
+                {text(v)}
+              </label>
+            );
+          })}
+          {picked.length ? (
+            <button type="button" className="block w-full text-left px-2 py-0.5 text-gray-400 hover:text-gray-700"
+              onClick={() => onChange([])}>
+              clear
+            </button>
+          ) : null}
+        </div>
+      </details>
+    </span>
+  );
 }
 
 /** Each hold control's label; the controls are the dimensions the view
@@ -932,15 +976,15 @@ function ParetoSection({
   gpus: string[];
   onApply?: (p: ScalingApply) => void;
 }) {
-  const [lines, setLines] = useState("gpu");
-  const [fix, setFix] = useState<Partial<Record<CloudDim, CloudValue>>>({});
+  const [lineDims, setLineDims] = useState<CloudDim[]>([]);
+  const [fix, setFix] = useState<Partial<Record<CloudDim, CloudValue[]>>>({});
   // The view with the request it answers: one drawn under other inputs
   // (another context, other holds) is not shown, so a click never applies a
   // point of the previous sweep.
   const [answer, setAnswer] = useState<{ key: string; view: CloudView } | null>(null);
   const [failed, setFailed] = useState("");
   const [applied, setApplied] = useState("");
-  const by = (PARETO_LINES.find((l) => l.key === lines) || PARETO_LINES[0]).by;
+  const by: CloudDim[] = ["gpu_sku", ...LINE_DIMS.filter((d) => lineDims.includes(d))];
   const sweepKey = JSON.stringify(sweepBody);
   // A new sweep holds nothing: its cloud may not have the held values.
   useEffect(() => { setFix({}); }, [sweepKey]);
@@ -992,8 +1036,8 @@ function ParetoSection({
   // The controls stay while a new view loads: the last answer's dimensions.
   const dims = Object.keys((view || answer?.view)?.values || {}) as CloudDim[];
   const holds = dims.map((d) => ({ d, label: HOLD_LABEL[d] ?? d }));
-  const held = holds.filter((h) => fix[h.d] !== undefined)
-    .map((h) => cloudLabel(h.d, fix[h.d] as CloudValue)).join(" · ");
+  const held = holds.filter((h) => fix[h.d]?.length)
+    .map((h) => (fix[h.d] as CloudValue[]).map((v) => cloudLabel(h.d, v)).join(", ")).join(" · ");
   const options = (d: CloudDim) => (view || answer?.view)?.values[d] || [];
   return (
     <FrontierChart<ParFrontierPt>
@@ -1004,36 +1048,28 @@ function ParetoSection({
         <div className="flex items-center gap-3 flex-wrap">
           {applied ? <span className="text-11 text-green-600">{applied}</span> : null}
           {holds.map(({ d, label }) => (
-            <label key={d} className="inline-flex items-center gap-1.5 text-xs text-gray-500">
-              {label}
-              <select
-                id={`infer-pareto-fix-${d}`}
-                className="text-xs border rounded px-1 py-0.5"
-                value={fix[d] === undefined ? "" : String(fix[d])}
-                onChange={(e) => {
-                  const raw = e.target.value;
-                  const v = options(d).find((x) => String(x) === raw);
-                  setFix((f) => {
-                    const next = { ...f };
-                    if (v === undefined) delete next[d]; else next[d] = v;
-                    return next;
-                  });
-                }}
-              >
-                <option value="">any</option>
-                {options(d).map((v) => (
-                  <option key={String(v)} value={String(v)}>{cloudLabel(d, v)}</option>
-                ))}
-              </select>
-            </label>
+            <MultiPick
+              key={d}
+              id={`infer-pareto-fix-${d}`}
+              label={label}
+              options={options(d)}
+              picked={fix[d] || []}
+              text={(v) => cloudLabel(d, v)}
+              onChange={(vs) => setFix((f) => {
+                const next = { ...f };
+                if (vs.length) next[d] = vs; else delete next[d];
+                return next;
+              })}
+            />
           ))}
-          <label className="inline-flex items-center gap-1.5 text-xs text-gray-500">
-            Lines
-            <select id="infer-pareto-lines" className="text-xs border rounded px-1 py-0.5"
-              value={lines} onChange={(e) => setLines(e.target.value)}>
-              {PARETO_LINES.map((l) => <option key={l.key} value={l.key}>{l.label}</option>)}
-            </select>
-          </label>
+          <MultiPick
+            id="infer-pareto-lines"
+            label="Lines: GPU ×"
+            options={LINE_DIMS}
+            picked={lineDims}
+            text={(d) => HOLD_LABEL[d as CloudDim]}
+            onChange={(ds) => setLineDims(ds as CloudDim[])}
+          />
         </div>
       }
       series={series}

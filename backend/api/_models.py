@@ -652,9 +652,10 @@ class ParallelFrontierRequest(BaseModel):
     """A decode Pareto frontier off a parallel sweep's point cloud
     (`parallel_sweep.decode_frontier`): the sweep as the Scaling panel posts
     it (read as its SOL answer, `sol_only`: the cloud is SOL only), the
-    dimensions held at a value, and the ones each drawn line is one value of."""
+    dimensions held to a set of values, and the ones each drawn line is one
+    value of."""
     sweep: InferenceParallelSweepRequest
-    fix: Dict[DecodeCloudDim, Union[int, str]] = Field(default_factory=dict)
+    fix: Dict[DecodeCloudDim, List[Union[int, str]]] = Field(default_factory=dict)
     group_by: List[DecodeCloudDim] = Field(default_factory=lambda: ["gpu_sku"])
 
 

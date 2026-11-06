@@ -640,8 +640,8 @@ async def inference_parallel_sweep_frontier(req: ParallelFrontierRequest,
                                             request: Request,
                                             authorization: Optional[str] = Header(None)):
     """A decode Pareto frontier of the Scaling panel's parallel sweep: the
-    sweep's decode point cloud with some dimensions held (`fix`: card, mode,
-    GPU count, concurrent requests) and the rest grouped into lines
+    sweep's decode point cloud with some dimensions held to a set of values
+    (`fix`: cards, modes, GPU counts, batches) and the rest grouped into lines
     (`group_by`), each line its Pareto front. The cloud is SOL only, so the
     view reads the sweep's SOL answer (the panel's body with `sol_only`,
     its cache entry); computes it on a miss."""
