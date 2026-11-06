@@ -83,6 +83,20 @@ PACKAGE = {
             return rec
 
 
+        def deep(x):
+            return x + 3
+
+
+        @memoize(maxsize=None)
+        def inner(x):
+            return deep(x)
+
+
+        @memoize(maxsize=None)
+        def outer(x):
+            return inner(x) * 2
+
+
         def from_a_route(record):
             return opener(record)
 
@@ -229,6 +243,14 @@ with recording() as r:
 with recording() as r2:
     a.cached2(1)
 out["untraced_memo_hit"] = names(r2)
+# A memo whose miss hit another memo: a later hit names both misses' code.
+with recording() as r:
+    a.inner(7)
+with recording() as r:
+    a.outer(7)
+with recording() as r:
+    a.outer(7)
+out["nested_memo_hit"] = names(r)
 # Bug B: the frame that opened a recording, and a generator made before it.
 out["opener"] = names(a.opener(recording))
 # One computation, reached from two callers: one trace.
@@ -286,6 +308,14 @@ def test_a_memo_hit_names_the_code_its_miss_ran(traced):
     assert {"tpkg/a.py::cached", "tpkg/a.py::helper"} <= set(out["hit"])
     assert "tpkg/a.py::other" in out["property_hit"]
     assert "tpkg/a.py::other" in out["table_hit"]
+
+
+def test_a_memo_hit_names_the_memos_its_miss_hit(traced):
+    """`outer`'s miss hit `inner`, filled before; a hit on `outer` names
+    what `inner`'s miss ran too (`provider.Fragment`'s parts)."""
+    _tmp, out = traced
+    assert {"tpkg/a.py::outer", "tpkg/a.py::inner", "tpkg/a.py::deep"} <= set(
+        out["nested_memo_hit"])
 
 
 def test_untraced_code_is_in_no_trace(traced):

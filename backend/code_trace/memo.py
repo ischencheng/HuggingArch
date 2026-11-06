@@ -33,14 +33,26 @@ _P = provider()
 TRACED = _P.traced
 
 
-def _traced_call(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+class _Slot:
+    """A memo's value with the trace of its computation, and the epoch of
+    the active recordings it was last merged into (`provider.merged`)."""
+
+    __slots__ = ("epoch", "trace", "value")
+
+    def __init__(self, value: Any, trace: Any) -> None:
+        self.value = value
+        self.trace = trace
+        self.epoch = -1
+
+
+def _traced_call(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> _Slot:
     """`fn(*args, **kwargs)` and the trace of what it ran."""
     rec = _P.begin(nested=True)
     try:
         value = fn(*args, **kwargs)
     finally:
-        trace = _P.end(rec)
-    return value, trace
+        trace = _P.end(rec, nested=True)
+    return _Slot(value, trace)
 
 
 def memoize(maxsize: Any = 128, typed: bool = False) -> Any:
@@ -56,25 +68,16 @@ def memoize(maxsize: Any = 128, typed: bool = False) -> Any:
 
         @functools.wraps(fn)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
-            value, trace = cached(*args, **kwargs)
-            _P.merge(trace)
-            return value
+            slot = cached(*args, **kwargs)
+            if slot.epoch != _P.epoch:
+                _P.merged(slot)
+            return slot.value
 
         wrapper.cache_clear = cached.cache_clear  # type: ignore[attr-defined]
         wrapper.cache_info = cached.cache_info  # type: ignore[attr-defined]
         return wrapper
 
     return decorate
-
-
-class _Slot:
-    """A `memo_property` value with the trace of its computation."""
-
-    __slots__ = ("trace", "value")
-
-    def __init__(self, value: Any, trace: Any) -> None:
-        self.value = value
-        self.trace = trace
 
 
 class _TracedProperty(functools.cached_property):
@@ -94,11 +97,12 @@ class _TracedProperty(functools.cached_property):
             return self
         slot = instance.__dict__.get(self.attrname, _MISSING)
         if slot is _MISSING:
-            value, trace = _traced_call(self.func, instance)
-            instance.__dict__[self.attrname] = _Slot(value, trace)
-            return value
+            slot = instance.__dict__[self.attrname] = _traced_call(
+                self.func, instance)
+            return slot.value
         if type(slot) is _Slot:
-            _P.merge(slot.trace)
+            if slot.epoch != _P.epoch:
+                _P.merged(slot)
             return slot.value
         return slot
 
@@ -108,14 +112,6 @@ _MISSING = object()
 memo_property: Any = _TracedProperty if TRACED else functools.cached_property
 
 
-class _Entry:
-    __slots__ = ("trace", "value")
-
-    def __init__(self, value: Any, trace: Any) -> None:
-        self.value = value
-        self.trace = trace
-
-
 class Memo:
     """A keyed memo table: `get(key, build)` is the value `build()` made for
     `key`, built once (single-flight per key) and kept among the `maxsize`
@@ -123,11 +119,11 @@ class Memo:
 
     def __init__(self, maxsize: Optional[int] = None) -> None:
         self.maxsize = maxsize
-        self._table: "OrderedDict[Hashable, _Entry]" = OrderedDict()
+        self._table: "OrderedDict[Hashable, _Slot]" = OrderedDict()
         self._lock = threading.Lock()
         self._building: Dict[Hashable, threading.Lock] = {}
 
-    def _hit(self, key: Hashable) -> Optional[_Entry]:
+    def _hit(self, key: Hashable) -> Optional[_Slot]:
         with self._lock:
             entry = self._table.get(key)
             if entry is not None:
@@ -146,12 +142,11 @@ class Memo:
             with self._lock:
                 if self._building.get(key) is gate:
                     del self._building[key]
-        _P.merge(entry.trace)
+        _P.merged(entry)
         return entry.value
 
-    def _build(self, key: Hashable, build: Callable[[], Any]) -> _Entry:
-        entry = (_Entry(*_traced_call(build)) if TRACED
-                 else _Entry(build(), None))
+    def _build(self, key: Hashable, build: Callable[[], Any]) -> _Slot:
+        entry = _traced_call(build) if TRACED else _Slot(build(), None)
         with self._lock:
             self._table[key] = entry
             while self.maxsize is not None and len(self._table) > self.maxsize:

@@ -86,9 +86,6 @@ async def health_details() -> dict:
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    # The code this server runs is fixed before it answers anything
-    # (`code_trace.provider.seal`; nothing under `GlobalHash`).
-    code_trace_seal()
     await _op_pipeline.startup()
     # The cache warm runs out of process (`python -m backend.warm_caches`, low
     # priority, its own sweep pool): inside this process it would compete
@@ -108,6 +105,10 @@ async def _lifespan(_app: FastAPI):
     if not pool.in_test_run():
         for start in _background_loops:
             start()
+    # The code this server runs is fixed before it answers anything
+    # (`code_trace.provider.seal`; nothing under `GlobalHash`) — last, so the
+    # workers' prestart timer is not held back by it.
+    code_trace_seal()
     try:
         yield
     finally:

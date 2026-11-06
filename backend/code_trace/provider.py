@@ -34,8 +34,10 @@ Soundness of `TracedFunctions` rests on four rules, each a test in
      recording also starts with the code of the frame that opened it — it
      keeps executing inside it; recordings are lexical, so no caller above
      it does. `untraced` is per thread: that thread's code lands only in
-     recordings begun inside the window, and is left armed for everyone
-     else. Supersets are allowed, misses are not.
+     recordings begun inside the window, and stays armed while another
+     computation has a recording open (with none, it is disabled as usual
+     and re-armed when the window closes, for this computation's own
+     recordings around it). Supersets are allowed, misses are not.
   2. What ran before any recording — module top levels, class bodies, and
      every function called while importing — is one import-time trace
      (`global_trace`), named by one item in every trace. The traced trees
@@ -108,6 +110,7 @@ import os
 import pkgutil
 import subprocess
 import sys
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Optional, Tuple
@@ -153,6 +156,7 @@ _EVENTS = (sys.monitoring.events.PY_START, sys.monitoring.events.PY_RESUME)
 _EVENT_SET = sys.monitoring.events.PY_START | sys.monitoring.events.PY_RESUME
 
 ENGINE_ITEM = "<engine>"
+_UNSEEN = object()
 IMPORT_ITEM = "<import-time>"
 LOCK_ITEM = "<uv.lock>"
 
@@ -164,8 +168,10 @@ class Trace:
 
     items: Tuple[Tuple[str, str], ...]
 
-    @property
+    @functools.cached_property
     def id(self) -> str:
+        """Hashed once: a trace is merged, stored and looked up by it, and
+        hashing every item each time was a cost of its own."""
         return digest("\n".join(f"{k}\t{h}" for k, h in self.items))
 
     def names(self) -> FrozenSet[str]:
@@ -183,6 +189,35 @@ class Trace:
         return cls(tuple(sorted((str(k), str(h)) for k, h in data)))
 
 
+class Fragment:
+    """A memo miss's trace, not yet assembled: the code objects it ran and
+    the traces (or fragments) it merged. A memo keeps one beside its value
+    and hands it to the computations around each hit; only a computation's
+    own trace is assembled into items (`TracedFunctions._assemble`), once,
+    however many misses it reached. Assembling every miss's — thousands a
+    computation — was most of what recording cost. In-process only: pickled
+    (a value crossing to a worker with its memos), it becomes the trace of
+    its code and parts, flattened once (`provider.flatten`) however many
+    values carry it."""
+
+    __slots__ = ("codes", "flat", "parts")
+
+    def __init__(self, codes: FrozenSet[Any], parts: Tuple[Any, ...]) -> None:
+        self.codes = codes
+        self.parts = parts
+        self.flat: Optional[Trace] = None
+
+    @property
+    def id(self) -> str:
+        """Its identity among a recording's merged traces: the object's."""
+        return f"fragment:{id(self)}"
+
+    def __reduce__(self) -> Any:
+        if self.flat is None:
+            self.flat = provider().flatten(self)
+        return (Trace, (self.flat.items,))
+
+
 @dataclass(eq=False)
 class Recording:
     """One computation's recording in progress."""
@@ -192,6 +227,8 @@ class Recording:
     traces: Dict[str, Trace] = field(default_factory=dict)
     #: Growing memo entries this recording read (`attach`).
     growing: List["Growing"] = field(default_factory=list)
+    #: The last `snapshot` taken, and what it was taken of.
+    snap: Any = None
 
 
 @dataclass(eq=False)
@@ -211,6 +248,8 @@ class GlobalHash:
     """Today's code version: one hash of every engine `.py`."""
 
     traced = False
+    #: No recordings to change (`TracedFunctions.epoch`).
+    epoch = 0
     #: Whether a value stored with no recording open fails loudly: never
     #: here, where every store has the one trace.
     strict = False
@@ -228,7 +267,10 @@ class GlobalHash:
     def begin(self, *, nested: bool = False) -> Recording:
         return Recording()
 
-    def end(self, rec: Recording) -> Trace:
+    def end(self, rec: Recording, *, nested: bool = False) -> Trace:
+        return self.trace()
+
+    def flatten(self, fragment: Any) -> Trace:
         return self.trace()
 
     def snapshot(self, rec: Optional[Recording] = None) -> Optional[Trace]:
@@ -239,6 +281,9 @@ class GlobalHash:
 
     def merge(self, trace: Optional[Trace],
               into: Optional[Tuple[Recording, ...]] = None) -> None:
+        return None
+
+    def merged(self, slot: Any) -> None:
         return None
 
     def attach(self, entry: Growing) -> None:
@@ -284,10 +329,17 @@ class TracedFunctions:
         #: the callback iterates a stable tuple without taking it.
         self._active: Tuple[Recording, ...] = (self._import,)
         self._sealed = False
+        #: Moves whenever the set of active recordings does: a memo hit
+        #: whose trace was merged in the same epoch was merged into every
+        #: one of them already (`merged`).
+        self.epoch = 0
         #: Set while `seal` imports: a memo miss at import time records, but
         #: must not seal again.
         self._sealing = False
         self._files: Dict[str, FileIdentity] = {}
+        #: `current`'s files, by the path a trace names them by (None: no
+        #: such file in the code this process runs).
+        self._by_rel: Dict[str, Optional[FileIdentity]] = {}
         self._item_of: Dict[Any, Tuple[str, str]] = {}
         self._valid: Dict[str, bool] = {}
         self._modules: FrozenSet[str] = frozenset()
@@ -310,6 +362,15 @@ class TracedFunctions:
         for event in _EVENTS:
             mon.register_callback(self._tool, event, callback)
         mon.set_events(self._tool, _EVENT_SET)
+        #: The canonical import-time trace's interpreter, when this source has
+        #: none on disk yet: started now, read at `seal`.
+        self._canonical_child: Optional[Tuple[Any, Any]] = None
+        if not canonical and not os.path.exists(self._canonical_path()):
+            try:
+                self._start_canonical()
+            except OSError:
+                logger.debug("code_trace: canonical child not started early",
+                             exc_info=True)
 
     # -- recording ---------------------------------------------------------
 
@@ -334,7 +395,16 @@ class TracedFunctions:
             if window is not None:
                 for rec in window:
                     rec.codes.add(code)
-                return None
+                # Armed for another computation's recording, which must see
+                # this code the first time it runs there; with none, disabled
+                # as usual, and re-armed when the window closes (`untraced`)
+                # for this computation's own (open in this context, whatever
+                # thread runs it).
+                mine = _COMPUTATIONS.get()
+                if any(rec not in mine for rec in provider._active):
+                    return None
+                thread.disabled_in_window = True
+                return disable
             for rec in provider._active:
                 rec.codes.add(code)
             return disable
@@ -378,19 +448,52 @@ class TracedFunctions:
                 rec.codes.add(code)
         with self._lock:
             self._active = (*self._active, rec)
+            self.epoch += 1
         window = getattr(self._thread, "window", None)
         if window is not None:
             window.append(rec)
         sys.monitoring.restart_events()
         return rec
 
-    def end(self, rec: Recording) -> Trace:
+    def end(self, rec: Recording, *, nested: bool = False) -> Any:
+        """`rec`'s trace — for a memo miss's (`nested`), a `Fragment`,
+        assembled only inside the computation that reaches it."""
         window = getattr(self._thread, "window", None)
         if window is not None and rec in window:
             window.remove(rec)
         with self._lock:
             self._active = tuple(r for r in self._active if r is not rec)
+            self.epoch += 1
+        if nested and not rec.growing:
+            return Fragment(frozenset(rec.codes), tuple(rec.traces.values()))
         return self._trace_of(rec, final=True)
+
+    def flatten(self, fragment: Fragment) -> Trace:
+        """`fragment` as a trace: the items of its code objects and of every
+        part it reaches. No more — the receiving computation adds the
+        foreign closure and the import-time trace when it forms its own."""
+        codes, items = self._reach({fragment.id: fragment})
+        items = {**dict(self._items(codes)), **items}
+        return Trace(tuple(sorted(items.items())))
+
+    def _reach(self, traces: Dict[str, Any]) -> Tuple[set, Dict[str, str]]:
+        """The code objects and items `traces` stand for: each trace's
+        items, each fragment's code objects and its parts', each once."""
+        codes: set = set()
+        items: Dict[str, str] = {}
+        pending = list(traces.values())
+        seen: set = set()
+        while pending:
+            part = pending.pop()
+            if id(part) in seen:
+                continue
+            seen.add(id(part))
+            if type(part) is Fragment:
+                codes |= part.codes
+                pending.extend(part.parts)
+            else:
+                items.update(part.items)
+        return codes, items
 
     def snapshot(self, rec: Optional[Recording] = None) -> Optional[Trace]:
         """The trace `rec` (default: the innermost computation open in this
@@ -402,7 +505,17 @@ class TracedFunctions:
             if not open_:
                 return None
             rec = open_[-1]
-        return self._trace_of(rec, final=False)
+        # A computation handing out many jobs in a row is snapshotted once
+        # while it records nothing new in between.
+        seen = (len(rec.codes), len(rec.traces), len(self._closure),
+                tuple((len(e.codes), len(e.traces),
+                       sum(len(r.codes) + len(r.traces) for r in e.readers))
+                      for e in rec.growing))
+        if rec.snap is not None and rec.snap[0] == seen:
+            return rec.snap[1]
+        trace = self._trace_of(rec, final=False)
+        rec.snap = (seen, trace)
+        return trace
 
     def _trace_of(self, rec: Recording, *, final: bool) -> Trace:
         """`rec`'s trace: what it ran, the traces it merged, and for each
@@ -428,12 +541,19 @@ class TracedFunctions:
                     entry.readers = [r for r in entry.readers if r is not rec]
                     entry.codes |= codes
                     entry.traces.update(traces)
+        return self._assemble(codes, traces)
+
+    def _assemble(self, codes: set, traces: Dict[str, Any]) -> Trace:
+        """A trace's items: of the code objects, of every trace and
+        fragment merged (a fragment's own merges included, each once), of
+        the foreign closure; then what the import-time trace already
+        names, named through it."""
+        reached, items = self._reach(traces)
+        codes |= reached
         # The foreign closure, whatever this computation ran: a third-party
         # cache it hit may have skipped any of it (`_watch_foreign`).
         codes |= set(self._closure)
-        items = dict(self._items(codes))
-        for trace in traces.values():
-            items.update(trace.items)
+        items = {**dict(self._items(codes)), **items}
         if self._sealed:
             self._check_modules()
             # What the import-time trace names, every trace names through
@@ -456,6 +576,17 @@ class TracedFunctions:
             if trace.id not in rec.traces:
                 rec.traces[trace.id] = trace
 
+    def merged(self, slot: Any) -> None:
+        """A memo hit: `slot.trace` into every recording this thread's code
+        lands in — unless it went into all the active ones in this epoch
+        already, which covers a thread inside `untraced` too (its targets
+        are among them). Memos test the epoch before calling."""
+        if slot.epoch == self.epoch:
+            return
+        self.merge(slot.trace)
+        if getattr(self._thread, "window", None) is None:
+            slot.epoch = self.epoch
+
     def attach(self, entry: Growing) -> None:
         with self._lock:
             for rec in self._targets():
@@ -471,10 +602,16 @@ class TracedFunctions:
         miss inside the window still records its own call."""
         outer = getattr(self._thread, "window", None)
         self._thread.window = []
+        self._thread.disabled_in_window = False
         try:
             yield
         finally:
             self._thread.window = outer
+            if getattr(self._thread, "disabled_in_window", False):
+                # What the window disabled, this thread's own recordings
+                # (around it) must still see when it runs there.
+                self._thread.disabled_in_window = False
+                sys.monitoring.restart_events()
 
     # -- the import-time trace ---------------------------------------------
 
@@ -489,6 +626,7 @@ class TracedFunctions:
             with self._lock:
                 self._active = tuple(r for r in self._active
                                      if r is not self._import)
+                self.epoch += 1
             self._modules = self._repo_modules()
             for path in self._module_files():
                 self._identity(path)
@@ -555,25 +693,40 @@ class TracedFunctions:
         before it sealed — an API server's routes, a warm job's script —
         then moves no trace: a trace recorded in a pool worker, a warm job
         or another machine reads the same here."""
-        cache = os.path.join(DERIVED, "import-time")
-        path = os.path.join(cache, f"{self._source_key()}.json")
+        path = self._canonical_path()
         if not os.path.exists(path):
-            os.makedirs(cache, exist_ok=True)
-            spec = json.dumps({"root": self._root, "trees": list(self._trees),
-                               "lock": self._lock_file, "out": path})
-            env = dict(os.environ, HA_CODE_TRACE="global",
-                       PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
-            done = subprocess.run([sys.executable, "-c", _CANONICAL_CHILD, spec],
-                                  env=env, capture_output=True, text=True,
-                                  check=False)
-            if done.returncode != 0 or not os.path.exists(path):
+            child, errors = self._canonical_child or self._start_canonical()
+            child.wait()
+            if child.returncode != 0 or not os.path.exists(path):
+                errors.seek(0)
                 logger.warning("code_trace: the canonical import-time trace "
                                "could not be computed (%s); this process's "
-                               "own stands in", done.stderr[-2000:])
+                               "own stands in", errors.read()[-2000:])
                 return self._import_time()
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         return Trace.from_json(data["trace"]), tuple(data["foreign"])
+
+    def _canonical_path(self) -> str:
+        return os.path.join(DERIVED, "import-time", f"{self._source_key()}.json")
+
+    def _start_canonical(self) -> Tuple[Any, Any]:
+        """Start the fresh interpreter `_canonical_import_time` reads, and
+        do not wait for it: it needs only the source, so it runs while this
+        process imports (`__init__`), and leaves each file's identity in
+        `DERIVED` behind it."""
+        os.makedirs(os.path.join(DERIVED, "import-time"), exist_ok=True)
+        spec = json.dumps({"root": self._root, "trees": list(self._trees),
+                           "lock": self._lock_file, "out": self._canonical_path()})
+        env = dict(os.environ, HA_CODE_TRACE="global",
+                   PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
+        # Read at `seal`, after this returns: kept open beside the child.
+        errors = tempfile.TemporaryFile("w+")  # noqa: SIM115
+        child = subprocess.Popen([sys.executable, "-c", _CANONICAL_CHILD, spec],
+                                 env=env, stdout=subprocess.DEVNULL,
+                                 stderr=errors, text=True)
+        self._canonical_child = (child, errors)
+        return self._canonical_child
 
     def _import_trees(self) -> List[str]:
         names: List[str] = []
@@ -687,8 +840,8 @@ class TracedFunctions:
             # machinery, whose cache can skip it — is a callback; a call from
             # repo code is that code's, recorded or skipped with it. And
             # inside one callback, the next is already watched.
-            if (getattr(thread, "foreign", 0)
-                    or sys._getframe(1).f_code.co_filename.startswith(prefix)):
+            if (sys._getframe(1).f_code.co_filename.startswith(prefix)
+                    or getattr(thread, "foreign", 0)):
                 return fn(*args, **kwargs)
             # A profile hook, this thread's alone and only while the
             # callback runs, sees every call in it — code this process ran
@@ -778,10 +931,13 @@ class TracedFunctions:
         if item == ENGINE_ITEM:
             return None
         rel, _, _qual = item.partition("::")
-        path = os.path.join(self._root, rel)
-        if not os.path.exists(path):
-            return None
-        return self._identity(os.path.abspath(path)).items().get(item)
+        identity = self._by_rel.get(rel, _UNSEEN)
+        if identity is _UNSEEN:
+            # Once per file: whether it is there, and what it holds.
+            path = os.path.abspath(os.path.join(self._root, rel))
+            identity = self._by_rel[rel] = (
+                self._identity(path) if os.path.exists(path) else None)
+        return None if identity is None else identity.items().get(item)
 
     def valid(self, trace: Trace) -> bool:
         known = self._valid.get(trace.id)

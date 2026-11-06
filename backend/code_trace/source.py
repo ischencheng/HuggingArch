@@ -249,7 +249,10 @@ class FileIdentity:
         return f"{self.rel}::<module>", self.skeleton
 
     def items(self) -> Dict[str, str]:
-        """Every item of the file."""
-        out = {f"{self.rel}::{qual}": h for _end, qual, h in self._defs}
-        out.update((self.module_item(),))
+        """Every item of the file — built once; read, never written."""
+        out = self.__dict__.get("_items")
+        if out is None:
+            out = {f"{self.rel}::{qual}": h for _end, qual, h in self._defs}
+            out.update((self.module_item(),))
+            self.__dict__["_items"] = out
         return out

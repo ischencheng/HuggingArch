@@ -52,10 +52,15 @@ def _plumbing() -> list:
     from backend.api.sweep_runtime import _SWEEP
     from backend.code_trace.provider import recording
 
+    from backend.measure.cache import WRITE_BEHIND
+
     key = hashlib.sha256(tempfile.mkdtemp().encode()).hexdigest()
     with recording() as rec:
         _SWEEP.get_or_compute(key, lambda: {"v": 1}, remote_ok=True)
         _SWEEP.get(key, remote_ok=True)
+        # The remote tier writes on a thread of its own: its path is part of
+        # the plumbing only once it has run.
+        WRITE_BEHIND.drain(timeout=30)
     return rec["trace"].to_json()
 
 
