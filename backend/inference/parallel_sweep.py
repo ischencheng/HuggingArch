@@ -279,7 +279,7 @@ def class_cards(gpu_sku: str,
     class (`card.Card.klass`), `gpu_sku` always among them —
     the one with the most HBM first: the card the class walks on, and the
     card the others are priced off without walking again
-    (`capacity._restamp_gpu`, `capacity.ClassSweep`).
+    (`capacity._restamp_gpu`, `the serving-law pool`).
 
     The one rule for which cards may share a walk, asked by both views that
     price a series per card. `series` is the one the view publishes: the

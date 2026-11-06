@@ -23,6 +23,7 @@ factors are the ratio of the whole-model view to this rank's view.
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass, field, fields, replace
 from typing import (Callable, FrozenSet, Any, Dict, Iterable, Iterator, List,
                     Literal, Mapping, NamedTuple, Optional, Tuple, Union)
@@ -53,7 +54,7 @@ from .parallel_config import ParallelConfig
 from .chunk_terms import ChunkLaunchTerm, merge_chunk_launch_terms
 from .intensity import arithmetic_intensity
 from .prefill_geometry import PrefillChunkSchedule, PrefillEndpointGeometry
-from .batch_sweep import (measure_points, measures_on_card, phase_at, point_measures,
+from .batch_sweep import (measure_points, phase_at, point_measures,
                           fold_chunk_point_measures, rows_at, step_measure)
 from .row_roofline import (PHASE, ROW, CardForm, FloorForm, LawBook,
                            RowRoofline, StepSum, column_names)
@@ -391,6 +392,8 @@ class _CapacityPreparation:
     #: The walks every step of this preparation shares, across all the
     #: points of a sweep (`step_eval.StepCells`).
     cells: StepCells = field(default_factory=StepCells)
+    #: Re-account the shared walk family after a producer has lazily grown it.
+    account_cells: Any = None
 
     def fabric(self) -> Fabric:
         """This card's interconnect at this deployment's link latency
@@ -702,7 +705,7 @@ def without_step(result: dict, row_lists: Iterable[str]) -> dict:
 
 def _point_rows(base: dict, p_dst: _CapacityPreparation, batches: Mapping[str, int],
                 pending: "PendingEstimate", point: Point, *,
-                breakdown: bool) -> Dict[str, list]:
+                breakdown: bool, costs: bool = True) -> Dict[str, list]:
     """`base`'s per-op rows on `p_dst`'s card at the point `point` moves
     them to (`{}` for the walk's own; a sweep's context, `{"s_input": L}`),
     at each row list's batch (`_point_batches`) and verify width
@@ -753,7 +756,7 @@ def _point_rows(base: dict, p_dst: _CapacityPreparation, batches: Mapping[str, i
             rows, Point({**point.counts, "B": batch, "s_verify": widths[key]}),
             cell=pending.walk_of_rows[key].analysis, peak_flops=p_dst.peak_flops,
             peak_bw=p_dst.peak_bw, fabric=fabric, breakdown=breakdown,
-            launch_s=launch_s)
+            launch_s=launch_s, costs=costs)
     return out
 
 #: The row and phase columns that add across repeated launches, derived from
@@ -988,7 +991,7 @@ def _endpoint_memo_key(kind: str, p: _CapacityPreparation,
     preparation, the length and the prefix. A memo keyed this way is
     therefore sound for every point of one cell, not only for the points of
     one context: two contexts of the same length and prefix at different
-    draft K (`gallery_frontier._draft_walk` builds exactly those) key apart.
+    draft K (Gallery's draft points build exactly those) key apart.
     """
     return (kind, p.gpu_sku, tuple(sorted(p.verify_widths().items())), schedule)
 
@@ -1343,6 +1346,7 @@ class ModelCells(NamedTuple):
     resolved: Any
     cells: StepCells
     basis: CellBasis
+    shared: Any
 
 
 def _model_cells(resolved: Any, parallel: ParallelConfig,
@@ -1369,7 +1373,8 @@ def _model_cells(resolved: Any, parallel: ParallelConfig,
     return shared.reader(
         "capacity", lambda: ModelCells(
             shared.resolved, shared.cells,
-            CellBasis(shared.resolved, parallel, precision, shared.cells)))
+            CellBasis(shared.resolved, parallel, precision, shared.cells),
+            shared))
 
 
 @dataclass(frozen=True)
@@ -1471,8 +1476,9 @@ def _capacity_preparation(
     # The walks this preparation's steps share — every point of a sweep
     # reads the same ones, and so does every later request of the same
     # model, deployment and precision (`_model_cells`).
-    resolved, cells, basis = _model_cells(resolved, parallel, precision,
-                                          model_id=knobs.model_id)
+    resolved, cells, basis, shared = _model_cells(
+        resolved, parallel, precision, model_id=knobs.model_id)
+    account_cells = shared.account
     analysis = basis.analysis
     resolved_precision = analysis.resolved_precision
     # Resolve overlay context once. Per-seq loops reuse this tuple.
@@ -1757,6 +1763,7 @@ def _capacity_preparation(
             draft=draft,
             refusal_reason=refusal_reason,
             cells=cells,
+            account_cells=account_cells,
         )
 
     # The tree is built for the stage the numbers beside it describe.
@@ -1832,6 +1839,7 @@ def _capacity_preparation(
         draft=draft,
         refusal_reason=refusal_reason,
         cells=cells,
+        account_cells=account_cells,
     )
 
 
@@ -2057,7 +2065,7 @@ class CapacitySweepPlan:
     * batch — `points` here (`gridded`: a batch grid or the single pair),
       resolved per card by `_point_batches` / `_direct_batches`;
     * the card within a walk class — `parallel_sweep.class_cards` names
-      them and `ClassSweep.cards` keeps them;
+      them and `the class sweep kept` keeps them;
     * K, the speculative width — `s_verifies` here
       (`CapacityKnobs.s_verify`), walked as the symbol wherever it is wider
       than one;
@@ -2256,6 +2264,8 @@ def _sweep_cell(p: _CapacityPreparation, cell: Cell,
                 prefill_chunk_schedule=base_schedule,
                 fold_prefill_chunks=False, breakdown=False)
             shared_walk = (pw, pending, pending.finish())
+            if pw.account_cells is not None:
+                pw.account_cells()
             stage_walks.append(shared_walk)
         if prices is not None and index not in prices:
             # Walked (the anchors above are this cell's, whatever the caller
@@ -2948,178 +2958,6 @@ def card_form_of(per: Mapping[str, Any], gpu_sku: str, *, phase: str,
     return form
 
 
-@dataclass(frozen=True)
-class ClassSweep:
-    """One gridded serving walk of a deployment (`sweep_points`), walked once
-    for every card of a walk class (`framework_bindings.card_class`: the cards
-    that walk a model alike) and read on any of them without walking again.
-
-    What a card changes in such a sweep is its price and its capacity, not
-    its rows. So the sweep keeps, per context: for each batch the grid fixes,
-    the walk card's phases as `project` keeps them, each step as a function of
-    the card and the floors (`CardForm`), and its measures; and per card its
-    capacity there (`max_batch_per_gpu`, `beyond_max_context`) and its own
-    point at each batch the card's ceiling sets, each read off a sweep ON that
-    card — the
-    capacity and the ceiling batch are the engine's answer for the card,
-    not a second derivation of it. The walk card is the class's card with
-    the most HBM: a deployment that fits no card of the class does not fit
-    it either, so a fixed batch it cannot price no card can serve. A fixed
-    point no card of the class serves is not kept.
-
-    `on_card` reads the sweep on one of its cards: the same
-    `{batch key: [point per context]}` a sweep on that card gives, its
-    points served as that card serves them (`served_points`), each with its
-    step's time and rates on that card at the sweep's floors, its step as a
-    functions of the floors (`CardForm`, `forms`) and its measures keyed there
-    (`batch_sweep.measures_on_card`)."""
-
-    walk_card: str
-    #: Per batch key the grid fixes: per context, the walk card's point or
-    #: None.
-    fixed: Dict[str, List[Optional[dict]]]
-    #: Per card: `{"ceilings": [[max_batch_per_gpu, beyond_max_context]
-    #: per context], "own": {ceiling batch key: [point or None per
-    #: context]}}`, or `{"error": reason}` when the card's sweep failed.
-    cards: Dict[str, dict]
-
-    @classmethod
-    def of(cls, swept: Mapping[str, Mapping[str, Any]], *, walk_card: str,
-           batch_grid: List[Mapping[str, Any]],
-           project: Callable[[str, Dict[str, Any]], Dict[str, Any]],
-           book: LawBook, floors_s: Tuple[float, float]) -> "ClassSweep":
-        """The class walk of `swept` — per card, its sweep (`{batch key:
-        [point per context]}`, the walk card's over the whole grid, every
-        other card's over the ceiling batches alone), or `{"error":
-        reason}` — at the floors the sweeps were priced at.
-
-        A card of another class than `walk_card` is refused here, by the
-        one statement of that rule (`Card.refuse_unless_one_class`): the fixed
-        batches below are the WALK CARD's points, read on each card
-        through their forms (`on_card`), so a card that walks the model
-        differently would be published with the walk card's step."""
-        for sku in swept:
-            Card.of(walk_card).refuse_unless_one_class(Card.of(sku))
-        def point(pt: Any, gpu_sku: str) -> Optional[dict]:
-            per = (pt or {}).get("sol") or {}
-            if not per:
-                return None
-            phases: Dict[str, Dict[str, Any]] = {}
-            forms: Dict[str, Dict[str, Any]] = {}
-            groups: Dict[str, int] = {}
-            gpuCounts: Dict[str, int] = {}
-            for name, phase in (per.get("phases") or {}).items():
-                form = card_form_of(per, gpu_sku, phase=name, book=book,
-                                    floors_s=floors_s)
-                phases[name] = project(name, phase)
-                if form is not None:
-                    forms[name] = form.to_json()
-                elif phase.get("prefill_chunk_map"):
-                    phases[name] = {**phases[name],
-                                    "t_sol_s": phase.get("t_sol_s")}
-                throughput = phase.get("throughput") or {}
-                groups[name] = throughput.get("groups", 1)
-                gpuCounts[name] = throughput.get("num_gpus", 1)
-            return {
-                "phases": phases,
-                "forms": forms,
-                "groups": groups,
-                "num_gpus": gpuCounts,
-                "facts": {name: per.get(name) for name in (
-                    "parallel_warnings", "max_context_tokens",
-                    "infeasibility_reason", "max_decode_batch_per_gpu",
-                    "max_prefill_batch_per_gpu")},
-                "measures": (pt or {}).get("measures") or {},
-            }
-
-        def ceilings(card: Mapping[str, Any]) -> List[List[Any]]:
-            out: List[List[Any]] = []
-            for at in zip(*card.values(), strict=True):
-                per = next(((pt or {}).get("sol") or {} for pt in at
-                            if (pt or {}).get("sol")), {})
-                out.append([per.get("max_batch_per_gpu"),
-                            bool(per.get("beyond_max_context"))])
-            return out
-
-        cards: Dict[str, dict] = {}
-        for sku, card in swept.items():
-            if "error" in card:
-                cards[sku] = {"error": str(card["error"])}
-                continue
-            own = {
-                bp["key"]: [point(pt, sku) for pt in card[bp["key"]]]
-                for bp in batch_grid
-                if not bp["decode_batch_size"]
-                and (sku == walk_card or bp["key"] != "max")}
-            if sku != walk_card and "capacity" in own:
-                own["max"] = own["capacity"]
-            cards[sku] = {"ceilings": ceilings(card), "own": own}
-        if "error" in cards[walk_card]:
-            raise ValueError(cards[walk_card]["error"])
-        fixed: Dict[str, List[Optional[dict]]] = {}
-        for bp in batch_grid:
-            if not bp["decode_batch_size"]:
-                continue
-            fixed[bp["key"]] = [
-                point(pt, walk_card)
-                if any(point_served(max_batch_per_gpu=card["ceilings"][i][0],
-                                    beyond_max_context=card["ceilings"][i][1],
-                                    requests=bp["decode_batch_size"])
-                       for card in cards.values() if "error" not in card)
-                else None
-                for i, pt in enumerate(swept[walk_card][bp["key"]])]
-        return cls(walk_card, fixed, cards)
-
-    def on_card(self, gpu_sku: str, *, batch_grid: List[Mapping[str, Any]],
-                floors_s: Tuple[float, float]) -> Dict[str, List[Optional[dict]]]:
-        """The sweep on `gpu_sku`, one of its cards, at the floors
-        `floors_s`. A card the sweep was not walked for is refused, and a
-        card whose own sweep failed raises its reason."""
-        card = self.cards.get(gpu_sku)
-        if card is None:
-            raise KeyError(f"{gpu_sku} is not a card this sweep was walked for "
-                           f"({', '.join(self.cards)})")
-        if "error" in card:
-            raise ValueError(card["error"])
-        gpu = get_gpu(gpu_sku)
-
-        def priced(point: Optional[dict], ceiling: List[Any]) -> Optional[dict]:
-            if point is None:
-                return None
-            phases: Dict[str, Dict[str, Any]] = {}
-            forms: Dict[str, Dict[str, Any]] = {}
-            for name, projection in point["phases"].items():
-                phase = dict(projection)
-                if name in point["forms"]:
-                    form = floor_form_on(
-                        CardForm.from_json(point["forms"][name]), gpu)
-                    phase["t_sol_s"] = form.at(*floors_s)
-                    forms[name] = form.to_json()
-                if "binding" in phase:
-                    phase["throughput"] = phase_throughput(
-                        phase, unique_tokens_multiplier=point["groups"][name],
-                        num_gpus=point["num_gpus"][name])
-                phases[name] = phase
-            return {"sol": {"max_batch_per_gpu": ceiling[0],
-                            "beyond_max_context": ceiling[1],
-                            "phases": phases, **point["facts"]},
-                    "measures": measures_on_card(point["measures"], gpu_sku),
-                    "forms": forms}
-
-        return {bp["key"]: [priced(pt, card["ceilings"][i]) for i, pt in enumerate(
-                    self.fixed[bp["key"]] if bp["decode_batch_size"]
-                    else card["own"][bp["key"]])]
-                for bp in batch_grid}
-
-    def to_json(self) -> Dict[str, Any]:
-        return {"walk_card": self.walk_card, "fixed": self.fixed,
-                "cards": self.cards}
-
-    @classmethod
-    def from_json(cls, d: Mapping[str, Any]) -> "ClassSweep":
-        return cls(str(d["walk_card"]), dict(d["fixed"]), dict(d["cards"]))
-
-
 def _phase_inputs(p: _CapacityPreparation, _c: "CapacityCeilings", *,
                   avg_input_tokens: int,
                   avg_output_tokens: int,
@@ -3311,6 +3149,7 @@ def _capacity_pending(
     `finish()` runs the rest with no measurement read, and the estimate's
     measured totals (`PendingEstimate.measures`) are folded over one lookup
     as a one-point sweep's are (`finish_estimates`, `_capacity_finish`)."""
+    pending_started = time.perf_counter()
     if avg_input_tokens < 0 or avg_output_tokens < 0:
         raise ValueError("avg_input_tokens and avg_output_tokens must be ≥ 0")
     if prefill_chunk_schedule is None:
@@ -3769,6 +3608,9 @@ def _capacity_pending(
             return _fold_chunked_prefill_sol(
                 finish(), p, estimate, prefill_chunk_schedule)
         estimate = replace(estimate, finish=finish_chunked)
+    estimate.timings["pending_walk_s"] = time.perf_counter() - pending_started
+    if p.account_cells is not None:
+        p.account_cells()
     return estimate
 
 
@@ -3820,6 +3662,8 @@ class PendingEstimate:
     #: step's shape (`batch_sweep.step_measure`): one walk's points share
     #: them.
     measured_formulas: Dict[Any, Any] = field(default_factory=dict)
+    #: Stage timings, published beside an estimate (`s`).
+    timings: Dict[str, Any] = field(default_factory=dict)
 
     def priced_on(self, p_dst: Any, ceilings: Any = None, *,
                   rows_stage: Optional[int] = None) -> None:
@@ -3867,6 +3711,7 @@ class PendingEstimate:
         out_rows: Dict[str, list] = dict(rows)
         if not looks_up(self.selection_mode):
             return out_rows, None
+        started = time.perf_counter()
         points: Dict[str, list] = {}
         for name, walk in self.walk_of_rows.items():
             listed = key_columns(rows.get(name) or [], walk.analysis)
@@ -3876,6 +3721,8 @@ class PendingEstimate:
                 model_id=walk.model_id, spec_hash=walk.spec_hash)
             out_rows[name] = [{**r, **identity_columns(pt)}
                               for r, pt in zip(listed, points[name], strict=True)]
+        self.timings["point_keys_s"] = time.perf_counter() - started
+        self.timings["keyed_rows"] = sum(len(value) for value in points.values())
         return out_rows, points
 
     def measures(self, result: Mapping[str, Any]) -> Dict[str, Any]:
@@ -3913,7 +3760,14 @@ def finish_estimates(pending: List[PendingEstimate]) -> List[dict]:
     measurement, then the union of their keys looked up once and each
     estimate's measured totals folded over it (`batch_sweep.measure_points`)
     — an estimate is a one-point sweep."""
-    results = [without_step(pe.finish(), pe.walk_of_rows) for pe in pending]
+    started = time.perf_counter()
+    results = []
+    for pe in pending:
+        oneStarted = time.perf_counter()
+        results.append(without_step(pe.finish(), pe.walk_of_rows))
+        pe.timings["finish_s"] = time.perf_counter() - oneStarted
+    if timings := next((pe.timings for pe in pending), None):
+        timings["finish_estimates_s"] = time.perf_counter() - started
     reading = [(pe, r) for pe, r in zip(pending, results, strict=True)
                if pe.reads and not r.get("infeasibility_reason")]
     if reading:
@@ -3922,11 +3776,26 @@ def finish_estimates(pending: List[PendingEstimate]) -> List[dict]:
                != (first.scope, first.calibration_rows, first.selection_mode,
                    first.kernel_mix) for pe, _r in reading):
             raise ValueError("estimates finished together read one measurement scope")
-        measure_points([{"sol": r, "measures": pe.measures(r)} for pe, r in reading],
+        started = time.perf_counter()
+        measuredPoints = []
+        for pe, r in reading:
+            oneStarted = time.perf_counter()
+            measures = pe.measures(r)
+            pe.timings["point_measure_build_s"] = (
+                time.perf_counter() - oneStarted)
+            measuredPoints.append({"sol": r, "measures": measures})
+        first.timings["point_measure_build_s"] = (
+            time.perf_counter() - started)
+        measure_points(measuredPoints,
                        selection_mode=first.selection_mode,
                        measurement_scope=first.scope,
                        calibration_rows=first.calibration_rows,
-                       kernel_mix=first.kernel_mix)
+                       kernel_mix=first.kernel_mix,
+                       timings=first.timings)
+    for pe in pending:
+        if (pe.preparation is not None
+                and pe.preparation.account_cells is not None):
+            pe.preparation.account_cells()
     return results
 
 

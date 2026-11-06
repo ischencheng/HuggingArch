@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Any, Dict, Optional
 
 from fastapi import Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+
+logger = logging.getLogger(__name__)
 
 from backend.arch.eval.precision import ResolvedPrecision
 from backend.arch.eval.dim import value_of
@@ -439,6 +442,16 @@ def _estimate_payload(req: InferenceEstimateRequest) -> Any:
         return _head_repartition_refusal(e)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    result["timings"] = pending[0].timings if pending[0] is not None else {}
+    if len(pending) > 1:
+        result["timings"]["decode"] = (
+            pending[1].timings if pending[1] is not None else {})
+    if pending[0] is not None:
+        logger.info("estimate timings %s", json.dumps(
+            pending[0].timings, sort_keys=True, default=str))
+        if len(pending) > 1 and pending[1] is not None:
+            logger.info("decode estimate timings %s", json.dumps(
+                pending[1].timings, sort_keys=True, default=str))
     result = served(result)
     result["code_version"] = _code_version()
     _say_measurements(result, req)

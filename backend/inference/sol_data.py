@@ -28,7 +28,7 @@ from backend.measure.scope import ResultIdentity, of_walk
 #: and made a bundle one walk class's (`ServingWalkKey`). v3 made a record a
 #: real CSE graph. v4 carries the serving capacity view and the effective
 #: parallel config beside that graph.
-walkRecordSchema = "serving-law-v4"
+walkRecordSchema = "serving-law-v6"
 servingContexts = tuple(ROUTINE_SEQ_LENS)
 defaultPrefillChunkSize = 8192
 

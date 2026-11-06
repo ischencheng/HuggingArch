@@ -29,6 +29,7 @@ Stage placement in the pipeline:
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
@@ -40,6 +41,8 @@ if TYPE_CHECKING:
 from backend.arch.eval.dim import as_extent, as_number
 from backend.arch.sharding import ENCODE
 from backend.arch.eval.analysis import Point
+from backend.measure.lookup import Key
+from backend.measure.auto_sweep import MeasuredFormula, PointMeasure
 
 from .benchmark_identity import (
     RowIdentity,
@@ -57,6 +60,7 @@ from .op_calibration import (
     BenchmarkKey,
     PhysicalKey,
 )
+import sympy as sp
 from backend.measure.auto_sweep import (DECLINED_REASON, MISSING_PROJECTION,
                                          MISSING_SIGNATURE, ZERO_LAUNCH)
 
@@ -456,6 +460,109 @@ class PointRow:
         return Fraction(self.launch_rows) / self.launch_rows_exact
 
 
+def _law_to_json(value: Any) -> Any:
+    """A row's law value as plain JSON, expressions under one marker.
+
+    The spelling is `sp.sstr`, read back through `LawBook.read` — the same
+    closed law-text vocabulary `roofline_expr` and `shape_law` already use.
+    """
+    if isinstance(value, sp.Basic):
+        return {"__law__": sp.sstr(value)}
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            key = (f"__lawkey__:{sp.sstr(k)}"
+                   if isinstance(k, sp.Basic) else _law_to_json(k))
+            out[key] = _law_to_json(v)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_law_to_json(v) for v in value]
+    return value
+
+
+def _law_from_json(value: Any) -> Any:
+    if (isinstance(value, dict) and set(value) == {"__law__"}
+            and isinstance(value["__law__"], str)):
+        from .row_roofline import LawBook
+        return LawBook.read(value["__law__"])
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            key = (LawBook.read(k[len("__lawkey__:"):])
+                   if isinstance(k, str)
+                   and k.startswith("__lawkey__:") else _law_from_json(k))
+            out[key] = _law_from_json(v)
+        return out
+    if isinstance(value, list):
+        return [_law_from_json(v) for v in value]
+    return value
+
+
+def _walk_laws(value: Any) -> Any:
+    if isinstance(value, sp.Basic):
+        yield value
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            yield from _walk_laws(k)
+            yield from _walk_laws(v)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            yield from _walk_laws(v)
+
+
+def _materialize_laws(value: Any, binding: Mapping[str, Any],
+                      book: Any) -> Any:
+    if isinstance(value, sp.Basic):
+        return book.evaluate(value, {
+            name: binding[name] for name in
+            (symbol.name for symbol in value.free_symbols)})
+    if isinstance(value, dict):
+        return {_materialize_laws(k, binding, book):
+                _materialize_laws(v, binding, book)
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [_materialize_laws(v, binding, book) for v in value]
+    return value
+
+
+class _StoredRowIdentity(RowIdentity):
+    """A serialized row's resolved identity, without its graph.
+
+    The key derivation is still `RowIdentity._keyed`: only the facts that
+    derivation asked the graph for at walk time (`op`, leaf variants, state
+    carrier) have been resolved and stored. A consumer cannot rederive them.
+    """
+
+    def __init__(self, *, op: str, leaf: Mapping[str, Any],
+                 served: Mapping[str, int], dtype_env_json: str,
+                 declined: str):
+        self._served = dict(served)
+        self._leaves = {}
+        self._result = None
+        self._program = None
+        self._node_by_sid = {}
+        self._op = op
+        self._leaf = dict(leaf)
+        self._dtype_env_json = dtype_env_json
+        self._declined = declined
+
+    def leaf_of(self, row: Mapping[str, Any]) -> Dict[str, Any]:
+        return self._leaf
+
+    def leaf_dtype_env(self, row: Mapping[str, Any]
+                      ) -> Tuple[str, str]:
+        return self._dtype_env_json, self._declined
+
+    def op_of(self, row: Mapping[str, Any], node: Optional[Any]) -> str:
+        return self._op
+
+    def _node_of(self, row: Mapping[str, Any]) -> Optional[Any]:
+        return None
+
+    def carries_state(self, row: Mapping[str, Any]) -> bool:
+        return bool(row.get("__carries_state__"))
+
+
 def key_columns_at(read: Mapping[Any, Any], row: Mapping[str, Any]
                     ) -> Dict[str, Any]:
     """What the row's measurement key is read off at a point (`read`)
@@ -555,6 +662,96 @@ def _at_geometry(row: Mapping[str, Any], *, billed: float,
     return f, a
 
 
+def point_row_of(row: Mapping[str, Any], identity: RowIdentity,
+                 deployment: DeploymentContext, *, model_id: str,
+                 spec_hash: str,
+                 dispatch_override: Optional[DispatchDecision] = None
+                 ) -> PointRow:
+    """One row's PointRow — the single key derivation.
+
+    """
+    binding = deployment.framework_binding
+    dispatched_binding = (
+        None if binding is None
+        else binding.deployed(replace(
+            binding.deployment,
+            kv_block_size=deployment.kv_block_size,
+            tensor_parallel=deployment.tensor_parallel)))
+    bindings = op_bindings()
+    op, shape_json, (shape_in, shape_out) = identity.of_event(row)
+    signature = bindings.get(op)
+    if signature is not None and row.get("shape_at_batch") is False:
+        raise NoShapeLaw(
+            f"{row.get('aggregation_id')}: no shape law to read at this batch")
+    sid = str(row.get("aggregation_id", "") or "")
+    dtype_env_json, declined = identity.leaf_dtype_env(row)
+    placement_reason = (
+        ZERO_LAUNCH if zero_cost(row) else
+        DECLINED_REASON if declined else
+        MISSING_SIGNATURE if signature is None else
+        MISSING_PROJECTION if shape_json is None else "")
+    launches = identity.launches(row)
+    cadence = identity.cadence(row)
+    billed = float(max(launches, 1) * cadence)
+    flops, access = row.get("flops_per_rank"), row.get("access_bytes_per_rank")
+    declared = get_signature(signature) if signature is not None else None
+    resolved_launch = ResolvedLaunch.from_dtype_env_json(dtype_env_json)
+    analysis = (None if identity._result is None
+                else identity._result.analysis)
+    dispatch = (
+        dispatch_override if dispatch_override is not None else None
+        if binding is None or analysis is None else
+        dispatched_binding.dispatch_for(
+            op, analysis.program, analysis, resolved_launch))
+    padded_rows, exact_rows = identity.launch_rows(row)
+    # Padding is a routed buffer's and no other tensor's
+    # (`RoutedLaunch`): a grouped launch wants whole rows per expert,
+    # and every other averaged extent is a cadence the plan refuses by
+    # name (`plan._starved_axes` / `_rounded_axes`). So a row on no
+    # routed buffer keeps the walk's numerators whatever its extents do.
+    at_geometry = _at_geometry(row, billed=billed)
+    return PointRow(
+        uid=row.get("uid"),
+        aggregation_id=sid,
+        op=op,
+        signature=signature,
+        shape_json=shape_json,
+        dtype_env_json=dtype_env_json,
+        key=None if shape_json is None else BenchmarkKey(
+            # Model, spec and node are provenance, not physics, and the
+            # version is the measurement's, not the request's.
+            model=model_id, spec_hash=spec_hash,
+            phase=deployment.phase, parallel=deployment.parallel_signature,
+            framework=deployment.framework, framework_version="",
+            gpu=deployment.gpu_sku, op=op, node_spec_id=sid,
+            shape_json=shape_json, dtype_env_json=dtype_env_json,
+            kernel_impl="",
+        ).to_physical(),
+        count=int(row.get("count_per_step", 1)),
+        launches=launches,
+        cadence=cadence,
+        zero_cost=zero_cost(row),
+        declined=declined,
+        placement_reason=placement_reason,
+        t_sol_s=float(row.get("t_sol_s") or 0.0),
+        launch_shape_in=shape_in,
+        launch_shape_out=shape_out or row.get("shape_outs"),
+        shape_weight=identity.launch_weight(row),
+        flops_per_launch=None if flops is None else float(flops) / billed,
+        access_bytes_per_launch=None if access is None else float(access) / billed,
+        launch_rows=padded_rows,
+        launch_rows_exact=exact_rows,
+        routed=row.get("routed"),
+        geometry_flops=at_geometry[0],
+        geometry_access_bytes=at_geometry[1],
+        kernel_params=declared.params_from_row(row) if declared is not None else {},
+        leaf=identity.leaf_of(row),
+        carries_state=identity.carries_state(row),
+        dispatch=dispatch,
+    )
+
+
+
 def point_keys(cell: Any, rows: Sequence[Mapping[str, Any]],
                workload: WorkloadShape, deployment: DeploymentContext, *,
                model_id: str, spec_hash: str) -> List[PointRow]:
@@ -564,8 +761,8 @@ def point_keys(cell: Any, rows: Sequence[Mapping[str, Any]],
     `cell` is the walk the rows come from (`pipeline.analyze`'s result), and
     `rows` its per-op rows at the point: the walk's own (`per_op_timing`),
     or those rows re-read at another batch and card
-    (`batch_sweep.rows_at`). The estimate's overlay, the
-    Kernel Bench plan and any rescaled sweep point ask here, so a stored
+    (`batch_sweep.rows_at`). The estimate's overlay, a Kernel Bench plan, a
+    serving-law producer and any rescaled sweep point ask here, so a stored
     measurement and the lookup for it are keyed by one derivation.
 
     Raises `NoShapeLaw` for a measurable row re-read at a batch its walk
@@ -584,87 +781,8 @@ def point_keys(cell: Any, rows: Sequence[Mapping[str, Any]],
     if identity is None:
         identity = cell.identities[served] = RowIdentity(
             cell, kv_block_size=served[0], ssm_chunk_size=served[1])
-    bindings = op_bindings()
-    analysis = cell.analysis
-    # `binding` was deployed before the point's deployment sidecar was
-    # built. Page and TP are request facts there, so ask dispatches with the
-    # same one owner that resolves the framework's page default.
-    dispatched_binding = (
-        None if binding is None
-        else binding.deployed(replace(
-            binding.deployment,
-            kv_block_size=deployment.kv_block_size,
-            tensor_parallel=deployment.tensor_parallel)))
-    out: List[PointRow] = []
-    for row in rows:
-        op, shape_json, (shape_in, shape_out) = identity.of_event(row)
-        signature = bindings.get(op)
-        if signature is not None and row.get("shape_at_batch") is False:
-            raise NoShapeLaw(
-                f"{row.get('aggregation_id')}: no shape law to read at this batch")
-        sid = str(row.get("aggregation_id", "") or "")
-        dtype_env_json, declined = identity.leaf_dtype_env(row)
-        resolved_launch = ResolvedLaunch.from_dtype_env_json(dtype_env_json)
-        placement_reason = (
-            ZERO_LAUNCH if zero_cost(row) else
-            DECLINED_REASON if declined else
-            MISSING_SIGNATURE if signature is None else
-            MISSING_PROJECTION if shape_json is None else "")
-        launches = identity.launches(row)
-        cadence = identity.cadence(row)
-        billed = float(max(launches, 1) * cadence)
-        flops, access = row.get("flops_per_rank"), row.get("access_bytes_per_rank")
-        declared = get_signature(signature) if signature is not None else None
-        dispatch = (None if binding is None else
-                    dispatched_binding.dispatch_for(
-                        op, analysis.program, analysis, resolved_launch))
-        padded_rows, exact_rows = identity.launch_rows(row)
-        # Padding is a routed buffer's and no other tensor's
-        # (`RoutedLaunch`): a grouped launch wants whole rows per expert,
-        # and every other averaged extent is a cadence the plan refuses by
-        # name (`plan._starved_axes` / `_rounded_axes`). So a row on no
-        # routed buffer keeps the walk's numerators whatever its extents do.
-        at_geometry = _at_geometry(row, billed=billed)
-        out.append(PointRow(
-            uid=row.get("uid"),
-            aggregation_id=sid,
-            op=op,
-            signature=signature,
-            shape_json=shape_json,
-            dtype_env_json=dtype_env_json,
-            key=None if shape_json is None else BenchmarkKey(
-                # Model, spec and node are provenance, not physics, and the
-                # version is the measurement's, not the request's.
-                model=model_id, spec_hash=spec_hash,
-                phase=deployment.phase, parallel=deployment.parallel_signature,
-                framework=deployment.framework, framework_version="",
-                gpu=deployment.gpu_sku, op=op, node_spec_id=sid,
-                shape_json=shape_json, dtype_env_json=dtype_env_json,
-                kernel_impl="",
-            ).to_physical(),
-            count=int(row.get("count_per_step", 1)),
-            launches=launches,
-            cadence=cadence,
-            zero_cost=zero_cost(row),
-            declined=declined,
-            placement_reason=placement_reason,
-            t_sol_s=float(row.get("t_sol_s") or 0.0),
-            launch_shape_in=shape_in,
-            launch_shape_out=shape_out or row.get("shape_outs"),
-            shape_weight=identity.launch_weight(row),
-            flops_per_launch=None if flops is None else float(flops) / billed,
-            access_bytes_per_launch=None if access is None else float(access) / billed,
-            launch_rows=padded_rows,
-            launch_rows_exact=exact_rows,
-            routed=row.get("routed"),
-            geometry_flops=at_geometry[0],
-            geometry_access_bytes=at_geometry[1],
-            kernel_params=declared.params_from_row(row) if declared is not None else {},
-            leaf=identity.leaf_of(row),
-            carries_state=identity.carries_state(row),
-            dispatch=dispatch,
-        ))
-    return out
+    return [point_row_of(row, identity, deployment, model_id=model_id,
+                         spec_hash=spec_hash) for row in rows]
 
 
 # ---------------------------------------------------------------------------

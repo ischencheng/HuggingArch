@@ -26,6 +26,7 @@ code: the estimator imports it.
 from __future__ import annotations
 
 import os
+import time
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -155,8 +156,9 @@ def _client() -> "httpx.Client":
         return client
 
 
-def _call(method: str, path: str, **kw: Any) -> dict:
+def _call(method: str, path: str, *, timed: bool = False, **kw: Any):
     url = service_url()
+    started = time.perf_counter()
     try:
         r = _client().request(method, url + path,
                               headers={INTERNAL_HEADER: secret()}, **kw)
@@ -173,10 +175,11 @@ def _call(method: str, path: str, **kw: Any) -> dict:
             f"measurements unavailable: the Kernel Bench service answered "
             f"{r.status_code}{': ' + detail if detail else ''}")
     try:
-        return r.json()
+        value = r.json()
     except ValueError:
         raise MeasurementsUnavailable(
             "measurements unavailable: the Kernel Bench service answered no JSON") from None
+    return (value, time.perf_counter() - started) if timed else value
 
 
 def resolve_scope(*, reads: bool, owner: Optional[str]) -> MeasurementScope:
@@ -204,6 +207,8 @@ class Lookup:
     keys: tuple
     rows: tuple
     excluded_mine: int
+    request_s: float = 0.0
+    service_s: float = 0.0
 
 
 #: The rows of keys already looked up in this process, by the scope's cache
@@ -273,9 +278,11 @@ def lookup(scope: MeasurementScope, keys: Sequence[Any], *,
     missing = [k for k in keys if k not in held]
     excluded = 0
     if missing:
-        out = _call("POST", "/internal/bench/lookup", json={
+        started = time.perf_counter()
+        out, request_s = _call("POST", "/internal/bench/lookup", timed=True, json={
             "keys": [key_json(k) for k in missing], "owner": scope.owner,
             "snapshot": scope.snapshot}, timeout=lookup_timeout(len(missing), timeout))
+        service_s = float(out.get("service_s") or 0.0)
         try:
             if (str(out["lake_id"]) != scope.lake_id or int(out["snapshot"]) != scope.snapshot
                     or len(out["rows"]) != len(missing)):
@@ -291,7 +298,9 @@ def lookup(scope: MeasurementScope, keys: Sequence[Any], *,
                 f"malformed ({e})") from None
         _hold(scope, fetched)
         held.update(fetched)
-    return Lookup(keys, tuple(held[k] for k in keys), excluded)
+    return Lookup(keys, tuple(held[k] for k in keys), excluded,
+                  request_s=(time.perf_counter() - started) if missing else 0.0,
+                  service_s=service_s if missing else 0.0)
 
 
 def covered(keys: Sequence[Any]) -> Dict[Any, Set[Tuple[str, str, str]]]:

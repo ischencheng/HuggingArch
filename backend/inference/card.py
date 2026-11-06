@@ -216,7 +216,7 @@ class Card:
         (`capacity._restamp_gpu`: the card's memory and peaks), its ROWS
         move (`capacity._point_rows`: every row's law read at the other
         card's peaks and fabric), and a kept class sweep moves a step's
-        form (`capacity.ClassSweep`). Each asks here; none says it again.
+        form (`the serving-law pool`). Each asks here; none says it again.
 
         The graph does not mention the SKU — but it does mention the card's
         CLASS (`framework_bindings.CardClass`: what a framework's dispatch

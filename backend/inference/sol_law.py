@@ -10,14 +10,18 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 import sympy as sp
 
 from backend.arch.law_text import read_walk_law
-from backend.measure.auto_sweep import _ExactPrinter, exact_div
+from backend.arch.eval.analysis import Point
+from backend.measure.auto_sweep import (
+    _ExactPrinter, exact_div, MeasuredFormula, PointMeasure,
+)
+from backend.measure.lookup import Key
 
 from .capacity import (
     CapacityKnobs,
@@ -25,6 +29,7 @@ from .capacity import (
     _restamp_gpu,
     _capacity_pending,
     _capacity_preparation,
+    _point_rows,
     point_served,
     without_step,
 )
@@ -36,8 +41,11 @@ from .parallel_config import ParallelConfig
 from .prefill_geometry import PrefillChunkSchedule, PrefillEndpointGeometry
 from .row_roofline import StepSum, law_symbol, rung_symbols
 from .sol_data import walkRecordSchema as servingLawSchema
+from .calibration_overlay import point_keys
 from .serving_view import servingCapacityView
 from backend.code_trace.memo import memoize
+from .sweep_grid import FRONTIER_BATCH_GRID, GALLERY_SEQ_LENS
+from .batch_sweep import point_measures
 
 
 _lawOutputs = {
@@ -286,6 +294,336 @@ def _collectives(rows: Iterable[Mapping[str, Any]]) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _measurePointsToJson(
+        items: Sequence[tuple[str, int, int, PointMeasure]]
+) -> dict[str, Any]:
+    """One decode grid's concrete lookups as ordinary JSON tables.
+
+    Every distinct string and physical key is named once. Launches and term
+    metadata are properties of the step's rows, held by a term variant rather
+    than repeated at every point. A point names only the looked-up terms and
+    the key entry each reads.
+    """
+    strings: list[str] = []
+    at_string: dict[str, int] = {}
+    contexts: list[Any] = []
+    at_context: dict[str, int] = {}
+    variants: list[dict[str, Any]] = []
+    at_variant: dict[str, int] = {}
+    keys: list[list[int]] = []
+    at_key: dict[tuple[Any, ...], int] = {}
+    anchors: list[Any] = []
+    at_anchor: dict[str, int] = {}
+    dispatches: list[Any] = []
+    at_dispatch: dict[str, int] = {}
+    shapeAxes: list[str] = []
+    at_axis: dict[str, int] = {}
+    shapeTemplates: list[list[int]] = []
+    at_template: dict[tuple[int, ...], int] = {}
+    shapes: list[list[Any]] = []
+    at_shape: dict[str, int] = {}
+
+    def text(value: str) -> int:
+        got = at_string.get(value)
+        if got is None:
+            got = at_string[value] = len(strings)
+            strings.append(value)
+        return got
+
+    def indexed(table: list[Any], at: dict[str, int], value: Any) -> int:
+        canonical = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        got = at.get(canonical)
+        if got is None:
+            got = at[canonical] = len(table)
+            table.append(value)
+        return got
+
+    def variant(measure: PointMeasure) -> int:
+        value = {
+            "unkeyed": [text(v) for v in measure.unkeyed],
+            "labels": [text(v) for v in measure.labels],
+            "reasons": [text(v) for v in measure.reasons],
+            "zero_cost": list(measure.formula.zero_cost),
+            "launches": list(measure.launches),
+            "formula": text(measure.formula.text),
+        }
+        return indexed(variants, at_variant, value)
+
+    def key(value: Any, read: Any, *, cardless: bool) -> int:
+        if value is None or read is None:
+            raise ValueError("a looked-up term states its key and selection read")
+        decoded = json.loads(value.shape_json)
+        template = tuple(indexed(shapeAxes, at_axis, axis)
+                         for axis in decoded)
+        templateIndex = at_template.get(template)
+        if templateIndex is None:
+            templateIndex = at_template[template] = len(shapeTemplates)
+            shapeTemplates.append(list(template))
+        shapeRow = [templateIndex, *(decoded[axis] for axis in decoded)]
+        canonicalShape = json.dumps(decoded, sort_keys=True,
+                                    separators=(",", ":"))
+        if canonicalShape != value.shape_json:
+            raise ValueError("a physical key's shape is not canonical JSON")
+        shape = at_shape.get(canonicalShape)
+        if shape is None:
+            shape = at_shape[canonicalShape] = len(shapes)
+            shapes.append(shapeRow)
+        fields = [text(value.signature), shape, text(value.dtype_env_json),
+                  text("" if cardless else value.gpu), text(value.phase)]
+        anchor = indexed(anchors, at_anchor, read.get("anchor"))
+        dispatch = indexed(dispatches, at_dispatch, read.get("dispatch"))
+        canonical = (*fields, anchor, dispatch)
+        got = at_key.get(canonical)
+        if got is None:
+            got = at_key[canonical] = len(keys)
+            keys.append([*fields, anchor, dispatch])
+        return got
+
+    def withoutCard(measure: PointMeasure) -> PointMeasure:
+        return replace(
+            measure,
+            keys=tuple(None if value is None else value._replace(gpu="")
+                       for value in measure.keys),
+            context={**(measure.context or {}), "gpu": ""})
+
+    grouped: dict[tuple[int, int], list[tuple[str, PointMeasure]]] = {}
+    for gpu, context, batch, measure in items:
+        grouped.setdefault((int(context), int(batch)), []).append(
+            (gpu, measure))
+    points = []
+    for (context, batch), atPoint in grouped.items():
+        firstGpu, first = atPoint[0]
+        normalized = withoutCard(first)
+        cardless = all(
+            withoutCard(measure) == normalized
+            for _gpu, measure in atPoint[1:])
+        representatives = [(firstGpu, first)] if cardless else atPoint
+        for gpu, measure in representatives:
+            keyed = []
+            for i, (physical, read) in enumerate(
+                    zip(measure.keys, measure.inputs, strict=True)):
+                if physical is None or measure.formula.zero_cost[i]:
+                    continue
+                keyed.append((i, key(physical, read, cardless=cardless)))
+            point = {
+                "context": context, "batch": batch,
+                "variant": variant(measure),
+                "contextIndex": indexed(
+                    contexts, at_context, withoutCard(measure).context
+                    if cardless else measure.context),
+                "keyedTerms": [term for term, _key in keyed],
+                "keyedKeys": [entry for _term, entry in keyed],
+            }
+            if not cardless:
+                point["gpu"] = gpu
+            points.append(point)
+    return {"schema": "measure-points-v6", "strings": strings,
+            "contexts": contexts, "variants": variants,
+            "keyColumns": [list(column) for column in zip(*keys, strict=True)]
+            if keys else [],
+            "shapeAxes": shapeAxes, "shapeTemplates": shapeTemplates,
+            "shapes": shapes,
+            "anchors": anchors,
+            "dispatches": dispatches, "points": points,
+            "cardless": all("gpu" not in point for point in points)}
+
+
+def _measurePointAt(table: Mapping[str, Any], *, gpu_sku: str,
+                    context: int, batch: int, point: Any = None,
+                    as_object: bool = False,
+                    shared: Optional[Dict[Any, Any]] = None
+                    ) -> dict[str, Any]:
+    """One stored table row as the `PointMeasure` a fold reads.
+
+    `point` is the already-located row; a one-point caller may omit it.
+    """
+    if point is None:
+        for candidate in table["points"]:
+            if (candidate.get("gpu", gpu_sku) == gpu_sku
+                    and int(candidate["context"]) == int(context)
+                    and int(candidate["batch"]) == int(batch)):
+                point = candidate
+                break
+    if point is None:
+        raise KeyError(f"the serving law has no measured point for {gpu_sku} "
+                       f"at {context} tokens and batch {batch}")
+
+    strings = table["strings"]
+    cardless = bool(table.get("cardless"))
+    stored = table["variants"][point["variant"]]
+    count = len(stored["zero_cost"])
+    physical: list[Any] = [None] * count
+    inputs: list[Any] = [None] * count
+    for term, entry in zip(point["keyedTerms"], point["keyedKeys"],
+                           strict=True):
+        storedKey = [column[entry] for column in table["keyColumns"]]
+        cacheKey = (gpu_sku, tuple(storedKey))
+        if shared is not None and cacheKey in shared:
+            physical[term], inputs[term] = shared[cacheKey]
+        else:
+            shapeRow = table["shapes"][storedKey[1]]
+            template = table["shapeTemplates"][shapeRow[0]]
+            shape = {table["shapeAxes"][axis]: value
+                     for axis, value in zip(template, shapeRow[1:],
+                                            strict=True)}
+            shapeJson = json.dumps(shape, sort_keys=True,
+                                   separators=(",", ":"))
+            fields = [strings[storedKey[0]], shapeJson,
+                      strings[storedKey[2]], strings[storedKey[3]],
+                      strings[storedKey[4]]]
+            if cardless:
+                fields[3] = gpu_sku
+            rowInput = {
+                "anchor": table["anchors"][storedKey[5]],
+                "dispatch": table["dispatches"][storedKey[6]],
+            }
+            physical[term], inputs[term] = Key(*fields), rowInput
+            if shared is not None:
+                shared[cacheKey] = (physical[term], inputs[term])
+    selectionContext = dict(table["contexts"][point["contextIndex"]])
+    if cardless:
+        selectionContext["gpu"] = gpu_sku
+    measureObject = PointMeasure(
+        tuple(physical), tuple(float(v) for v in stored["launches"]),
+        tuple(strings[i] for i in stored["unkeyed"]),
+        tuple(strings[i] for i in stored["labels"]),
+        tuple(strings[i] for i in stored["reasons"]),
+        MeasuredFormula(strings[stored["formula"]],
+                        tuple(stored["zero_cost"])),
+        selectionContext, tuple(inputs), (), (),
+    )
+    # Gallery/Scaling SOL points carry no per-op row table. The measured fold
+    # updates their phase totals and coverage; term-to-row mapping is
+    # breakdown-only and is not a pool fact.
+    return {"measure": measureObject if as_object
+            else measureObject.to_json(),
+            "terms": [], "phase": "decode"}
+
+
+def servingMeasurePoint(record: Mapping[str, Any], *, card: Card,
+                        context: int, batch: int) -> dict[str, Any]:
+    """A record's stored decode measurement at one public point.
+
+    The producer derived every key through `calibration_overlay.point_keys`.
+    This read is a table lookup; it neither replays a law nor walks.
+    """
+    table = record.get("phases", {}).get("decode", {}).get("measurePoints")
+    if table is None:
+        raise ValueError("the serving law carries no measured points")
+    return _measurePointAt(
+        table, gpu_sku=card.sku, context=int(context), batch=int(batch))
+
+
+def servingMeasurePoints(record: Mapping[str, Any], *, card: Card,
+                         points: Sequence[Tuple[int, int]]
+                         ) -> Dict[Tuple[int, int], dict[str, Any]]:
+    """Many of one record's stored decode measurements, in one table pass.
+
+    A Gallery entry names the same record at many public points. Locating the
+    rows once here keeps the record's deduplicated key table the one owner
+    while a fold expands only the points that view asks for.
+    """
+    table = record.get("phases", {}).get("decode", {}).get("measurePoints")
+    if table is None:
+        raise ValueError("the serving law carries no measured points")
+    cardless = bool(table.get("cardless"))
+    rows: Dict[Tuple[str, int, int], Any] = {}
+    for point in table["points"]:
+        gpu = card.sku if cardless else point.get("gpu")
+        rows[(str(gpu), int(point["context"]), int(point["batch"]))] = point
+    out: Dict[Tuple[int, int], dict[str, Any]] = {}
+    missing: list[Tuple[int, int]] = []
+    shared: Dict[Any, Any] = {}
+    for context, batch in points:
+        point = rows.get((str(card.sku), int(context), int(batch)))
+        if point is None:
+            missing.append((int(context), int(batch)))
+            continue
+        out[(int(context), int(batch))] = _measurePointAt(
+            table, gpu_sku=card.sku, context=int(context), batch=int(batch),
+            point=point, as_object=True, shared=shared)
+    if missing:
+        context, batch = missing[0]
+        raise KeyError(f"the serving law has no measured point for {card.sku} "
+                       f"at {context} tokens and batch {batch}")
+    return out
+
+
+def _measurePointTables(pending: Any, preparation: Any,
+                        phases: Mapping[str, Any],
+                        base: Mapping[str, Any],
+                        capacity: Sequence[Mapping[str, Any]], *,
+                        cards: Sequence[str],
+                        contexts: Sequence[int],
+                        batchGrid: Sequence[Mapping[str, Any]]
+                        ) -> Dict[str, dict[str, Any]]:
+    """Every public point's `PointMeasure`, derived once while the walk is live.
+
+    Each point uses the same road a plan and a live estimate use:
+    `capacity._point_rows` moves the walked rows to the point and card, then
+    `calibration_overlay.point_keys` derives what the lake is asked. The
+    resulting `PointMeasure`s are plain data; a pool reader never replays a
+    symbolic row key. The public pool carries the decode measured track:
+    prefill and custom plan points walk and ask `point_keys` there.
+    """
+    base = {name: rows for name, rows in base.items()
+            if name in ("per_op_timing_decode", "per_op_timing_draft")}
+    facts = {(str(fact["gpu_sku"]), int(fact["context"])): fact
+             for fact in capacity}
+    byPhase: Dict[str, list[tuple[str, int, int, PointMeasure]]] = {}
+    representative = Card.of(cards[0])
+    onCard = _restamp_gpu(preparation, representative)
+    for context in contexts:
+        cardFacts = [(gpu_sku, facts.get((gpu_sku, int(context))))
+                     for gpu_sku in cards]
+        cardFacts = [pair for pair in cardFacts if pair[1] is not None]
+        if not cardFacts:
+            continue
+        wanted = {int(batchPoint["decode_batch_size"])
+                  for batchPoint in batchGrid
+                  if batchPoint["decode_batch_size"] is not None}
+        wanted.update(int(pair[1]["max_decode_batch"]) for pair in cardFacts)
+        for decodeBatch in sorted(wanted):
+            if decodeBatch <= 0:
+                continue
+            if not any(point_served(
+                    max_batch_per_gpu=fact["max_decode_batch"],
+                    beyond_max_context=fact["beyond_max_context"],
+                    requests=decodeBatch or 1)
+                    for _gpu_sku, fact in cardFacts):
+                continue
+            batches = {
+                "per_op_timing_decode": decodeBatch,
+                "per_op_timing_draft": decodeBatch,
+            }
+            rows = _point_rows(
+                base, onCard, batches, pending,
+                Point({"s_input": int(context)}), breakdown=False,
+                costs=False)
+            for gpu_sku, fact in cardFacts:
+                if not point_served(
+                        max_batch_per_gpu=fact["max_decode_batch"],
+                        beyond_max_context=fact["beyond_max_context"],
+                        requests=decodeBatch or 1):
+                    continue
+                keyed: Dict[str, list[Any]] = {}
+                for name, walk in pending.walk_of_rows.items():
+                    if name not in base:
+                        continue
+                    keyed[name] = point_keys(
+                        walk.analysis, rows.get(name) or [], walk.workload,
+                        replace(walk.deployment, gpu_sku=gpu_sku),
+                        model_id=walk.model_id, spec_hash=walk.spec_hash)
+                measures = point_measures(
+                    pending, rows, keyed, {"decode": phases.get("decode")},
+                    gpu_sku=gpu_sku, as_objects=True)
+                for phase, measure in measures.items():
+                    byPhase.setdefault(phase, []).append(
+                        (gpu_sku, int(context), decodeBatch, measure["measure"]))
+    return {phase: _measurePointsToJson(items)
+            for phase, items in byPhase.items()}
+
+
 def _phase(rows: list[Mapping[str, Any]],
            *, mla_absorbed: bool = False,
            draft_rows: Iterable[Mapping[str, Any]] = (),
@@ -309,12 +647,61 @@ def _phase(rows: list[Mapping[str, Any]],
             "mla_absorbed": bool(mla_absorbed)}
 
 
+def _capacityFacts(preparation: Any, outputTokens: int, *,
+                   cards: Sequence[str], contexts: Sequence[int],
+                   prefillChunkSize: Optional[int] = None
+                   ) -> list[dict[str, Any]]:
+    """One preparation's public capacity facts, by card and context.
+
+    This is the only construction; `servingLawCapacity` publishes it, and a
+    speculative serving record receives the plain answer as `publicCapacity`
+    rather than recomputing it.
+    """
+    if preparation.refusal_reason is not None:
+        def refusedOn(cardSku: str) -> Any:
+            return _restamp_gpu(preparation, Card.of(cardSku))
+
+        return [{
+            "gpu_sku": cardSku, "context": int(context),
+            "max_decode_batch": 0, "max_prefill_batch": 0,
+            "beyond_max_context": int(context) > int(
+                preparation.max_context or 0),
+            "infeasibility_reason": preparation.refusal_reason,
+            **servingCapacityView(refusedOn(cardSku), capacity_ceilings(
+                refusedOn(cardSku), avg_input_tokens=int(context),
+                avg_output_tokens=int(outputTokens),
+                prefill_chunk_size=prefillChunkSize)),
+        } for cardSku in cards for context in contexts]
+    out: list[dict[str, Any]] = []
+    for cardSku in cards:
+        onCard = _restamp_gpu(preparation, Card.of(cardSku))
+        for context in contexts:
+            ceilings = capacity_ceilings(
+                onCard, avg_input_tokens=int(context),
+                avg_output_tokens=int(outputTokens),
+                prefill_chunk_size=prefillChunkSize,
+                prefill_capacity=True)
+            out.append({
+                "gpu_sku": cardSku, "context": int(context),
+                "max_decode_batch": int(ceilings.max_batch),
+                "max_prefill_batch": int(ceilings.max_prefill_batch),
+                "beyond_max_context": bool(ceilings.beyond_max_context),
+                "infeasibility_reason": ceilings.infeasibility_reason,
+                **servingCapacityView(onCard, ceilings),
+            })
+    return out
+
+
 def servingLawRecord(environment: Mapping[str, Any], *, gpu_sku: str,
                      anchorContext: int, outputTokens: int,
                      parallel: Any,
                      capacityCards: Sequence[str] = (),
                      capacityContexts: Sequence[int] = (),
-                     draft_forwards: Any = None) -> dict[str, Any]:
+                     draft_forwards: Any = None,
+                     measureContexts: Sequence[int] | None = None,
+                     measureBatchGrid: Sequence[Mapping[str, Any]] | None = None,
+                     publicCapacity: Sequence[Mapping[str, Any]] | None = None,
+                     ) -> dict[str, Any]:
     """Walk one layout once and keep its SOL laws, no expanded points."""
     knobs = CapacityKnobs.from_kwargs(environment, envelope=frozenset({
         "config", "gpu_sku", "avg_output_tokens", "prefill_batch_size",
@@ -324,26 +711,12 @@ def servingLawRecord(environment: Mapping[str, Any], *, gpu_sku: str,
     if preparation.refusal_reason is not None:
         return {"refused": preparation.refusal_reason}
 
-    def preparationOn(cardSku: str) -> Any:
-        return _restamp_gpu(preparation, Card.of(cardSku))
-
-    capacity = []
-    for cardSku in capacityCards or (gpu_sku,):
-        onCard = preparationOn(cardSku)
-        for context in capacityContexts or (anchorContext,):
-            ceilings = capacity_ceilings(
-                onCard, avg_input_tokens=int(context),
-                avg_output_tokens=int(outputTokens),
-                prefill_chunk_size=environment.get("prefill_chunk_size"),
-                prefill_capacity=True)
-            capacity.append({
-                "gpu_sku": cardSku, "context": int(context),
-                "max_decode_batch": int(ceilings.max_batch),
-                "max_prefill_batch": int(ceilings.max_prefill_batch),
-                "beyond_max_context": bool(ceilings.beyond_max_context),
-                "infeasibility_reason": ceilings.infeasibility_reason,
-                **servingCapacityView(onCard, ceilings),
-            })
+    capacity = (list(publicCapacity) if publicCapacity is not None else
+                _capacityFacts(preparation, outputTokens,
+                               cards=capacityCards or (gpu_sku,),
+                               contexts=capacityContexts or (1024,),
+                               prefillChunkSize=environment.get(
+                                   "prefill_chunk_size")))
     if all(int(fact["max_decode_batch"] or 0) <= 0
            and int(fact["max_prefill_batch"] or 0) <= 0
            for fact in capacity):
@@ -374,27 +747,62 @@ def servingLawRecord(environment: Mapping[str, Any], *, gpu_sku: str,
                      else preparation.draft.forwards)
     if draft_forwards is not None:
         draftForwards = draft_forwards
+    phases = {
+        "prefill": _phase(
+            prefillRows,
+            mla_absorbed=bool(prefillWalk.step_eval.mla_absorbed)),
+        "decode": _phase(
+            decodeRows,
+            mla_absorbed=bool(decodeWalk.step_eval.mla_absorbed),
+            draft_rows=draftRows,
+                         draft_forwards=draftForwards),
+    }
+    base = pending.finish()
+    # The measured overlay is the plain decode step even when the SOL law also
+    # carries a draft: strip the draft metadata, and read the main rows at
+    # verify width 1. This is a point view over the one visit, not a second
+    # plain preparation or walk.
+    measurePhases = dict(base.get("phases") or {})
+    if preparation.draft is not None:
+        measurePhases["decode"] = {
+            key: value for key, value in measurePhases["decode"].items()
+            if key != "speculative_draft"}
+    measurePreparation = (replace(preparation, s_verify=1)
+                          if preparation.draft is not None else preparation)
+    draftCapacity = (
+        None if preparation.draft is None else _capacityFacts(
+            preparation, outputTokens,
+            cards=capacityCards or (gpu_sku,),
+            contexts=capacityContexts or (1024,),
+            prefillChunkSize=environment.get("prefill_chunk_size")))
+    # The measured overlay is the plain step's: no speculative draft's rows
+    # enter it. Its concrete public points are derived here, through the one
+    # `point_keys` road a plan uses, and stored as plain data.
+    measures = _measurePointTables(
+        pending, measurePreparation, measurePhases, base, capacity,
+        cards=capacityCards or (gpu_sku,),
+        contexts=GALLERY_SEQ_LENS if measureContexts is None
+        else measureContexts,
+        batchGrid=FRONTIER_BATCH_GRID if measureBatchGrid is None
+        else measureBatchGrid)
+    for name, table in measures.items():
+        phases[name]["measurePoints"] = table
+    # The record's producer is the boundary at which the lazily built walk is
+    # complete; re-account its shared family before publishing the record.
+    if preparation.account_cells is not None:
+        preparation.account_cells()
     return {
         "schema": servingLawSchema,
-        # The card the phase laws' rows were walked on: every binding of a
-        # card into them asks whether that card walks alike (`cardBinding`).
         "walked_on": gpu_sku,
+        "framework": str(knobs.framework or ""),
         "parallel": preparation.parallel.to_dict(),
         "speculative": preparation.draft is not None,
         "gpu_memory_fraction": knobs.gpu_memory_fraction,
         "max_context_tokens": preparation.max_context,
         "parallel_warnings": preparation.wb.get("parallel_warnings", []),
-        "phases": {
-            "prefill": _phase(
-                prefillRows,
-                mla_absorbed=bool(prefillWalk.step_eval.mla_absorbed)),
-            "decode": _phase(
-                decodeRows,
-                mla_absorbed=bool(decodeWalk.step_eval.mla_absorbed),
-                draft_rows=draftRows,
-                             draft_forwards=draftForwards),
-        },
+        "phases": phases,
         "capacity": capacity,
+        **({} if draftCapacity is None else {"draft_capacity": draftCapacity}),
     }
 
 
@@ -407,53 +815,17 @@ def servingLawCapacity(environment: Mapping[str, Any], *, gpu_sku: str,
     A speculative record's decode law already covers K=0 through its
     `s_verify` symbol, but its preparation also loads the draft stack. Capacity
     keeps both answers: this plain one and the drafted one
-    (`servingLawRecord.capacity`)."""
+    (`servingLawRecord.draft_capacity`)."""
     knobs = CapacityKnobs.from_kwargs(environment, envelope=frozenset({
         "config", "gpu_sku", "avg_output_tokens", "prefill_batch_size",
         "decode_batch_size", "prefill_chunk_size"}))
     preparation = _capacity_preparation(
         config=environment["config"], gpu_sku=gpu_sku, knobs=knobs)
-    if preparation.refusal_reason is not None:
-        def refusedOn(cardSku: str) -> Any:
-            return _restamp_gpu(preparation, Card.of(cardSku))
-
-        return [{
-            "gpu_sku": cardSku, "context": int(context),
-            "max_decode_batch": 0, "max_prefill_batch": 0,
-            "beyond_max_context": int(context) > int(
-                preparation.max_context or 0),
-            "infeasibility_reason": preparation.refusal_reason,
-            **servingCapacityView(refusedOn(cardSku), capacity_ceilings(
-                refusedOn(cardSku), avg_input_tokens=int(context),
-                avg_output_tokens=int(environment["avg_output_tokens"]),
-                prefill_chunk_size=environment.get("prefill_chunk_size"))),
-        } for cardSku in (capacityCards or (gpu_sku,))
-        for context in (capacityContexts or (1024,))]
-    # A record is one walk class's: its capacity facts are for the cards
-    # the walk may be re-priced on, and `_restamp_gpu` refuses any other
-    # (`Card.refuse_unless_one_class`). Another class walks its own record.
-    def preparationOn(cardSku: str) -> Any:
-        return _restamp_gpu(preparation, Card.of(cardSku))
-
-    out = []
-    for cardSku in capacityCards or (gpu_sku,):
-        onCard = preparationOn(cardSku)
-        for context in capacityContexts or (1024,):
-            ceilings = capacity_ceilings(
-                onCard, avg_input_tokens=int(context),
-                avg_output_tokens=int(environment["avg_output_tokens"]),
-                prefill_chunk_size=environment.get("prefill_chunk_size"),
-                prefill_capacity=True)
-            out.append({
-                "gpu_sku": cardSku, "context": int(context),
-                "max_decode_batch": int(ceilings.max_batch),
-                "max_prefill_batch": int(ceilings.max_prefill_batch),
-                "beyond_max_context": bool(ceilings.beyond_max_context),
-                "infeasibility_reason": ceilings.infeasibility_reason,
-                **servingCapacityView(onCard, ceilings),
-            })
-    return out
-
+    return _capacityFacts(
+        preparation, int(environment["avg_output_tokens"]),
+        cards=capacityCards or (gpu_sku,),
+        contexts=capacityContexts or (1024,),
+        prefillChunkSize=environment.get("prefill_chunk_size"))
 
 def _capacityAt(record: Mapping[str, Any], card: Card, context: int):
     for item in record.get("capacity") or ():
@@ -501,6 +873,7 @@ def servingLawPhaseView(record: Mapping[str, Any], name: str, *, batch: int,
                 record["phases"][name].get("mla_absorbed")),
         },
         "t_sol_s": time,
+        "time_unpublished_reason": "",
         "t_measured_s": None,
         "coverage": None,
     }

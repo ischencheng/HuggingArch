@@ -234,7 +234,7 @@ which a walk reaches another card asks it:
 |---|---|---|
 | Preparation | The card's HBM, peaks and fabric under the same walk and weights | `capacity._restamp_gpu` |
 | Rows | Every row's law read at the other card's peaks and fabric | `capacity._point_rows`, `_stamp_gpu_on_result` |
-| Kept class sweep | A step's priced form (`CardForm`) read on another card | `capacity.ClassSweep.of` / `on_card` |
+| Kept class sweep | A step's priced form (`CardForm`) read on another card | `the serving-law pool.of` / `on_card` |
 
 A walk also names the card it was taken on (`PendingEstimate.walked_on`), so
 `PendingEstimate.priced_on` can check, in one call, both the class and the
@@ -312,6 +312,11 @@ A sweep makes **one** Kernel Bench lookup for the union of every point's keys:
    (`batch_sweep.apply_measured`): each row's own time, each module group's
    and declaration parent's share, the phase total and coverage, the draft's
    share, the measured throughputs.
+4. The same fold records stage timings — reading `PointMeasure`s, collecting
+   and deduplicating keys, the lookup round trip (service and network split
+   by the service's `service_s`), selector construction and selection, and
+   `apply_measured`. Gallery publishes them under `measured_track.timings`;
+   the estimate route records the same vocabulary in `timings`.
 
 The selection strategy and any kernel pin come from the request at fold time,
 not from the cell, so one set of measures serves every selection mode. The
@@ -446,12 +451,27 @@ list.
 Each tier has the invalidation its data needs.
 
 1. **Canonical law records** (`inference/sol_law.py`, schema
-   `serving-law-v4`, `sol_data.walkRecordSchema`) are the only SOL artifact
+   `serving-law-v6`, `sol_data.walkRecordSchema`) are the only SOL artifact
    shared across surfaces. A record holds one layout's phase laws as a CSE
    formula graph over workload and card symbols (`sol_law.LawGraph`), its
    collective signatures, and compact capacity facts per card and context. It
    holds no expanded points, per-op breakdown, module table or response
-   payload. A reader compiles each CSE graph into one ordered assignment
+   payload. The decode phase also carries the public measured grid's concrete
+   `PointMeasure`s: at production time each card/context/batch enters the one
+   `point_keys` owner (the same road a Kernel Bench plan uses). Physical keys,
+   shape axes and term launches are record-level tables; a class's cards are
+   stored once when their `PointMeasure`s differ only by the key's GPU field,
+   and the reader binds the requested GPU. Per-point anomaly numerators are
+   not stored: they do not select a kernel. Production uses the same
+   `rows_at` road with `costs=False`, moving shapes, dtype, dispatch and
+   launch geometry without re-pricing every row's SOL numerators, and passes
+   `PointMeasure`s onward as objects. A pool reader looks the point up;
+   it never replays a symbolic row key, and the SOL projection does not read
+   the table. A Gallery entry stores only the record name and bundle key per
+   point; a measured fold expands the points that view asks for and never
+   keeps a second key table. The measured fold remains
+   `batch_sweep.measure_points`. A
+   reader compiles each CSE graph into one ordered assignment
    program in-process, keyed by the graph's law content, so a public point
    never re-parses SymPy per definition. `_capacity_preparation` itself reads
    the resident-weight ledger and returns a refused preparation when a rank
@@ -465,8 +485,9 @@ Each tier has the invalidation its data needs.
    as-shipped precision, and the producer's workload facts,
    `producerWalkFacts`), one record per layout (`sol_data.layoutRecordName`).
    A layout's record is walked on its class's walk card (§4.3); its capacity
-   facts are computed for every card of that class, each restamped within the
-   class (`sol_law.servingLawRecord`). A card enters a law only through
+   facts have one producer, `sol_law.servingLawCapacity`: every card of the
+   class is restamped there, and a speculative record receives those facts
+   once (`publicCapacity`). A card enters a law only through
    `sol_law.cardBinding`, which asks `Card.refuse_unless_one_class`, and a
    point is read off the record by `sol_law.servingLawPoint`. A card of
    another class names a different bundle and reads that one.
@@ -587,12 +608,13 @@ each record's shard, byte range and digest, so a reader seeks one record (one
 layout) rather than parsing a bundle; the manifest carries the bundle's plan
 (cards, layouts per card, contexts, producer facts, record schema), which
 `sol_data.walkManifestIsValid` checks before any record is read. Law records
-are small enough that a further compression layer would cost more than it
-saves. Formulas and keys serialize as plain JSON (law text read back through
-`law_text`), never pickle or generated program source.
+are plain JSON; the published archive is a gzip-compressed tar, so repeated
+key-table indices compress together without a custom codec. Formulas serialize
+as law text read back through `law_text`; concrete lookup keys serialize as
+plain JSON. Neither is pickle nor generated program source.
 
 In production the pool lives on the persistent volume. Each engine version has
-a small Storage index (`serving-law-v4/<engine>/index.json`); it names one
+a small Storage index (`serving-law-v6/<engine>/index.json`); it names one
 immutable, digest-addressed archive. `backend.sol_pool_artifact` reads that
 index at container start, downloads the archive it names and verifies its
 SHA-256. An absent index is not an error (the runtime warm builds the pool),
@@ -639,7 +661,7 @@ inside it would compete with user requests for the GIL and the sweep pool.
 | `backend/measure/scope.py` | `MeasurementScope`, `ResultIdentity`, `theory_of_request`, `measurement_fields` |
 | `backend/measure/cache.py` | `KeyedCache` and its backends, single-flight, remote tier |
 | `backend/measure/pool.py` | The persistent process pool (`submit`, `map_cells`) |
-| `backend/inference/capacity.py` | `CapacitySweepPlan`, `_sweep_cell`, `_point_rows`, `_restamp_gpu`, `_stamp_gpu_on_result`, `ClassSweep`, `PendingEstimate` (`priced_on`, `keyed_at`, `measures`), `finish_estimates` |
+| `backend/inference/capacity.py` | `CapacitySweepPlan`, `_sweep_cell`, `_point_rows`, `_restamp_gpu`, `_stamp_gpu_on_result`, `PendingEstimate` (`priced_on`, `keyed_at`, `measures`), `finish_estimates` |
 | `backend/inference/card.py` | `Card`, its class and price views, `refuse_unless_one_class` |
 | `backend/inference/parallel_sweep.py` | `ParallelSweepPlan`, `LayoutCell`, `_estimate_layout`, `class_cards`, `PER_POINT_FIELDS`, the decode ladder and frontier views |
 | `backend/inference/batch_sweep.py` | `rows_at`, `phase_at`, `point_measures`, `step_measure`, `measured_selector`, `measure_points`, `apply_measured`, `measures_on_card` |

@@ -343,7 +343,12 @@ export function Gallery() {
         const part = info.partial;
         if (part) {
           if (part.tag !== cursor.tag) arrived = [];
-          arrived = [...arrived, ...(part.items as FrontierModel[])];
+          const updates = part.items as FrontierModel[];
+          // A measured update replaces the model's SOL partial by id; items
+          // are a stream of current values, not append-only rows.
+          const byId = new Map(arrived.map((m) => [m.model_id, m]));
+          updates.forEach((m) => byId.set(m.model_id, m));
+          arrived = [...byId.values()];
           cursor.tag = part.tag;
           cursor.count = part.count;
           if (part.head) {

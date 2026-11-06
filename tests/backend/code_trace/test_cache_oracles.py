@@ -60,6 +60,10 @@ def _items(trace) -> set:
     return {tuple(item) for item in trace}
 
 
+def _names(trace) -> set:
+    return {item[0] for item in trace}
+
+
 @pytest.fixture(scope="module")
 def point(tmp_path_factory):
     """The one-point sweep: cold through the warm entry (filling the cache),
@@ -106,3 +110,15 @@ def test_a_sol_record_names_all_the_code_its_layout_ran_alone(tmp_path):
                    pool_dir="alone")["trace"]
     hidden = sorted(_items(alone) - _items(records[last]))
     assert hidden == [], f"code a record does not name: {hidden}"
+    # The v6 key table's own producers are part of that contract: an edit to
+    # the one `point_keys` road, or to the key-only projection feeding it,
+    # must invalidate every old concrete table.
+    required = {
+        "inference/calibration_overlay.py::point_keys",
+        "inference/capacity.py::_point_rows",
+        "inference/batch_sweep.py::rows_at",
+        "inference/batch_sweep.py::point_measures",
+        "inference/sol_law.py::_measurePointTables",
+    }
+    names = _names(records[last])
+    assert required <= names, sorted(required - names)

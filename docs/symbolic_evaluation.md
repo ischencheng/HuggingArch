@@ -90,9 +90,13 @@ A cell is one model's walks under one deployment and precision:
   media. A request of the same phase, stack and media, at any batch, prompt,
   cached prefix, output or verify width, is a point read off the same
   cell.
-- **Bounds.** Up to 8 entries are kept (`_CELLS`, `capacity.py:783`), up to
-  8 cells per entry (`CELLS_KEPT`, `backend/inference/step_eval.py:218`),
-  and up to 32 readings per cell (`READINGS_KEPT`, `:215`).
+- **Bounds.** Up to 16 model/deployment families are kept
+  (`WALK_CELLS`, `backend/inference/walk_registry.py:79`) **and** their
+  resident object bytes are capped at 768 MiB per process: entry count alone
+  does not bound Kimi-K3 against a 3B model. Inside a family, up to 8 cells
+  are kept (`CELLS_KEPT`, `backend/inference/step_eval.py:218`) and up to 32
+  readings per cell (`READINGS_KEPT`, `:215`). An oversized family is
+  returned to its caller but not retained in `WALK_CELLS`.
 - **Locks.** A cell builds what it holds under its own lock, so threads share
   it (`CellBasis`, `capacity.py:788`).
 - **`breakdown`.** With `breakdown`, a phase also carries its module table

@@ -186,13 +186,14 @@ def test_uploads_and_promotions_never_move_a_theory_key(wired, monkeypatch, meas
         return out
 
     def frontier_keys():
-        # The frontier's theory keys: the entry and its measures part (scope
-        # `none`), and a speculative view's drawing, whose measured track is
-        # off (`_view_scope`). A plain view's measured rates and drawing are
-        # keyed on the shared rows' scope and may move.
+        # The frontier's theory keys: the entry (its points name the pool
+        # records their measure keys live in), and a speculative view's
+        # drawing, whose measured track is off (`_view_scope`). A plain view's
+        # measured rates and drawing are keyed on the shared rows' scope and
+        # may move.
         stored, view = _Stored(MODEL, "rv"), FrontierView("B200")
         spec = FrontierView("B200", draft_tokens=1)
-        return [stored.entry_key(view), stored.measures_key(view),
+        return [stored.entry_key(view),
                 stored.view_key(spec, *_view_scope(spec))]
 
     frontier0 = frontier_keys()

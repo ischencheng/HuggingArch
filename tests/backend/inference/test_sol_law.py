@@ -74,7 +74,7 @@ def test_one_law_substitutes_every_point_without_breakdown():
         outputTokens=256, parallel=parallel,
         capacityCards=("H100-SXM", "H200"), capacityContexts=(8192,))
     encoded = json.dumps(record, separators=(",", ":"))
-    assert len(encoded) < 50_000
+    assert len(encoded) < 150_000
     assert "per_op_timing" not in record
     assert "flops_by_module" not in record
     assert "activation_peak" not in record

@@ -9,15 +9,10 @@ walks for the same facts even though both were careful to walk only once
 *within* their own call.
 
 This is deliberately not the durable `WalkKey` tier (`measure.scope.of_walk`):
-it is a bounded, in-process derivation registry. It names the model's data
+it is a bounded, in-process derivation registry. It names the model's result
 version, the checkpoint config a binding may read, the deployment and the
 precision profile — the facts `StepCells` is a function of — and never a
-point, card price, framework view or measurement. The code is not in the key:
-it cannot change under a live process. What a computation reads through an
-entry is filled lazily by whichever computation asks first, so the entry
-carries a growing trace (`code_trace.provider.Growing`) that every reader
-attaches to: a computation that reads walks another one built still depends
-on the code that built them.
+point, card price, framework view or measurement.
 Framework bindings, pipeline stages and timed-stack projections are readers
 attached to a cell (`Cell.serving`, keyed there by exactly those facts), so a
 plan's measurable-launch projection and an estimate's served view share the
@@ -32,7 +27,7 @@ from typing import Any, Callable, Optional
 
 from backend.code_trace.provider import Growing, provider
 from backend.fingerprint import data_version
-from backend.measure.cache import KeyedCache, MemoryBackend
+from backend.measure.cache import KeyedCache, MemoryBackend, deep_size_of
 from backend.measure.scope import make_key
 
 from .step_eval import StepCells
@@ -65,6 +60,7 @@ class SharedWalkCells:
     resolved: Any
     cells: StepCells
     key: WalkCellKey
+    cache_key: str
     #: The code every computation that read this entry ran.
     trace: Growing = field(default_factory=Growing, repr=False)
     _readers: dict[str, Any] = field(default_factory=dict, repr=False)
@@ -75,14 +71,30 @@ class SharedWalkCells:
         with self._lock:
             if name not in self._readers:
                 self._readers[name] = build()
-            return self._readers[name]
+            reader = self._readers[name]
+        # The reader may have walked and attached state to `cells`; the cache
+        # sized this entry before that lazy work existed. Re-account it once
+        # per completed reader build through the same byte budget.
+        self.account()
+        return reader
+
+    def account(self) -> bool:
+        """Re-measure this family under `WALK_CELLS`' byte budget."""
+        return WALK_CELLS.resize(self.cache_key, self)
 
 
-# A process-local memo, not an estimate-result cache: sixteen model/deployment
-# families mirror the capacity preparation budget. `StepCells` and the readers
-# attached to each cell provide the finer-grained bounds below this entry.
-WALK_CELLS = KeyedCache("walk_cells", MemoryBackend(max_entries=16),
-                        single_flight=True)
+# A process-local memo, not an estimate-result cache: at most sixteen
+# model/deployment families and, more importantly, at most this much resident
+# walk state. Entry count alone cannot bound memory: one Kimi family is many
+# times a 3B family. `StepCells` and the readers attached to each cell provide
+# the finer-grained bounds below this entry; a family larger than the whole
+# budget is returned to its caller but not retained.
+WALK_CELLS_MEMORY_BYTES = 768 * 1024 * 1024
+WALK_CELLS = KeyedCache(
+    "walk_cells",
+    MemoryBackend(max_entries=16, max_bytes=WALK_CELLS_MEMORY_BYTES,
+                  size_of=deep_size_of),
+    single_flight=True)
 
 
 def shared_walk_cells(resolved: Any, parallel: Any, precision: Any, *,
@@ -92,7 +104,7 @@ def shared_walk_cells(resolved: Any, parallel: Any, precision: Any, *,
     `parallel` and `precision` are their canonical domain objects
     (`ParallelConfig`, `PrecisionProfile`), not request dictionaries: this is
     below the HTTP boundary, where spelling has already been resolved once.
-    The raw config is named beside the data version because a framework
+    The raw config is named beside the engine version because a framework
     binding may read checkpoint fields (the Mamba scan chunk, for example)
     that the model footprint digest does not change.
     """
@@ -105,7 +117,7 @@ def shared_walk_cells(resolved: Any, parallel: Any, precision: Any, *,
                           parallel=repr(parallel), precision=precision.key)
 
     def build() -> SharedWalkCells:
-        return SharedWalkCells(resolved, StepCells(), key)
+        return SharedWalkCells(resolved, StepCells(), key, key.key())
 
     entry = WALK_CELLS.get_or_compute(key.key(), build)
     p.attach(entry.trace)

@@ -358,7 +358,7 @@ def _warm_frontier(gpu: str) -> bool:
     """Every model's decode Pareto frontier on `gpu` (`/gallery/frontier`):
     one GPU view spans every layout the frontier prices, so it is one job
     per GPU. The first GPU of a walk class walks each model for every card
-    of the class (`gallery_frontier._layout_walk`); the class's other GPUs
+    of the class (`gallery_frontier._layout_law`); the class's other GPUs
     price that walk."""
     print(f"warming the decode frontier on {gpu}", flush=True)
     return _report_payload(asyncio.run(build_frontier(FrontierView(gpu))))

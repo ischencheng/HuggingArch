@@ -1,16 +1,6 @@
 [
   {
     "identifiers": [
-      "Qwen/Qwen3-30B-A3B",
-      "XiaomiMiMo/MiMo-7B-RL",
-      "meta-llama/Llama-3.2-1B"
-    ],
-    "kind": "curated",
-    "module": "tests/backend/api/test_gallery_frontier_class_walk.py",
-    "name": "CASES"
-  },
-  {
-    "identifiers": [
       "deepseek-ai/DeepSeek-V4-Flash",
       "meta-llama/Llama-3.2-3B"
     ],
@@ -896,6 +886,15 @@
     "kind": "curated",
     "module": "tests/backend/inference/test_scales_follow_weights.py",
     "name": "_QUANTIZED_MOE"
+  },
+  {
+    "identifiers": [
+      "deepseek-ai/DeepSeek-V4.1-Flash",
+      "moonshotai/Kimi-K3"
+    ],
+    "kind": "curated",
+    "module": "tests/backend/inference/test_serving_measure_law.py",
+    "name": "LONG_CASES"
   },
   {
     "identifiers": [

@@ -46,12 +46,12 @@ def _assert_plain(result):
     pickle.loads(pickle.dumps(result))
 
 
-def test_a_frontier_layout_returns_plain_points():
+def test_a_frontier_layout_returns_plain_laws():
     layout = frontier_layouts(sweep_caps({}, resolved=_resolve_one(MODEL)[1]), "B300")[0]
-    result = gallery_frontier._layout_walk(
+    result = gallery_frontier._layout_law(
         (MODEL, class_cards("B300"), GPU_MEMORY_FRACTION_DEFAULT,
          gallery_frontier._GALLERY_PRECISION.canonical(), layout.to_dict()))
-    assert result.get("plain"), result
+    assert result.get("schema") == gallery_frontier.walkRecordSchema, result
     _assert_plain(result)
 
 

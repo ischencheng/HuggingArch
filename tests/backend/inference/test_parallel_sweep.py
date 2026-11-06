@@ -664,24 +664,6 @@ class TestSweepRobustness(unittest.TestCase):
             pending.priced_on(same_class, OtherStage())
         self.assertIn("pipeline stage", str(off_stage.exception))
 
-    def test_a_kept_class_sweep_refuses_a_card_of_another_class(self):
-        """A Gallery entry's kept sweep moves a step's FORM to the other
-        cards of its class (`capacity.ClassSweep.on_card`), so the cards it
-        is built for must be that class — refused at construction, by the
-        same statement, before any point is read. The Gallery passes
-        `parallel_sweep.class_cards`, which is one class; this is the guard
-        that says so."""
-        from backend.inference.capacity import ClassSweep
-
-        with self.assertRaises(ValueError) as refused:
-            ClassSweep.of({"H100-SXM": {}, "B200": {}}, walk_card="H100-SXM",
-                          batch_grid=[], project=dict, book=None,
-                          floors_s=(0.0, 0.0))
-        said = str(refused.exception)
-        for part in ("H100-SXM", "B200", "compute_capability=9.0",
-                     "compute_capability=10.0"):
-            self.assertIn(part, said)
-
     def test_a_layout_walks_once_per_card_class(self):
         """`_estimate_layout` over the default series walks each card CLASS
         once — on the class's roomiest card (`class_cards`) — and not once

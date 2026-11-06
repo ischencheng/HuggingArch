@@ -37,6 +37,7 @@ missing.
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 from dataclasses import dataclass, field, replace
 from typing import (Any, Callable, ClassVar, Dict, Iterable,
                     List, Mapping, Optional, Sequence, Tuple)
@@ -327,11 +328,16 @@ def exact_div(part: Any, whole: Any) -> Any:
 _exact_div = exact_div
 
 
+@lru_cache(maxsize=8)
+def _compiled_law(text: str, names: Tuple[str, ...]) -> Any:
+    return compile_law([read_walk_law(text)], names)
+
+
 def evaluate(text: str, binding: Mapping[str, Any]) -> Any:
     """Law `text` at a point: every symbol it reads bound by `binding`
     (name → number). Exact where no float enters."""
     names = tuple(sorted(binding))
-    return compile_law([read_walk_law(str(text))], names)(
+    return _compiled_law(str(text), names)(
         *(binding[n] for n in names))[0]
 
 

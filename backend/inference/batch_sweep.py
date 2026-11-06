@@ -41,6 +41,8 @@ was not keyed is never mistaken for one keyed to nothing.
 """
 from __future__ import annotations
 
+import time
+
 from backend.arch.eval.analysis import Point
 from backend.arch.eval.dim import as_extent, as_number
 from backend.arch.eval.transforms import Workload
@@ -334,7 +336,7 @@ def _point_laws(row: Mapping[str, Any], *, breakdown: bool) -> Iterator[Any]:
 def rows_at(rows: List[Dict[str, Any]], point: Point, *, cell: Any,
             peak_flops: Optional[float], peak_bw: Optional[float],
             fabric: Fabric, breakdown: bool,
-            launch_s: float = 0.0) -> List[Dict[str, Any]]:
+            launch_s: float = 0.0, costs: bool = True) -> List[Dict[str, Any]]:
     """Each row read at the point `point` moves it to — the workload counts
     it sets by name (`{"B": 8}`, `{"s_input": 4096, "B": 1}`), the rest the
     row's own — on the card `peak_*`, `fabric` and `launch_s` describe: its
@@ -349,7 +351,10 @@ def rows_at(rows: List[Dict[str, Any]], point: Point, *, cell: Any,
     its key is read off); without it, it carries none of what it showed at
     the walked point, and its key columns are read where it is keyed
     (`calibration_overlay.key_columns`). The
-    numbers are the same either way. `cell` is the walk the rows come from
+    numbers are the same either way. `costs=False` is the same existing road
+    with the row's SOL numerators and times left at the walk's anchor: a key
+    table needs the moved shapes, dtype, dispatch and launch geometry, not a
+    second per-point cost evaluation. `cell` is the walk the rows come from
     (`pipeline.AnalysisResult`), whose book holds their laws compiled."""
     book = cell.laws.book
     # The row's laws are in every workload count; another point is the
@@ -380,22 +385,25 @@ def rows_at(rows: List[Dict[str, Any]], point: Point, *, cell: Any,
         for law in _point_laws(r, breakdown=breakdown)))
     out: List[Dict[str, Any]] = []
     for r, point_at, ask in zip(rows, at_of, asks, strict=True):
-        card = RowCard.of(r, peak_flops=peak_flops, peak_bw=peak_bw,
-                          fabric=fabric, launch_s=launch_s)
         point = r["point_law"]
         comm = point["comm"]
         moved = point_at != point["point"]
         read = reading(point_at) if ask else None
-        at = book.row_at(r, point_at, card)
         # Without breakdown, what the row showed at the walked point is not
         # this point's.
         row = dict(r) if breakdown else bare_row(r)
-        row.update(point_columns(
-            at, r, card, breakdown=breakdown,
-            t_sym=comm["symbolic"] if comm and breakdown else None,
-            t_sub=(payload_substituted([read[law] for law in comm["payload"]],
-                                       comm["dtype_bytes"])
-                   if comm and breakdown else None)))
+        if costs:
+            card = RowCard.of(r, peak_flops=peak_flops, peak_bw=peak_bw,
+                              fabric=fabric, launch_s=launch_s)
+            at = book.row_at(r, point_at, card)
+            row.update(point_columns(
+                at, r, card, breakdown=breakdown,
+                t_sym=comm["symbolic"] if comm and breakdown else None,
+                t_sub=(payload_substituted([read[law] for law in comm["payload"]],
+                                           comm["dtype_bytes"])
+                       if comm and breakdown else None)))
+        else:
+            row["t_sol_s"] = 0.0
         if moved:
             row.update(_shape_columns_at(read, r))
             if point.get("routed") is not None:
@@ -421,9 +429,11 @@ def rows_at(rows: List[Dict[str, Any]], point: Point, *, cell: Any,
             row["point_law"] = {
                 **point, "point": point_at,
                 "flops": {**point["flops"], "law": flops_law},
-                "access": _access_at(point["access"], point["in_terms"],
-                                     read, at, int(r["count_per_step"]),
-                                     point["out_terms"])}
+                "access": (
+                    _access_at(point["access"], point["in_terms"],
+                               read, at, int(r["count_per_step"]),
+                               point["out_terms"])
+                    if costs else point["access"])}
             for key in ("shape_json", "dtype_env_json", "signature"):
                 row.pop(key, None)
             # A measurement is of one key: at another batch the row has
@@ -725,7 +735,8 @@ def _resum_module_parents(rows: List[Dict[str, Any]], key: str) -> None:
 def step_measure(step: StepSum, keyed: Mapping[int, Any], where: Mapping[int, str], *,
                  gpu_sku: str, framework: str, binding: Any,
                  written: Dict[Any, Tuple[str, Any]],
-                 include_cadence: bool = False) -> Dict[str, Any]:
+                 include_cadence: bool = False,
+                 as_object: bool = False) -> Dict[str, Any]:
     """One measured total's plain data: the `auto_sweep.PointMeasure` of
     `step` — its formula, written by the step's one aggregation
     (`StepSum.measured_law`), and per term its key at the point, launches,
@@ -736,7 +747,9 @@ def step_measure(step: StepSum, keyed: Mapping[int, Any], where: Mapping[int, st
     walked here: unplaced, named by its stage. `written` holds the formulas
     of the steps already measured, by the step's shape (each term's weight,
     place and whether it costs nothing): the points of one walk share it,
-    and their formula is one text."""
+    and their formula is one text. With `as_object`, `measure` is the
+    `PointMeasure` itself: an in-process producer (the serving-law key table)
+    writes it directly, without a JSON round trip."""
     shape = (step.rank_stage, tuple(
         (t.weight, t.stage, t.draft, t.zero_cost()) for t in step.terms))
     if shape not in written:
@@ -783,18 +796,21 @@ def step_measure(step: StepSum, keyed: Mapping[int, Any], where: Mapping[int, st
                                     point.dispatch.as_dict())}
                       if looked_up else None)
         terms.append([where[id(t.row)], t.row.get("uid")])
-    return {"measure": PointMeasure(
+    measure = PointMeasure(
         tuple(keys), tuple(launches), tuple(unkeyed), tuple(labels), tuple(reasons),
         MeasuredFormula(text, tuple(zero)),
         context={"gpu": gpu_sku, "framework": framework},
         inputs=tuple(inputs),
-        aggregation_ids=tuple(aggregation_ids)).to_json(), "terms": terms,
+        aggregation_ids=tuple(aggregation_ids))
+    return {"measure": measure if as_object else measure.to_json(),
+            "terms": terms,
         **({"cadences": tuple(cadences)} if include_cadence else {})}
 
 
 def point_measures(pending: Any, rows: Mapping[str, List[Dict[str, Any]]],
                    keyed: Mapping[str, List[Any]], phases: Mapping[str, Any], *,
-                   gpu_sku: str, include_cadence: bool = False
+                   gpu_sku: str, include_cadence: bool = False,
+                   as_objects: bool = False
                    ) -> Dict[str, Dict[str, Any]]:
     """Each phase of one point, before measurement, as plain data
     (`step_measure`): one measured total per phase — its rows, a pipeline's
@@ -832,7 +848,8 @@ def point_measures(pending: Any, rows: Mapping[str, List[Dict[str, Any]]],
                                      framework=walk.deployment.framework,
                                      binding=walk.deployment.framework_binding,
                                      written=pending.measured_formulas,
-                                     include_cadence=include_cadence),
+                                     include_cadence=include_cadence,
+                                     as_object=as_objects),
                       "phase": phase}
     return out
 
@@ -1030,7 +1047,8 @@ def measures_on_card(measures: Mapping[str, Mapping[str, Any]],
 
 
 def selector(registry: Any, *, strategy: str,
-             kernel_mix: Optional[Mapping[str, str]] = None) -> Any:
+             kernel_mix: Optional[Mapping[str, str]] = None,
+             timings: Optional[Dict[str, Any]] = None) -> Any:
     """The measured selection over a registry built from one lookup:
     `select(key, context, op, read) -> (one launch's time or None, state,
     the measurement's source and badge)`, through `op_calibration.
@@ -1041,6 +1059,7 @@ def selector(registry: Any, *, strategy: str,
 
     def select(key: Key, context: Mapping[str, Any], op: str,
                read: Mapping[str, Any]) -> Tuple[Optional[float], str, Any]:
+        started = time.perf_counter()
         gpu = gpus.setdefault(context["gpu"], get_gpu(context["gpu"]))
         pin = (kernel_mix or {}).get(op) or None
         dispatch = read.get("dispatch")
@@ -1058,11 +1077,19 @@ def selector(registry: Any, *, strategy: str,
             kernel_dispatch=read.get("dispatch"),
             current_peak_tflops_at=lambda dtype: (peak_flops_for_dtype(gpu, dtype) or 0.0) / 1e12,
             current_peak_bw_gbps=(peak_hbm_bw(gpu) or 0.0) / 1e9,
-            flops_for_anomaly=float(read["flops"]),
-            access_bytes_for_anomaly=float(read["access"]),
+            flops_for_anomaly=(None if read.get("flops") is None
+                               else float(read["flops"])),
+            access_bytes_for_anomaly=(None if read.get("access") is None
+                                      else float(read["access"])),
             source_anchor=anchor)
         if measured is None:
+            if timings is not None:
+                timings["selector_s"] = (timings.get("selector_s", 0.0)
+                                         + time.perf_counter() - started)
             return None, state, None
+        if timings is not None:
+            timings["selector_s"] = (timings.get("selector_s", 0.0)
+                                     + time.perf_counter() - started)
         return measured.t_op_s, state, {"source": measured.source,
                                         "source_badge": measured.source_badge,
                                         "utilization": measured.utilization}
@@ -1157,7 +1184,10 @@ def apply_measured(point: Dict[str, Any], measures: Mapping[str, Mapping[str, An
     at full coverage) and its coverage, and the throughputs. An encode
     stack's measure is its own."""
     for m in measures.values():
-        folded = PointMeasure.from_json(m["measure"]).fold(select)
+        measure = m["measure"]
+        measure = (measure if isinstance(measure, PointMeasure)
+                   else PointMeasure.from_json(measure))
+        folded = measure.fold(select)
         track = folded.track
         by_list = {name: terms_by_uid(None if t is None or t[0] != name else t[1]
                                       for t in m["terms"])
@@ -1228,7 +1258,8 @@ def apply_measured(point: Dict[str, Any], measures: Mapping[str, Mapping[str, An
 def measured_selector(measures: List[PointMeasure], *, selection_mode: str,
                       measurement_scope: Any = None,
                       calibration_rows: Optional[list] = None,
-                      kernel_mix: Optional[Mapping[str, str]] = None) -> Any:
+                      kernel_mix: Optional[Mapping[str, str]] = None,
+                      timings: Optional[Dict[str, Any]] = None) -> Any:
     """The selection every measured total of `measures` folds over: the union
     of their keys looked up ONCE (`auto_sweep.look_up`), the request's posted
     rows over them (`selector`). None when the request reads no measurements:
@@ -1239,30 +1270,80 @@ def measured_selector(measures: List[PointMeasure], *, selection_mode: str,
         measurement_scope=measurement_scope, calibration_rows=calibration_rows)
     if not reads or not measures:
         return None
+    started = time.perf_counter()
+    keys = sweep_keys(measures)
+    if timings is not None:
+        timings["key_count"] = len(keys)
+        timings["key_collect_s"] = time.perf_counter() - started
+    started = time.perf_counter()
     found = look_up(measurement_scope if measurement_scope is not None else NO_MEASUREMENTS,
-                    sweep_keys(measures))
+                    keys)
+    if timings is not None:
+        timings["lookup_s"] = time.perf_counter() - started
+        timings["lookup_service_s"] = found.service_s
+        timings["lookup_network_s"] = max(
+            0.0, found.request_s - found.service_s)
+    started = time.perf_counter()
     registry = registry_from_lookup([PhysicalKey(*k) for k in found.keys], found.rows)
     if calibration_rows:
         registry = merge_validated_rows(registry, calibration_rows, source="request")
-    return selector(registry, strategy=strategy,
-                    kernel_mix=kernel_mix if selection_mode == "kernel_mix" else None)
+    got = selector(registry, strategy=strategy,
+                   kernel_mix=kernel_mix if selection_mode == "kernel_mix" else None,
+                   timings=timings)
+    if timings is not None:
+        timings["selector_setup_s"] = time.perf_counter() - started
+
+    def frozen(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return tuple(sorted((str(key), frozen(item))
+                                for key, item in value.items()))
+        if isinstance(value, (list, tuple)):
+            return tuple(frozen(item) for item in value)
+        return value
+
+    # One Gallery view repeats a physical key at many contexts and batches;
+    # its selection depends on the key, context, op and row inputs, not on
+    # the point that happens to name them. Select each distinct question once.
+    answers: Dict[Any, Any] = {}
+
+    def select_once(key: Any, context: Mapping[str, Any], op: str,
+                    read: Mapping[str, Any]) -> Any:
+        question = (key, frozen(context), op, frozen(read))
+        if question not in answers:
+            answers[question] = got(key, context, op, read)
+        elif timings is not None:
+            timings["selector_cache_hits"] = (
+                timings.get("selector_cache_hits", 0) + 1)
+        return answers[question]
+
+    return select_once
 
 
 def measure_points(points: List[Dict[str, Any]], *, selection_mode: str,
                    measurement_scope: Any = None, calibration_rows: Optional[list] = None,
-                   kernel_mix: Optional[Mapping[str, str]] = None) -> None:
+                   kernel_mix: Optional[Mapping[str, str]] = None,
+                   timings: Optional[Dict[str, Any]] = None) -> None:
     """The measured track of points, in place — a sweep's, or one estimate's
     (a disaggregated pair's two): each point's measured totals folded over
     one selection (`measured_selector`) and applied (`apply_measured`).
     `points` are `{"sol", "measures"}`. Nothing is applied when the request
     reads no measurements."""
+    started = time.perf_counter()
+    parsed = [m["measure"] if isinstance(m["measure"], PointMeasure)
+              else PointMeasure.from_json(m["measure"])
+              for pt in points for m in (pt.get("measures") or {}).values()]
+    if timings is not None:
+        timings["point_measure_read_s"] = time.perf_counter() - started
     select = measured_selector(
-        [PointMeasure.from_json(m["measure"])
-         for pt in points for m in (pt.get("measures") or {}).values()],
+        parsed,
         selection_mode=selection_mode, measurement_scope=measurement_scope,
-        calibration_rows=calibration_rows, kernel_mix=kernel_mix)
+        calibration_rows=calibration_rows, kernel_mix=kernel_mix,
+        timings=timings)
     if select is None:
         return
+    started = time.perf_counter()
     for pt in points:
         if pt.get("measures"):
             apply_measured(pt["sol"], pt["measures"], select)
+    if timings is not None:
+        timings["apply_measured_s"] = time.perf_counter() - started

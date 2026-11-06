@@ -15,11 +15,15 @@ primary_region = 'nrt'
   # The container's processes on one 6 GiB VM (docs/measured_calibration.md
   # §8.3): the Kernel Bench service (~220 MiB), the API
   # (~110 MiB) and its compute pool, the runtime cache warm (~110 MiB) and
-  # its pool, spec agents (~250-400 MiB each). A compute worker is ~145 MiB
-  # idle and keeps the cells of the 16 models it ran last (`capacity._CELLS`),
-  # up to ~0.93 GiB when all 16 are the largest; computing one large model
-  # adds up to ~0.85 GiB while it runs (Kimi-K3). Worst case with 2 API
-  # workers and a 1-worker warm: ~4.5 GiB, which leaves room for 3 agents.
+  # its pool, spec agents (~250-400 MiB each). A projection-only compute
+  # worker has measured 0.16-0.19 GiB RSS. A worker that ran cold walks has
+  # measured 1.4-2.0 GiB RSS: `WALK_CELLS` is bounded by both 16
+  # model×deployment families and 768 MiB of resident walk objects
+  # (`walk_registry.py`; `StepCells` still keeps up to 8 cells and 32
+  # readings per cell). A family above that byte budget is served but not
+  # retained; a large walk also has transient compute allocations. Keep the
+  # 2 compute workers + 1 warm worker at or below ~4.5 GiB and room for 3
+  # agents.
   # Gallery frontier entries are held in no process's memory (disk and
   # remote only); each process that reads frontier views — every compute
   # worker, spawned with its own caches, and the warm — keeps them in a

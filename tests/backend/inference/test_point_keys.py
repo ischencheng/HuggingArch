@@ -210,7 +210,9 @@ class TestCallSites:
         path = Path(calibration_overlay.__file__)
         for fn in _functions(path):
             if fn.name == "point_keys":
-                assert _calls(fn) >= {"RowIdentity", "BenchmarkKey", "of_event"}
+                continue
+            if fn.name == "point_row_of":
+                assert _calls(fn) >= {"BenchmarkKey", "of_event"}
                 continue
             # A nested function is walked inside its parent too; judge each
             # by its own body.

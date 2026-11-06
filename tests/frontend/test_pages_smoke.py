@@ -1267,7 +1267,11 @@ def test_inference_scaling_measured_line_breaks_where_unmeasured(browser_base):
 
     def tooltip_at(i):
         s.page.mouse.move(x_of(i), y)
-        s.page.wait_for_timeout(400)
+        expected = f"EP = {[2, 4, 8][i]}"
+        assert s.wait_for(lambda: s.page.evaluate(
+            "() => [...document.querySelectorAll('#infer-scaling div')].some(d => "
+            "d.style && d.style.position === 'absolute' "
+            f"&& d.innerText.includes('{expected}'))"))
         return s.page.evaluate(
             "() => [...document.querySelectorAll('#infer-scaling div')]"
             ".filter(d => d.style && d.style.position === 'absolute' && /EP = /.test(d.innerText))"

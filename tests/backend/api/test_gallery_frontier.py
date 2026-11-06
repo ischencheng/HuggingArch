@@ -9,15 +9,17 @@ context is empty, no room for a request draws nothing).
 """
 from __future__ import annotations
 
-import copy
-
 import pytest
 
 import backend.api.gallery_frontier as f
 from backend.code_trace.provider import recording
 from backend.inference.parallel_config import ParallelConfig
 from backend.inference.parallel_sweep import class_cards
-from backend.inference.sweep_grid import FRONTIER_BATCH_GRID, GALLERY_SEQ_LENS
+from backend.inference.sweep_grid import (
+    FRONTIER_BATCH_GRID,
+    FRONTIER_DRAFT_TOKENS,
+    GALLERY_SEQ_LENS,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -44,44 +46,102 @@ def test_the_frontier_keeps_only_points_nothing_beats_on_both_axes():
     assert f.pareto_front([]) == []
 
 
-def _row(max_bs, batch, *, beyond=False):
-    tpot = 0.01 * (1 + batch / 64)
-    return {"max_batch_per_gpu": max_bs, "beyond_max_context": beyond,
-            "phases": {"decode": {
-                "phase": "decode", "batch": batch, "t_sol_s": tpot,
-                "binding": {"tokens_per_step": 1, "effective_tokens_per_step": batch,
-                            "effective_tokens_formula": {
-                                "symbolic": "B × 1", "substituted": f"{batch} × 1"}},
-                "throughput": {"groups": 1, "num_gpus": 2,
-                               "concurrent_requests": batch, "sol": {
-                    "time_per_output_token_s": tpot, "per_gpu": batch / tpot}}}}}
+def _timed_item(seq, *, batch=4, plain_s=0.01, drafts=None,
+                speculative=False, measure_record=None):
+    """A theory point as `_layout_points` stores it: its decode step, the
+    plain step's floor form and each K's (`draft`), constants here."""
+    dec = {"phase": "decode", "batch": batch, "t_sol_s": plain_s,
+           "binding": {"tokens_per_step": 1, "effective_tokens_per_step": batch,
+                       "speculative_draft_tokens": 1 if speculative else 0,
+                       "acceptance_rate": 1.0,
+                       "effective_tokens_formula": {"symbolic": "B × 1",
+                                                    "substituted": f"{batch} × 1"}},
+           "throughput": {"groups": 1, "num_gpus": 2}}
+    return {"seq": seq, "label": "TP2", "num_gpus": 2,
+            "sol": {"phases": {"decode": dec}},
+            "floors": None if speculative else {"constant": plain_s, "terms": []},
+            **({} if measure_record is None else
+                {"measureRecord": measure_record}),
+            "draft": {str(k): {"constant": t, "terms": []}
+                      for k, t in (drafts or {}).items()}}
 
 
-def _constant_forms(monkeypatch, card_form_of=None):
-    """The rows' laws stubbed: each point's step is its own time whatever
-    the floors — a card form of one memory term that the card's bandwidth
-    turns back into that time — and its measures are carried as they are."""
-    import backend.inference.capacity as capacity
-    from backend.inference.gpu_specs import get_gpu, peak_hbm_bw
-    from backend.inference.row_roofline import CardForm
-
-    def constant(per, gpu_sku, *, phase, book, floors_s):
-        t = per["phases"][phase]["t_sol_s"]
-        return CardForm(((0.0, t * peak_hbm_bw(get_gpu(gpu_sku)), 0, 0.0, -1,
-                          0.0, 1),), ("",))
-    monkeypatch.setattr(capacity, "card_form_of", card_form_of or constant)
-    monkeypatch.setattr(capacity, "measures_on_card", lambda m, sku: m)
-    return constant
+def _inline_measures(monkeypatch):
+    """Read the measures a test placed on its points, as the pool reader
+    would read them from the records those points name."""
+    monkeypatch.setattr(
+        f, "_measureReader",
+        lambda _core, _gpu_sku, _timings: lambda _i, point: (
+            (point.get("measures") or {}).get("decode")))
 
 
-def _layout_points(item):
-    """One layout of a model walked for its GPU alone and priced there
-    (`_layout_walk`, `_restamp_layout`)."""
-    model_id, view, parallel = item
-    walked = f._layout_walk((model_id, [view.gpu_sku],
-                             view.gpu_memory_fraction,
-                             f._GALLERY_PRECISION.canonical(), parallel))
-    return f._restamp_layout(walked, view.gpu_sku, ParallelConfig.from_dict(parallel))
+def _serving_law_record(*, max_batch=100, draft_max_batch=None,
+                        speculative=False, measure=False):
+    """A minimal current serving-law record: a real law graph (so projection
+    is the path under test) over stub capacity facts, with no measure law."""
+    graph = {
+        "inputs": ["B", "s_input", "s_verify"],
+        "definitions": [],
+        "outputs": {"t_sol_s": "s_input*s_verify/1000000000000"},
+    }
+    return {
+        "schema": f.walkRecordSchema,
+        "walked_on": "B200",
+        "framework": "vllm",
+        "parallel": ParallelConfig(tp_attention=2).to_dict(),
+        "speculative": speculative,
+        "gpu_memory_fraction": 0.9,
+        "max_context_tokens": max(GALLERY_SEQ_LENS),
+        "parallel_warnings": [],
+        "phases": {
+            name: {"law": graph, "collectives": [], "terms": [],
+                   **({"measurePoints": {}} if measure else {})}
+            for name in ("prefill", "decode")
+        },
+        "capacity": [
+            {
+                "gpu_sku": "B200",
+                "context": seq,
+                "max_decode_batch": max_batch,
+                "max_prefill_batch": 1,
+                "beyond_max_context": seq == GALLERY_SEQ_LENS[-1],
+                "infeasibility_reason": None,
+            }
+            for seq in GALLERY_SEQ_LENS
+        ],
+        **({} if draft_max_batch is None else {
+            "draft_capacity": [
+                {
+                    "gpu_sku": "B200",
+                    "context": seq,
+                    "max_decode_batch": draft_max_batch,
+                    "max_prefill_batch": 1,
+                    "beyond_max_context": seq == GALLERY_SEQ_LENS[-1],
+                    "infeasibility_reason": None,
+                }
+                for seq in GALLERY_SEQ_LENS
+            ]}),
+    }
+
+
+def _projecting_record(monkeypatch, calls, *, fail=None, fail_k=None,
+                       fail_all=False, max_batch=100):
+    """A speculative record projected through the real grid, recording each
+    projection's contexts and K; `fail` rejects one K (`fail_all`, all)."""
+    record = _serving_law_record(max_batch=max_batch, speculative=True)
+    real = f.servingLawPoints
+
+    def projected(record_arg, **kwargs):
+        calls.append({"contexts": list(kwargs["contexts"]),
+                      "draft_tokens": kwargs["draftTokens"]})
+        if fail is not None and kwargs["draftTokens"] and (
+                fail_all or kwargs["draftTokens"] == fail_k):
+            calls[-1]["raised"] = str(fail)
+            raise fail
+        return real(record_arg, **kwargs)
+
+    monkeypatch.setattr(f, "servingLawPoints", projected)
+    return record
 
 
 def _theory_at(res, seq):
@@ -92,20 +152,9 @@ def _batch(point):
     return point["sol"]["phases"]["decode"]["batch"]
 
 
-def test_a_layout_draws_the_batches_that_fit_and_max_once(monkeypatch):
-    # 100 requests fit per GPU at every context but the last, which is past
-    # the model's context.
-    def grid(env, *, seq_lens, batch_grid, s_verifies=None):
-        out = {}
-        for bp in batch_grid:
-            b = bp["decode_batch_size"] or 100
-            out[bp["key"]] = [{"sol": _row(100, b, beyond=(s == seq_lens[-1]))}
-                              for s in seq_lens]
-        return out
-    monkeypatch.setattr(f, "resolve_estimate_environment", lambda req: {})
-    monkeypatch.setattr(f, "_grid_points", grid)
-    _constant_forms(monkeypatch)
-    res = _layout_points(("test/Model", f.FrontierView("B200"), ParallelConfig(tp_attention=2).to_dict()))
+def test_a_layout_draws_the_batches_that_fit_and_max_once():
+    res = f._restamp_layout(
+        _serving_law_record(max_batch=100), "B200", ParallelConfig(tp_attention=2))
     pts = _theory_at(res, GALLERY_SEQ_LENS[0])
     assert sorted(_batch(p) for p in pts) == [1, 2, 4, 8, 16, 32, 64, 100]
     assert all(p["label"] == "TP2" and p["num_gpus"] == 2 for p in pts)
@@ -113,39 +162,19 @@ def test_a_layout_draws_the_batches_that_fit_and_max_once(monkeypatch):
     assert len(FRONTIER_BATCH_GRID) == 12
 
 
-def test_a_batch_that_does_not_fit_is_not_drawn(monkeypatch):
-    """62 requests fit per GPU: 64 and above are absent, max is 62 once.
-    Same question the overview asked of b64 at 16K."""
-    def grid(env, *, seq_lens, batch_grid, s_verifies=None):
-        out = {}
-        for bp in batch_grid:
-            b = bp["decode_batch_size"] or 62
-            out[bp["key"]] = [{"sol": _row(62, b)} for _s in seq_lens]
-        return out
-    monkeypatch.setattr(f, "resolve_estimate_environment", lambda req: {})
-    monkeypatch.setattr(f, "_grid_points", grid)
-    _constant_forms(monkeypatch)
-    res = _layout_points(
-        ("test/Model", f.FrontierView("B200"), ParallelConfig(tp_attention=2).to_dict()))
+def test_a_batch_that_does_not_fit_is_not_drawn():
+    """62 requests fit per GPU: 64 and above are absent, max is 62 once."""
+    res = f._restamp_layout(
+        _serving_law_record(max_batch=62), "B200", ParallelConfig(tp_attention=2))
     pts = _theory_at(res, GALLERY_SEQ_LENS[0])
     assert sorted(_batch(p) for p in pts) == [1, 2, 4, 8, 16, 32, 62]
 
 
-def test_a_layout_with_no_room_for_a_request_draws_nothing(monkeypatch):
+def test_a_layout_with_no_room_for_a_request_draws_nothing():
     """Weights / KV leave max_batch 0: every context is empty, the page
     names the model under the chart."""
-    why = "weights (500.00 GiB) exceed usable HBM."
-    def grid(env, *, seq_lens, batch_grid, s_verifies=None):
-        dead = _row(0, 1)
-        dead["infeasibility_reason"] = why
-        dead["memory"] = {"fits": False}
-        return {bp["key"]: [{"sol": dead} for _s in seq_lens]
-                for bp in batch_grid}
-    monkeypatch.setattr(f, "resolve_estimate_environment", lambda req: {})
-    monkeypatch.setattr(f, "_grid_points", grid)
-    _constant_forms(monkeypatch)
-    res = _layout_points(
-        ("test/Model", f.FrontierView("B200"), ParallelConfig().to_dict()))
+    res = f._restamp_layout(
+        _serving_law_record(max_batch=0), "B200", ParallelConfig())
     assert res["theory"] == []
 
 
@@ -158,28 +187,34 @@ def test_a_refused_layout_is_reported_not_failed(monkeypatch):
         raise SpecRefusal(
             "heads do not divide", declaration="num_heads",
             fix="divide heads across the tensor-parallel degree")
+
     monkeypatch.setattr(f, "resolve_estimate_environment", boom)
     monkeypatch.setattr(f, "_resolve_one", lambda mid: (None, object(), "v"))
     monkeypatch.setattr(f, "layout_verdict", refuse)
-    res = f._layout_walk((
+    res = f._layout_law((
         "test/Model", ["B200"], 0.9,
         f._GALLERY_PRECISION.canonical(), ParallelConfig().to_dict()))
     assert res == {"refused": "heads do not divide"}
 
+    # Through the projection the frontier reads it by (`_restamp_layout`), as
+    # every walk record is — not handed to the fold directly.
+    projected = f._restamp_layout(res, "B200", ParallelConfig())
+    assert projected == {"refused": "heads do not divide"}
+
     sk = str(GALLERY_SEQ_LENS[0])
-    entry = f._fold("test/Model", [ParallelConfig(), ParallelConfig(tp_attention=2)],
-                    [res, {"theory": [{"seq": sk, "label": "TP2", "num_gpus": 2,
-                                       "sol": _row(10, 10), "floors": None,
-                                       "measures": {}}]}])
+    entry = f._fold(
+        "test/Model", [ParallelConfig(), ParallelConfig(tp_attention=2)],
+        [projected, {"theory": [{**_timed_item(sk), "label": "TP2",
+                                 "num_gpus": 2}], "draft_errors": []}])
     assert entry["error"] is None
     assert entry["layouts"][0]["refused"] == "heads do not divide"
     assert entry["layouts"][1]["points"] == 1
     out = f._read_entry(entry, f.FrontierView("B200"))
-    assert [p["batch"] for p in out["frontier"][sk]] == [10]
+    assert [p["batch"] for p in out["frontier"][sk]] == [4]
 
 
 def test_an_engine_bug_is_not_downgraded_and_does_not_sink_the_warm(monkeypatch):
-    """A plain ValueError from the walk is an error, not a refusal.
+    """A plain ValueError from the law walk is an error, not a refusal.
 
     The diagnostic walk may fail with the same engine bug. It is reported
     beside the original failure, but must not replace it — and it must not
@@ -194,130 +229,10 @@ def test_an_engine_bug_is_not_downgraded_and_does_not_sink_the_warm(monkeypatch)
     monkeypatch.setattr(f, "resolve_estimate_environment", boom)
     monkeypatch.setattr(f, "_resolve_one", lambda mid: (None, object(), "v"))
     monkeypatch.setattr(f, "layout_verdict", diagnostic)
-    res = f._layout_walk((
+    res = f._layout_law((
         "test/Model", ["B200"], 0.9,
         f._GALLERY_PRECISION.canonical(), ParallelConfig().to_dict()))
-    assert res == {"error": "engine bug",
-                   "diagnostic": "same engine bug"}
-
-
-def test_measured_rows_fold_onto_the_frontier(monkeypatch):
-    """Kernel Bench rows ride the same points as SOL: a complete measured
-    step publishes tok/s beside the estimate, and the measured Pareto is
-    folded from those. The theory half is not served."""
-    from backend.measure.scope import MeasurementScope
-    monkeypatch.setattr(f, "_frontier_scope",
-                        lambda: (MeasurementScope(None, "lake", 1, 1, "r"), "reads"))
-
-    def apply(items, **_kw):
-        for it in items:
-            dec = it["sol"]["phases"]["decode"]
-            dec["throughput"]["measured"] = {
-                "time_per_output_token_s": 0.02, "per_gpu": 50.0}
-            dec["coverage"] = {"measured": 3, "total": 3}
-
-    monkeypatch.setattr(f, "measure_points", apply)
-    sk = str(GALLERY_SEQ_LENS[0])
-    sol = {"phases": {"decode": {"batch": 1, "throughput": {
-        "concurrent_requests": 1, "sol": {
-            "time_per_output_token_s": 0.01, "per_gpu": 100.0}}}}}
-    out = f._read_entry({
-        "model_id": "m", "frontier": {sk: [_pt(100, 100)]},
-        "layouts": [], "error": None,
-        "_theory": [{"seq": sk, "label": "1×GPU · TP1/EP1/CP1/DP1",
-                     "num_gpus": 1, "sol": sol, "measures": {"decode": {}}}],
-    }, f.FrontierView("B200"))
-    assert "_theory" not in out
-    pt = out["frontier"][sk][0]
-    assert pt["tok_s_per_user"] == 100.0
-    assert pt["tok_s_per_user_measured"] == 50.0
-    assert pt["tok_s_per_gpu_measured"] == 50.0
-    meas = out["frontier_measured"][sk][0]
-    assert meas["tok_s_per_user_measured"] == 50.0
-
-
-def test_the_measured_fold_does_not_walk(monkeypatch):
-    """Joining Kernel Bench rows is a lookup over the cached theory, not
-    another estimate walk."""
-    walks = []
-    monkeypatch.setattr(f, "_grid_points",
-                        lambda *a, **k: walks.append(1) or {})
-    from backend.measure.scope import MeasurementScope
-    monkeypatch.setattr(f, "_frontier_scope",
-                        lambda: (MeasurementScope(None, "lake", 1, 1, "r"), "reads"))
-    monkeypatch.setattr(f, "measure_points", lambda items, **k: None)
-    sk = str(GALLERY_SEQ_LENS[0])
-    f._read_entry({
-        "model_id": "m", "frontier": {sk: []}, "layouts": [], "error": None,
-        "_theory": [{"seq": sk, "label": "1×GPU", "num_gpus": 1,
-                     "sol": {"phases": {"decode": {}}}, "measures": {}}],
-    }, f.FrontierView("B200"))
-    assert walks == []
-
-
-def test_incomplete_measured_coverage_does_not_publish_tok_s(monkeypatch):
-    """A mixed step has no measured tok/s: the page never draws a partial
-    total. Same all-or-nothing the overview asked of `_safe_measured`."""
-    from backend.measure.scope import MeasurementScope
-    monkeypatch.setattr(f, "_frontier_scope",
-                        lambda: (MeasurementScope(None, "lake", 1, 1, "r"), "reads"))
-    monkeypatch.setattr(f, "measure_points", lambda items, **k: None)
-    sk = str(GALLERY_SEQ_LENS[0])
-    sol = {"phases": {"decode": {"batch": 1, "throughput": {
-        "concurrent_requests": 1,
-        "sol": {"time_per_output_token_s": 0.01, "per_gpu": 100.0},
-        "measured": None},
-        "coverage": {"measured": 2, "total": 3, "states": {"missing": ["k"]}}}}}
-    out = f._read_entry({
-        "model_id": "m", "frontier": {sk: [_pt(100, 100)]},
-        "layouts": [], "error": None,
-        "_theory": [{"seq": sk, "label": "1×GPU", "num_gpus": 1,
-                     "sol": sol, "measures": {"decode": {}}}],
-    }, f.FrontierView("B200"))
-    pt = out["frontier"][sk][0]
-    assert "tok_s_per_user_measured" not in pt
-    assert out["frontier_measured"][sk] == []
-
-
-def test_the_route_refuses_a_gpu_outside_the_gallery_series(monkeypatch):
-    """The picker offers `sweep_grid.GALLERY_GPUS`; another SKU is not swept
-    cold — a card the sheet lists but the Gallery does not publish included.
-    RTX-4090 is that second case and not a hypothetical one: it is a card of
-    the SWEEP series (`parallel_sweep.DEFAULT_SWEEP_GPUS`, where Kernel
-    Bench's measurements make it the comparison against theory), and the
-    Gallery's narrower series is what this route admits."""
-    from fastapi.testclient import TestClient
-
-    import backend.api  # noqa: F401  # registers routes
-    from backend.api._app import app
-    from backend.api.routes import gallery as route
-
-    monkeypatch.setattr(route, "build_frontier", lambda *a: (_ for _ in ()).throw(
-        AssertionError("swept")))
-    client = TestClient(app)
-    assert client.get("/gallery/frontier",
-                      params={"gpu_sku": "A100-40G-PCIe"}).status_code == 400
-    refused = client.get("/gallery/frontier", params={"gpu_sku": "RTX-4090"})
-    assert refused.status_code == 400
-    assert "RTX-4090" not in refused.json()["detail"].split(";")[0]
-
-
-def _timed_item(seq, *, batch=4, plain_s=0.01, drafts=None, speculative=False):
-    """A theory point as `_layout_points` stores it: its decode step, the
-    plain step's floor form and each K's (`draft`), constants here."""
-    dec = {"phase": "decode", "batch": batch, "t_sol_s": plain_s,
-           "binding": {"tokens_per_step": 1, "effective_tokens_per_step": batch,
-                       "effective_tokens_formula": {"symbolic": "B × 1",
-                                                    "substituted": f"{batch} × 1"}},
-           "throughput": {"groups": 1, "num_gpus": 2}}
-    if speculative:
-        dec["speculative_draft"] = {"forwards": 2}
-    return {"seq": seq, "label": "TP2", "num_gpus": 2,
-            "sol": {"phases": {"decode": dec}},
-            "floors": None if speculative else {"constant": plain_s, "terms": []},
-            "measures": {},
-            "draft": {str(k): {"constant": t, "terms": []}
-                      for k, t in (drafts or {}).items()}}
+    assert res == {"error": "engine bug", "diagnostic": "same engine bug"}
 
 
 def test_a_speculative_view_reads_the_drafts_step_and_keeps_one_plus_alpha_k():
@@ -357,6 +272,52 @@ def test_a_point_with_no_step_under_the_view_is_not_drawn():
     assert k1["measured_track"] == {"state": "none"}
     assert f._at_view(plain_only, f.FrontierView("B200", draft_tokens=2)) is None
     assert f._at_view(drafted_only, f.FrontierView("B200")) is None
+
+
+def test_a_plain_view_omits_a_batch_served_only_by_the_draft(monkeypatch):
+    """A draft's KV footprint can make its max batch lower than plain decode.
+
+    That extra batch is a K-step and must remain available to K views, but it
+    is not a plain point. Its only spelling of "which step it is" is the decode
+    binding's `speculative_draft_tokens`.
+    """
+    sk = str(GALLERY_SEQ_LENS[0])
+    entry = {"model_id": "m", "layouts": [], "error": None,
+             "draft_unavailable": None}
+    entry["_theory"] = f._restamp_layout(
+        _serving_law_record(max_batch=2, draft_max_batch=3,
+                            speculative=True),
+        "B200", ParallelConfig(tp_attention=2))["theory"]
+    by_batch = {point["sol"]["phases"]["decode"]["batch"]: point
+                for point in entry["_theory"] if point["seq"] == sk}
+    assert 3 in by_batch and by_batch[3]["sol"]["phases"]["decode"][
+        "binding"]["speculative_draft_tokens"] == 1
+    plain = f._read_entry(entry, f.FrontierView("B200"))
+    assert sorted(point["batch"] for point in plain["frontier"][sk]) == [2]
+    k1 = f._read_entry(entry, f.FrontierView("B200", draft_tokens=1))
+    assert sorted(point["batch"] for point in k1["frontier"][sk]) == [3]
+    for point in entry["_theory"]:
+        at_k1 = f._at_view(point, f.FrontierView("B200", draft_tokens=1))
+        if at_k1 is not None:
+            assert at_k1["sol"]["phases"]["decode"]["binding"][
+                "speculative_draft_tokens"] == 1
+    folded: list = []
+
+    def fold(items, **_kwargs):
+        folded.extend(item["sol"]["phases"]["decode"]["batch"]
+                      for item in items)
+        for item in items:
+            item["sol"]["phases"]["decode"]["coverage"] = {
+                "measured": 1, "total": 1}
+
+    monkeypatch.setattr(f, "measure_points", fold)
+    f._measured_rates(
+        entry, lambda _i, point: (
+            {"any": 1}
+            if point["sol"]["phases"]["decode"]["binding"][
+                "speculative_draft_tokens"] == 0 else None),
+        None)
+    assert set(folded) <= {1, 2}
 
 
 def test_a_model_with_no_mtp_draft_reads_an_empty_speculative_frontier():
@@ -420,100 +381,191 @@ def test_the_route_refuses_a_draft_length_off_the_pickers(monkeypatch):
         assert resp.status_code in (400, 422), params
 
 
-def _spec_grid(calls, *, fail=None):
-    """A `_grid_points` stub: the plain sweep at every context, and the
-    speculative one (`s_verifies`) at every context of every K — recorded
-    in `calls`, raising `fail` when given."""
-    def grid(env, *, seq_lens, batch_grid, s_verifies=None):
-        calls.append({"seq_lens": list(seq_lens), "s_verifies": s_verifies})
-        if s_verifies is not None and fail is not None:
-            raise fail
-        out = {}
-        for bp in batch_grid:
-            b = bp["decode_batch_size"] or 100
-            row = _row(100, b)
-            row["phases"]["prefill"] = {"batch": 1, "t_sol_s": 1.0}
-            row["phases"]["decode"].update(
-                phase="decode", t_sol_s=0.01,
-                binding={"tokens_per_step": 1, "effective_tokens_per_step": b,
-                         "effective_tokens_formula": {"symbolic": "B × 1",
-                                                      "substituted": f"{b} × 1"}})
-            row["phases"]["decode"]["throughput"].update(groups=1, num_gpus=2)
-            out[bp["key"]] = [{"sol": row, "measures": {"prefill": {"m": 1},
-                                                         "decode": {"m": 2}}}
-                              for _s in seq_lens]
-        return out
-    return grid
+def test_the_route_refuses_a_gpu_outside_the_gallery_series(monkeypatch):
+    """The picker offers `sweep_grid.GALLERY_GPUS`; another SKU is not swept
+    cold — a card the sheet lists but the Gallery does not publish included.
+    RTX-4090 is that second case and not a hypothetical one: it is a card of
+    the SWEEP series, and the Gallery's narrower series is what this route
+    admits."""
+    from fastapi.testclient import TestClient
+
+    import backend.api  # noqa: F401  # registers routes
+    from backend.api._app import app
+    from backend.api.routes import gallery as route
+
+    monkeypatch.setattr(route, "build_frontier", lambda *a: (_ for _ in ()).throw(
+        AssertionError("swept")))
+    client = TestClient(app)
+    assert client.get("/gallery/frontier",
+                      params={"gpu_sku": "A100-40G-PCIe"}).status_code == 400
+    refused = client.get("/gallery/frontier", params={"gpu_sku": "RTX-4090"})
+    assert refused.status_code == 400
+    assert "RTX-4090" not in refused.json()["detail"].split(";")[0]
 
 
-def _speculating(monkeypatch, grid, card_form_of=None):
-    monkeypatch.setattr(f, "resolve_estimate_environment", lambda req: {})
-    monkeypatch.setattr(f, "_grid_points", grid)
-    monkeypatch.setattr(f, "draft_refusal", lambda mid: None)
-    _constant_forms(monkeypatch, card_form_of)
+def test_measured_rows_fold_onto_the_frontier(monkeypatch):
+    """Kernel Bench rows ride the same points as SOL: a complete measured
+    step publishes tok/s beside the estimate, and the measured Pareto is
+    folded from those. The theory half is not served."""
+    from backend.measure.scope import MeasurementScope
+    monkeypatch.setattr(f, "_frontier_scope",
+                        lambda: (MeasurementScope(None, "lake", 1, 1, "r"), "reads"))
+    _inline_measures(monkeypatch)
+
+    def apply(items, **_kw):
+        for it in items:
+            dec = it["sol"]["phases"]["decode"]
+            dec["throughput"]["measured"] = {
+                "time_per_output_token_s": 0.02, "per_gpu": 50.0}
+            dec["coverage"] = {"measured": 3, "total": 3}
+
+    monkeypatch.setattr(f, "measure_points", apply)
+    _inline_measures(monkeypatch)
+    sk = str(GALLERY_SEQ_LENS[0])
+    sol = {"phases": {"decode": {"batch": 1, "throughput": {
+        "concurrent_requests": 1, "sol": {
+            "time_per_output_token_s": 0.01, "per_gpu": 100.0}}}}}
+    out = f._read_entry({
+        "model_id": "m", "frontier": {sk: [_pt(100, 100)]},
+        "layouts": [], "error": None,
+        "_theory": [{"seq": sk, "label": "1×GPU · TP1/EP1/CP1/DP1",
+                     "num_gpus": 1, "sol": sol, "measures": {"decode": {}}}],
+    }, f.FrontierView("B200"))
+    assert "_theory" not in out
+    pt = out["frontier"][sk][0]
+    assert pt["tok_s_per_user"] == 100.0
+    assert pt["tok_s_per_user_measured"] == 50.0
+    assert pt["tok_s_per_gpu_measured"] == 50.0
+    meas = out["frontier_measured"][sk][0]
+    assert meas["tok_s_per_user_measured"] == 50.0
 
 
-def test_every_k_is_one_sweep_of_every_context(monkeypatch):
-    """The K's of `FRONTIER_DRAFT_TOKENS` are one speculative sweep: each
-    context once per K, at that K's verify width — one walk of the layout,
-    every K read off it."""
-    from backend.inference.sweep_grid import FRONTIER_DRAFT_TOKENS
+def test_the_measured_fold_does_not_walk(monkeypatch):
+    """Joining Kernel Bench rows is a lookup over the cached theory, not
+    another estimate walk or another law production."""
+    from backend.measure.scope import MeasurementScope
+    monkeypatch.setattr(f, "_frontier_scope",
+                        lambda: (MeasurementScope(None, "lake", 1, 1, "r"), "reads"))
+    monkeypatch.setattr(f, "_layout_law", lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("walked")))
+    monkeypatch.setattr(f, "measure_points", lambda items, **k: None)
+    _inline_measures(monkeypatch)
+    sk = str(GALLERY_SEQ_LENS[0])
+    f._read_entry({
+        "model_id": "m", "frontier": {sk: []}, "layouts": [], "error": None,
+        "_theory": [{"seq": sk, "label": "1×GPU", "num_gpus": 1,
+                     "sol": {"phases": {"decode": {}}}, "measures": {}}],
+    }, f.FrontierView("B200"))
+
+
+def test_incomplete_measured_coverage_does_not_publish_tok_s(monkeypatch):
+    """A mixed step has no measured tok/s: the page never draws a partial
+    total. Same all-or-nothing the overview asked of `_safe_measured`."""
+    from backend.measure.scope import MeasurementScope
+    monkeypatch.setattr(f, "_frontier_scope",
+                        lambda: (MeasurementScope(None, "lake", 1, 1, "r"), "reads"))
+    monkeypatch.setattr(f, "measure_points", lambda items, **k: None)
+    _inline_measures(monkeypatch)
+    sk = str(GALLERY_SEQ_LENS[0])
+    sol = {"phases": {"decode": {"batch": 1, "throughput": {
+        "concurrent_requests": 1,
+        "sol": {"time_per_output_token_s": 0.01, "per_gpu": 100.0},
+        "measured": None},
+        "coverage": {"measured": 2, "total": 3, "states": {"missing": ["k"]}}}}}
+    out = f._read_entry({
+        "model_id": "m", "frontier": {sk: [_pt(100, 100)]},
+        "layouts": [], "error": None,
+        "_theory": [{"seq": sk, "label": "1×GPU · TP1/EP1/CP1/DP1",
+                     "num_gpus": 1, "sol": sol, "measures": {"decode": {}}}],
+    }, f.FrontierView("B200"))
+    pt = out["frontier"][sk][0]
+    assert "tok_s_per_user_measured" not in pt
+    assert out["frontier_measured"][sk] == []
+
+
+def test_every_k_is_one_projection_of_every_context(monkeypatch):
+    """Each K of `FRONTIER_DRAFT_TOKENS` is a projection of the same serving
+    law at its own verify width — one law, every K read off it."""
     calls: list = []
-    _speculating(monkeypatch, _spec_grid(calls))
-    res = _layout_points(("test/Model", f.FrontierView("B200"),
-                            ParallelConfig(tp_attention=2).to_dict()))
-    spec = [c for c in calls if c["s_verifies"] is not None]
-    assert len(calls) == 2 and len(spec) == 1
-    seqs = list(GALLERY_SEQ_LENS)
-    assert spec[0]["seq_lens"] == seqs * len(FRONTIER_DRAFT_TOKENS)
-    assert spec[0]["s_verifies"] == [k + 1 for k in FRONTIER_DRAFT_TOKENS
-                                     for _s in seqs]
+    record = _projecting_record(monkeypatch, calls)
+    res = f._restamp_layout(record, "B200", ParallelConfig(tp_attention=2))
+    assert [c["draft_tokens"] for c in calls] == [0, *FRONTIER_DRAFT_TOKENS]
+    assert all(c["contexts"] == list(GALLERY_SEQ_LENS) for c in calls)
     assert res["draft_errors"] == []
-    point = _theory_at(res, seqs[0])[0]
-    assert sorted(point["draft"]) == sorted(str(k) for k in FRONTIER_DRAFT_TOKENS)
+    point = _theory_at(res, GALLERY_SEQ_LENS[0])[0]
+    assert sorted(point["draftTimes"]) == sorted(
+        str(k) for k in FRONTIER_DRAFT_TOKENS)
 
 
-def test_a_layout_no_card_serves_walks_no_draft(monkeypatch):
-    """No room for a request on any card of the class: no plain point, so
-    no speculative view either, and its sweep is not walked."""
+def test_a_layout_no_card_serves_projects_no_draft(monkeypatch):
+    """No room for a request anywhere: no plain point, so no speculative
+    projection either."""
     calls: list = []
-    inner = _spec_grid(calls)
-
-    def grid(env, *, seq_lens, batch_grid, s_verifies=None):
-        out = inner(env, seq_lens=seq_lens, batch_grid=batch_grid,
-                    s_verifies=s_verifies)
-        for pts in out.values():
-            for pt in pts:
-                pt["sol"]["max_batch_per_gpu"] = 0
-        return out
-    _speculating(monkeypatch, grid)
-    walked = f._layout_walk(("test/Model", ["GB200", "B200"], 0.9,
-                             f._GALLERY_PRECISION.canonical(),
-                             ParallelConfig(tp_attention=2).to_dict()))
-    assert "draft" not in walked
-    assert all(c["s_verifies"] is None for c in calls)
+    record = _projecting_record(monkeypatch, calls, max_batch=0)
+    res = f._restamp_layout(record, "B200", ParallelConfig(tp_attention=2))
+    assert res["theory"] == [] and res["draft_errors"] == []
+    assert [c["draft_tokens"] for c in calls] == [0]
 
 
 def test_a_cached_point_keeps_what_the_frontier_reads(monkeypatch):
-    """The frontier draws decode: a cached point keeps its decode phase and
-    its decode measure, not the prefill half or the rest of the estimate."""
-    _speculating(monkeypatch, _spec_grid([]))
-    monkeypatch.setattr(f, "draft_refusal", lambda mid: "no draft")
-    res = _layout_points(("test/Model", f.FrontierView("B200"),
-                            ParallelConfig(tp_attention=2).to_dict()))
+    """The frontier draws decode: a projected point keeps its decode phase
+    and the record that owns its measure, not the prefill half, the rest of
+    the walk, or a second key table."""
+    view = f.FrontierView("B200")
+    walk_key = f._Stored("test/Model", "v1").serving_key(view)
+    res = f._restamp_layout(
+        _serving_law_record(measure=True), "B200",
+        ParallelConfig(tp_attention=2), walk_key=walk_key)
     point = _theory_at(res, GALLERY_SEQ_LENS[0])[0]
     assert point["sol"] == {"phases": {"decode": point["sol"]["phases"]["decode"]}}
-    assert point["measures"] == {"decode": {"m": 2}}
+    assert point["measureRecord"] == f.StepLawKey.of_layout(
+        walk_key, ParallelConfig(tp_attention=2)).record_name
+    assert "measures" not in point
 
 
-def test_a_failed_speculative_sweep_is_every_ks_published_error(monkeypatch):
-    """No K is dropped silently: a speculative sweep that fails is an error
-    of the layout at every K, published with that K's view and not with
-    another's."""
-    from backend.inference.sweep_grid import FRONTIER_DRAFT_TOKENS
-    _speculating(monkeypatch, _spec_grid([], fail=ValueError("verify refused")))
+def test_one_fold_reads_each_measure_record_once(monkeypatch):
+    """A Gallery fold expands points only for the request, and reads every
+    named canonical record once — not once per point and never into the
+    Gallery cache."""
+    sk = str(GALLERY_SEQ_LENS[0])
+    core = {
+        "model_id": "m", "layouts": [], "error": None,
+        "_measurePool": "bundle-key",
+        "_theory": [_timed_item(sk, batch=1, measure_record="record"),
+                    _timed_item(sk, batch=2, measure_record="record")],
+    }
+    reads: list = []
+    monkeypatch.setattr(
+        f, "sharedSolPool",
+        type("Pool", (), {"record": staticmethod(
+            lambda *_args: reads.append(1) or {"record": True})}))
+    monkeypatch.setattr(
+        f, "servingMeasurePoints",
+        lambda record, *, card, points: {
+            (context, batch): {"any": batch} for context, batch in points})
+
+    def apply(items, **_kwargs):
+        for item in items:
+            item["sol"]["phases"]["decode"]["coverage"] = {
+                "measured": 1, "total": 1}
+
+    monkeypatch.setattr(f, "measure_points", apply)
+    rates = f._measured_rates(
+        core, f._measureReader(core, "B200", {}), None)
+    assert reads == [1]
+    assert rates["timings"]["measure_records"] == 1
+    assert rates["timings"]["measure_points"] == 2
+
+
+def test_a_failed_speculative_projection_is_every_ks_published_error(monkeypatch):
+    """No K is dropped silently: a speculative projection that fails is an
+    error of the layout at every K, published with that K's view and not
+    with another's."""
+    calls: list = []
+    record = _projecting_record(
+        monkeypatch, calls, fail=ValueError("verify refused"), fail_all=True)
     cfg = ParallelConfig(tp_attention=2)
-    res = _layout_points(("test/Model", f.FrontierView("B200"), cfg.to_dict()))
+    res = f._restamp_layout(record, "B200", cfg)
     assert res["theory"]
     assert [(e["layout"], e["draft_tokens"], e["error"]) for e in res["draft_errors"]] == [
         ("TP2", k, "verify refused") for k in FRONTIER_DRAFT_TOKENS]
@@ -529,36 +581,17 @@ def test_a_failed_speculative_sweep_is_every_ks_published_error(monkeypatch):
 
 
 def test_one_k_that_fails_is_that_ks_error(monkeypatch):
-    """A K whose steps do not price (its floor form refused) is that K's
-    error; the other K's draw."""
-    from backend.inference.sweep_grid import FRONTIER_DRAFT_TOKENS
+    """A K whose law does not price is that K's error; the other K's draw."""
     bad = FRONTIER_DRAFT_TOKENS[-1]
     calls: list = []
-
-    constant = _constant_forms(monkeypatch)
-
-    def card_form_of(per, gpu_sku, *, phase, book, floors_s):
-        if per["phases"]["decode"].get("bad"):
-            raise ValueError("floor form gives 1 s for a step of 2 s")
-        return constant(per, gpu_sku, phase=phase, book=book,
-                        floors_s=floors_s)
-
-    def grid(env, *, seq_lens, batch_grid, s_verifies=None):
-        out = _spec_grid(calls)(env, seq_lens=seq_lens, batch_grid=batch_grid,
-                                s_verifies=s_verifies)
-        for pts in out.values():
-            for i, pt in enumerate(pts):
-                pt["sol"] = copy.deepcopy(pt["sol"])
-                if s_verifies is not None and s_verifies[i] == bad + 1:
-                    pt["sol"]["phases"]["decode"]["bad"] = True
-        return out
-    _speculating(monkeypatch, grid, card_form_of)
-    res = _layout_points(("test/Model", f.FrontierView("B200"),
-                            ParallelConfig(tp_attention=2).to_dict()))
+    record = _projecting_record(
+        monkeypatch, calls, fail=ValueError("verify width refused"), fail_k=bad)
+    res = f._restamp_layout(record, "B200", ParallelConfig(tp_attention=2))
+    assert [c["draft_tokens"] for c in calls] == [0, *FRONTIER_DRAFT_TOKENS]
     assert [(e["draft_tokens"], e["error"]) for e in res["draft_errors"]] == [
-        (bad, "floor form gives 1 s for a step of 2 s")]
+        (bad, "verify width refused")]
     point = _theory_at(res, GALLERY_SEQ_LENS[0])[0]
-    assert sorted(point["draft"]) == sorted(
+    assert sorted(point["draftTimes"]) == sorted(
         str(k) for k in FRONTIER_DRAFT_TOKENS if k != bad)
 
 
@@ -584,6 +617,10 @@ def _kept(monkeypatch, tmp_path, *, state="reads"):
     monkeypatch.setattr(f, "_FRONTIER_VIEWS", views)
     monkeypatch.setattr(f, "sharedSolPool", SolPool(tmp_path / "sol-pool"))
     monkeypatch.setattr(f, "_resolve_one", lambda mid: (None, object(), "v1"))
+    monkeypatch.setattr(
+        f, "_measureReader",
+        lambda _core, _gpu_sku, _timings: lambda _i, point: (
+            {"any": 1} if point.get("measureRecord") else None))
     scope = MeasurementScope(None, "lake", 1, 1, "r")
     monkeypatch.setattr(f, "_frontier_scope", lambda: (
         (scope, "reads") if state == "reads" else (f.NO_MEASUREMENTS, state)))
@@ -600,14 +637,24 @@ def _kept(monkeypatch, tmp_path, *, state="reads"):
 
 
 def _built_entry(monkeypatch, cards=("B200",), calls=None):
-    """A one-layout model's class walk over `cards` (the walk card first):
-    the plan `_frontier_read` hands out and each layout's walk."""
-    _speculating(monkeypatch, _spec_grid([] if calls is None else calls))
+    """A one-layout model's serving-law result, with the projection stubbed
+    to constant points; these tests own Gallery's cache and fold behavior."""
+    monkeypatch.setattr(f, "draft_refusal", lambda mid: None)
+
+    def restamp(_walked, _gpu_sku, cfg, _walk_key=None, _view=None):
+        return {
+            "theory": [
+                _timed_item(str(seq), measure_record="test-record")
+                for seq in GALLERY_SEQ_LENS
+            ],
+            "draft_errors": [],
+        }
+
+    monkeypatch.setattr(f, "_restamp_layout", restamp)
     cfg = ParallelConfig(tp_attention=2).to_dict()
     plan = {"cards": list(cards), "layoutsByCard": {c: [cfg] for c in cards},
             "layouts": [cfg]}
-    return plan, [f._layout_walk(("test/Model", list(cards), 0.9,
-                                  f._GALLERY_PRECISION.canonical(), cfg))]
+    return plan, [{"parallel": cfg, "walk": {"schema": f.walkRecordSchema}}]
 
 
 def test_a_kept_view_is_read_without_its_entry(monkeypatch, tmp_path):
@@ -626,16 +673,25 @@ def test_a_kept_view_is_read_without_its_entry(monkeypatch, tmp_path):
                                          ParallelConfig(tp_attention=2))["theory"])]
 
 
-def test_floors_and_k_read_the_entry_but_never_its_measures(monkeypatch, tmp_path):
+def test_floors_and_k_read_the_entry_but_never_its_measure_records(
+        monkeypatch, tmp_path):
     """Another floor or K draws off the entry's first part; the measured
     rates folded once per Kernel Bench snapshot are reused, so the measures
-    part — most of an entry — is not read for them."""
+    record those points name is not read for them."""
     _entries, reads, folds = _kept(monkeypatch, tmp_path)
+    real_reader = f._measureReader
+    record_reads: list = []
+
+    def reader(*args, **kwargs):
+        record_reads.append(1)
+        return real_reader(*args, **kwargs)
+
+    monkeypatch.setattr(f, "_measureReader", reader)
     plan, results = _built_entry(monkeypatch)
     model = "test/Model"
     f._finish_frontier(model, f.FrontierView("B200"), plan, results)
+    record_reads.clear()
     stored = f._Stored(model, "v1")
-    measures_key = stored.measures_key(f.FrontierView("B200"))
     for view in (f.FrontierView("B200", comm_latency_us=5.0),
                  f.FrontierView("B200", draft_tokens=2),
                  f.FrontierView("B200", draft_tokens=3, acceptance_rate=0.6)):
@@ -643,45 +699,39 @@ def test_floors_and_k_read_the_entry_but_never_its_measures(monkeypatch, tmp_pat
         got = f._frontier_read(model, view)
         assert "drawn" in got
         assert reads == [stored.entry_key(view)]
-        assert measures_key not in reads
+        assert record_reads == []
     assert len(folds) == 1
-    # A new snapshot folds again, off the measures part.
+    # A new snapshot folds again, off the records the entry names.
     from backend.measure.scope import MeasurementScope
     monkeypatch.setattr(f, "_frontier_scope", lambda: (
         MeasurementScope(None, "lake", 2, 2, "r"), "reads"))
     reads.clear()
     assert "drawn" in f._frontier_read(model, f.FrontierView("B200"))
-    assert measures_key in reads and len(folds) == 2
+    assert reads == [stored.entry_key(f.FrontierView("B200"))]
+    assert record_reads == [1] and len(folds) == 2
 
 
-def test_an_entry_missing_its_measures_part_is_priced_again(monkeypatch, tmp_path):
-    """The two parts are one entry: a view that needs the measures and finds
-    only the first part prices the model again rather than drawing a
-    measured track of nothing."""
+def test_an_entry_missing_its_measure_record_draws_sol(monkeypatch, tmp_path):
+    """A record the artifact did not carry is a missing measured overlay, not
+    a second Gallery key table: the SOL entry still draws, measured reads are
+    labelled unavailable, and no walk is started to paper over the cache."""
     entries, _reads, _folds = _kept(monkeypatch, tmp_path)
     plan, results = _built_entry(monkeypatch)
     model = "test/Model"
     stored = f._Stored(model, "v1")
-    core, _measures = f._entry_parts(f._restamp(
+    core = f._restamp(
         model, {**plan, "layouts": [{"parallel": p, "walk": r} for p, r in
                                      zip(plan["layouts"], results, strict=True)]},
-        "B200"))
+        "B200")
+    for point in core["_theory"]:
+        point.pop("measureRecord", None)
     entries.put(stored.entry_key(f.FrontierView("B200")), core)
-    monkeypatch.setattr(f, "frontier_layouts", lambda caps, gpu: [ParallelConfig()])
-    monkeypatch.setattr(f, "class_frontier_layouts", lambda caps, cards: [ParallelConfig()])
-    monkeypatch.setattr(f, "sweep_caps", lambda *a, **k: {})
-    monkeypatch.setattr(f, "parallel_configs_for_mode", lambda *a, **k: [])
+    monkeypatch.setattr(f, "_layout_law", lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("walked")))
     got = f._frontier_read(model, f.FrontierView("B200"))
-    # The plan is the view card's walk class: a law never spans two.
-    cards = f.FrontierView("B200").walk_cards()
-    assert cards == class_cards("B200") and "B300" not in cards
-    assert got == {"walk": {"cards": cards,
-                            "layoutsByCard": {c: [ParallelConfig().to_dict()]
-                                                for c in cards},
-                            "galleryLayoutsByCard": {
-                                c: [ParallelConfig().to_dict()] for c in cards},
-                            "layouts": [ParallelConfig().to_dict()]}}
-    # A view that reads no measures draws off the first part alone.
+    assert got["drawn"]["measured_track"] == {"state": "unavailable"}
+    assert got["drawn"]["frontier"][str(GALLERY_SEQ_LENS[0])]
+    # A view that reads no measurements draws off the same entry.
     assert "drawn" in f._frontier_read(model, f.FrontierView("B200", draft_tokens=1))
 
 
@@ -743,15 +793,16 @@ def test_the_lakes_answer_reaches_the_pricing_and_never_the_walk(
     assert len(calls) == walked and folds
 
 
-def test_the_kept_parts_carry_no_measures_in_the_first(monkeypatch, tmp_path):
+def test_the_kept_entry_names_records_and_carries_no_point_measures(
+        monkeypatch, tmp_path):
     entries, _reads, folds = _kept(monkeypatch, tmp_path, state="none")
     plan, results = _built_entry(monkeypatch)
     f._finish_frontier("test/Model", f.FrontierView("B200"), plan, results)
     stored = f._Stored("test/Model", "v1")
     core = entries.get(stored.entry_key(f.FrontierView("B200")))
-    measures = entries.get(stored.measures_key(f.FrontierView("B200")))
+    assert core["_measurePool"]
+    assert all(t.get("measureRecord") == "test-record" for t in core["_theory"])
     assert all("measures" not in t for t in core["_theory"])
-    assert len(measures["measures"]) == len(core["_theory"])
     assert folds == []
 
 
@@ -773,6 +824,7 @@ def _read_folded(monkeypatch, items):
     from backend.measure.scope import MeasurementScope
     monkeypatch.setattr(f, "_frontier_scope",
                         lambda: (MeasurementScope(None, "lake", 1, 1, "r"), "reads"))
+    _inline_measures(monkeypatch)
 
     def apply(pts, **_kw):
         for it in pts:
@@ -868,7 +920,7 @@ def test_a_frontier_point_the_fold_did_not_reach_is_refused(monkeypatch):
     """
     sk = str(GALLERY_SEQ_LENS[0])
     item = _covered_item(sk, batch=1, tpot=0.01, coverage={"measured": 0, "total": 2})
-    item["measures"] = {}
+    item.pop("measures")
     out = _read_folded(monkeypatch, [item])
     assert out["frontier"][sk]
     assert out["measured_track"] == {"state": "unavailable"}
@@ -995,8 +1047,8 @@ def test_one_request_reads_the_lake_once(monkeypatch):
 
     seen: list = []
 
-    def read(model_id, view, got=None):
-        seen.append(got)
+    def read(model_id, view, track=None, *, cache_only=False):
+        seen.append(track)
         return {"drawn": {"model_id": model_id}}
 
     monkeypatch.setattr(f, "_frontier_scope", scope)
@@ -1056,7 +1108,7 @@ def test_a_cold_frontier_publishes_kept_models_at_once_and_computes_in_the_clien
     monkeypatch.setattr(f, "_model_concurrency", lambda: 1)
     monkeypatch.setattr(f, "iter_snapshot_ids", lambda: ["a/1", "b/2", "c/3"])
 
-    def read(model_id, view, got=None):
+    def read(model_id, view, track=None, *, cache_only=False):
         if model_id == "c/3":
             return {"drawn": {"model_id": model_id}}
         return {"walk": {"cards": [], "layouts": []}}
@@ -1094,3 +1146,64 @@ def test_a_cold_frontier_publishes_kept_models_at_once_and_computes_in_the_clien
     assert computed == ["b/2", "a/1"]
     assert [m["model_id"] for m in whole["models"]] == ["a/1", "b/2", "c/3"]
     assert {k: whole[k] for k in partial["head"]} == partial["head"]
+
+def test_a_measured_cache_hit_returns_without_computing(monkeypatch):
+    """The lake being readable never invalidates a drawing already kept for
+    its own track (`frontier_model` must not fall back to a second walk)."""
+    import asyncio
+
+    view = f.FrontierView("B200")
+    track = (object(), "reads")
+    monkeypatch.setattr(
+        f, "_frontier_read",
+        lambda *_args, **_kwargs: {"drawn": {"model_id": "kept"}})
+    monkeypatch.setattr(
+        f, "_compute_frontier",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("computed")))
+    assert asyncio.run(f.frontier_model("m", view, track)) == {
+        "model_id": "kept"}
+
+
+def test_a_measured_request_publishes_sol_before_the_fold(monkeypatch):
+    """A lake read or fold may take time; the model's SOL partial is public
+    first and the measured drawing replaces it by model id."""
+    import asyncio
+
+    view = f.FrontierView("B200")
+    track = (object(), "reads")
+    monkeypatch.setattr(f, "_frontier_scope", lambda: track)
+    monkeypatch.setattr(f, "iter_snapshot_ids", lambda: ["a/1"])
+    monkeypatch.setattr(f, "_model_concurrency", lambda: 1)
+    monkeypatch.setattr(
+        f, "_frontier_read",
+        lambda model, view_arg, track_arg=None, *, cache_only=False:
+        {} if cache_only or track_arg[1] == "reads" else {"walk": {}})
+    monkeypatch.setattr(f, "_layout_law", lambda item: {"schema": "law"})
+    monkeypatch.setattr(f, "_finish_frontier", lambda *args, **kwargs: {
+        "model_id": args[0], "track": kwargs.get("track")})
+    published: list = []
+    monkeypatch.setattr(f, "report_partial", lambda item=None, **_kw:
+                        published.append(item))
+
+    async def compute(model_id, view_arg, track_arg, got):
+        return {"model_id": model_id, "computed": True,
+                "stage": "measured" if track_arg[1] == "reads" else "sol"}
+
+    monkeypatch.setattr(f, "_compute_frontier", compute)
+    out = asyncio.run(f.build_frontier(view))
+    assert out["models"] == [{"model_id": "a/1", "computed": True,
+                              "stage": "measured"}]
+    assert [item["stage"] for item in published
+            if item is not None][:-1] == ["sol", "measured"]
+
+
+def test_a_layout_the_walk_does_not_deploy_projects_as_its_answer():
+    """A walk's refusal, error or missing peak is that layout's answer on
+    every card of the class (`_restamp_layout`), never an absent one; a record
+    that is not a current serving law is an error, not a silent None."""
+    cfg = ParallelConfig()
+    assert f._restamp_layout({"error": "boom"}, "B200", cfg) == {"error": "boom"}
+    no_peak = f._restamp_layout({"no_peak": ["fp4", "mma"]}, "H100-SXM", cfg)
+    assert no_peak == {"error": str(f.NoPeakForDtype("H100-SXM", "fp4", "mma"))}
+    with pytest.raises(ValueError, match="not a serving-law"):
+        f._restamp_layout({"schema": "serving-law-v1"}, "B200", cfg)

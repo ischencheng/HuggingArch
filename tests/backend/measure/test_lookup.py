@@ -80,6 +80,18 @@ class TestOutcomes:
         assert measurements.resolve_scope(reads=True, owner="o") is NONE
         assert len(registry_for(NONE, [_key(_row())])) == 0
 
+
+def test_a_lookup_splits_service_time_from_the_round_trip(service):
+    """The fold's timing vocabulary splits what the service measured from
+    HTTP transport; a cache hit asks for neither."""
+    key = _key(_row())
+    service["answer"] = lambda _request: httpx.Response(200, json={
+        **_answer([key], [[]]).json(), "service_s": 0.0001})
+    got = measurements.lookup(SCOPE, [key])
+    assert got.service_s == 0.0001
+    assert got.request_s >= got.service_s
+    assert measurements.lookup(SCOPE, [key]).request_s == 0.0
+
     def test_theory_asks_nothing(self, service):
         assert measurements.resolve_scope(reads=False, owner=None) is NONE
         assert service["seen"] == []

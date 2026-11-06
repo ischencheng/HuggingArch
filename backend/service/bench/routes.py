@@ -55,6 +55,7 @@ import pathlib
 import threading
 import uuid
 import weakref
+import time
 from contextlib import contextmanager
 from functools import lru_cache
 from typing import Any, Dict, Iterator, Literal, Mapping, Optional, Sequence
@@ -949,6 +950,7 @@ def bench_lookup(body: LookupBody):
     lake = _lake()
     snapshot = lake.snapshot_id() if body.snapshot is None else int(body.snapshot)
     keys = [dict(k) for k in body.keys]
+    started = time.perf_counter()
     try:
         out = _lookup.lookup(lake, keys, owner=owner, snapshot=snapshot, verdicts=verdicts,
                              selection=selection, stats=lookup_stats)
@@ -958,7 +960,9 @@ def bench_lookup(body: LookupBody):
         raise HTTPException(status_code=503, detail=str(e)) from None
     except duckdb.Error as e:
         raise _lake_mod.LakeUnavailable(f"snapshot {snapshot} cannot be read: {e}") from e
-    return JSONResponse(content={"lake_id": _lake_id(lake), "snapshot": snapshot, **out})
+    return JSONResponse(content={
+        "lake_id": _lake_id(lake), "snapshot": snapshot,
+        "service_s": round(time.perf_counter() - started, 6), **out})
 
 
 def version_of(lake: _lake_mod.Lake) -> dict:

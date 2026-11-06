@@ -34,13 +34,16 @@ hash the key already carries, so every stored entry is valid. Stdlib only
 from __future__ import annotations
 
 import collections
+import gc
 import json
 import logging
 import os
 import pathlib
 import pickle
 import queue
+import sys
 import threading
+import types
 from typing import Any, Callable, Optional
 
 from backend.code_trace.provider import TRACES, Trace, provider, recording
@@ -84,9 +87,11 @@ class MemoryBackend:
     which are several times larger: a caller sizes it with that factor in
     mind, per process that holds one."""
 
-    def __init__(self, max_entries: int = 256, max_bytes: Optional[int] = None):
+    def __init__(self, max_entries: int = 256, max_bytes: Optional[int] = None,
+                 *, size_of: Optional[Callable[[Any], int]] = None):
         self._max = max_entries
         self._max_bytes = max_bytes
+        self._size_of = size_of or _json_size_of
         self._store: "collections.OrderedDict[str, Any]" = collections.OrderedDict()
         self._sizes: dict[str, int] = {}
         self._bytes = 0
@@ -102,8 +107,7 @@ class MemoryBackend:
     def put(self, key: str, value: Any, nbytes: Optional[int] = None) -> None:
         size = 0
         if self._max_bytes is not None:
-            size = (int(nbytes) if nbytes is not None
-                    else len(json.dumps(value).encode()))
+            size = int(nbytes) if nbytes is not None else self._size_of(value)
         with self._lock:
             self._drop(key)
             if self._max_bytes is not None and size > self._max_bytes:
@@ -116,6 +120,35 @@ class MemoryBackend:
                 # Evict least-recently used.
                 self._drop(next(iter(self._store)))
 
+    def resize(self, key: str, value: Any,
+               nbytes: Optional[int] = None) -> bool:
+        """Re-measure a mutable value already in this tier.
+
+        A working value may grow after it is stored (`WALK_CELLS` builds its
+        walk lazily). Its owner re-accounts it when a reader has finished
+        building; if it no longer fits, it is evicted while the caller keeps
+        the reference it already holds.
+        """
+        if self._max_bytes is None:
+            return key in self._store
+        size = int(nbytes) if nbytes is not None else self._size_of(value)
+        with self._lock:
+            if key not in self._store:
+                return False
+            if size > self._max_bytes:
+                self._drop(key)
+                return False
+            self._bytes += size - self._sizes[key]
+            self._sizes[key] = size
+            while len(self._store) > self._max or (
+                    self._max_bytes is not None
+                    and self._bytes > self._max_bytes):
+                evicted = next(iter(self._store))
+                self._drop(evicted)
+                if evicted == key:
+                    return False
+            return True
+
     def _drop(self, key: str) -> None:
         if key in self._store:
             del self._store[key]
@@ -126,6 +159,54 @@ class MemoryBackend:
             self._store.clear()
             self._sizes.clear()
             self._bytes = 0
+
+
+def _json_size_of(value: Any) -> int:
+    return len(json.dumps(value).encode())
+
+
+def deep_size_of(value: Any) -> int:
+    """The resident bytes an object graph attributes to one cache value.
+
+    Shared children are counted once within a value and process-global code
+    (modules, classes, functions, and builtins) is not charged to an entry.
+    This is the size function for in-process caches whose values are working
+    objects rather than JSON payloads; the bytes still feed the same
+    `MemoryBackend.max_bytes` budget and LRU eviction as JSON sizes.
+    """
+    shared_code = (
+        type, types.ModuleType, types.FunctionType, types.BuiltinFunctionType,
+        types.MethodType, types.WrapperDescriptorType,
+        types.MethodWrapperType, types.BuiltinMethodType,
+    )
+    seen: set[int] = set()
+    stack: list[Any] = [value]
+    total = 0
+    while stack:
+        obj = stack.pop()
+        if isinstance(obj, shared_code) or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        try:
+            total += sys.getsizeof(obj)
+        except TypeError:
+            continue
+        if isinstance(obj, dict):
+            stack.extend(obj.keys())
+            stack.extend(obj.values())
+        elif isinstance(obj, (list, tuple, set, frozenset)):
+            stack.extend(obj)
+        else:
+            slots = getattr(obj, "__slots__", None)
+            if slots is not None:
+                for name in slots:
+                    try:
+                        stack.append(getattr(obj, name))
+                    except AttributeError:
+                        pass
+            else:
+                stack.extend(gc.get_referents(obj))
+    return total
 
 
 class DiskBackend:
@@ -391,6 +472,19 @@ class KeyedCache:
                 _log.warning("%s; not stored", message)
                 return
         self._store(key, value, trace, remote_ok, remote_if)
+
+    def resize(self, key: str, value: Any) -> bool:
+        """Re-account a mutable local value; see `MemoryBackend.resize`."""
+        resize = getattr(self._backend, "resize", None)
+        if resize is None:
+            return False
+        # A local entry is a value plus its trace id. Re-account that whole
+        # entry — not a second, unwrapped representation of the mutable value.
+        stored = self._backend.get(key)
+        if not (isinstance(stored, dict) and TRACE_FIELD in stored
+                and stored.get("value") is value):
+            return False
+        return bool(resize(key, stored))
 
     def _local_or_remote(self, key: str, remote_ok: bool) -> Optional[Any]:
         """Local hit, else (when shareable) a remote hit promoted into local;

@@ -18,6 +18,7 @@ from backend.measure.cache import (
     TieredBackend,
     WriteBehindBackend,
     WriteBehindQueue,
+    deep_size_of,
 )
 from backend.measure.scope import make_key
 
@@ -68,6 +69,45 @@ def test_memory_backend_keeps_no_value_larger_than_its_budget(tmp_path):
     # The same key shrunk to fit is kept, and its old size is gone.
     be.put("huge", _blob(150))
     assert be.get("huge") is not None and be.get("small") is not None
+
+
+def test_deep_size_of_counts_working_objects_and_memory_backend_uses_it():
+    """Byte-bounded memory works for non-JSON working values too: size is
+    attributed once per object graph, shared code is not charged, and the
+    same LRU budget evicts by resident bytes."""
+    shared = {"payload": bytearray(512)}
+    twice = [shared, shared]
+    once = deep_size_of(shared)
+    assert deep_size_of(twice) < once + deep_size_of({"payload": bytearray(512)})
+    assert deep_size_of(threading.Lock()) > 0
+
+    one = {"payload": bytearray(500)}
+    other = {"payload": bytearray(700)}
+    be = MemoryBackend(
+        max_entries=16, max_bytes=deep_size_of(one) + deep_size_of(other) - 1,
+        size_of=deep_size_of)
+    be.put("one", one)
+    be.put("other", other)
+    assert be.get("one") is None and be.get("other") is not None
+    huge = {"payload": bytearray(4_000_000)}
+    be.put("huge", huge)
+    assert be.get("huge") is None and be.get("other") is not None
+
+
+def test_memory_backend_reaccounts_a_value_that_grew_after_it_was_stored():
+    value = {"payload": bytearray(100)}
+    be = MemoryBackend(max_bytes=deep_size_of(value) * 2,
+                       size_of=deep_size_of)
+    be.put("k", value)
+    value["payload"] = bytearray(100_000)
+    assert not be.resize("k", value)
+    assert be.get("k") is None
+    small = {"payload": bytearray(100)}
+    be.put("small", small)
+    small["other"] = bytearray(50)
+    assert be.resize("small", small)
+    assert be.get("small") is small
+    assert be._bytes == deep_size_of(small)
 
 
 def test_a_promoted_value_is_sized_by_its_file_not_serialised_again(tmp_path, monkeypatch):
