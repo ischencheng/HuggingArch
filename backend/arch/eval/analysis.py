@@ -21,7 +21,6 @@ from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
-from functools import cached_property
 from typing import (Any, Callable, ClassVar, Dict, FrozenSet, Iterable, Iterator, List,
                     Mapping, NamedTuple, Optional, Sequence, Tuple)
 
@@ -47,6 +46,7 @@ from .routed import RoutedLaunch
 from .rule import Rule
 from .values import Cost, Shape
 from .. import dims as dims_mod
+from backend.code_trace.memo import memo_property
 
 
 
@@ -508,7 +508,7 @@ class Analysis:
                 else self.program)
         return self.precision
 
-    @cached_property
+    @memo_property
     def weight_promotions(self) -> Mapping[int, Any]:
         """Every walked leaf whose matmul computes in its weight's dtype
         because the weight is held wider than the activation
@@ -525,7 +525,7 @@ class Analysis:
         return traffic_mod.weight_promotions(
             self.program, self.formats.values, self.resolved_precision)
 
-    @cached_property
+    @memo_property
     def shipped_precision(self) -> Any:
         """This walk read against the profile the checkpoint SHIPS with.
 
@@ -547,7 +547,7 @@ class Analysis:
             peak_families=precision.launch_peak_families,
             unavailable_launches=precision.unavailable_launches)
 
-    @cached_property
+    @memo_property
     def shipped_weight_promotions(self) -> Mapping[int, Any]:
         """`weight_promotions` as the checkpoint ships it: the saved formats
         of every leaf, against the edges `shipped_precision` gives them.
@@ -761,7 +761,7 @@ class Analysis:
             "inapplicable": inapplicable,
         }
 
-    @cached_property
+    @memo_property
     def replica_cost(self) -> Layer[Cost]:
         """`cost` as ONE data-parallel replica's step: each node's FLOPs at
         `dp_attention = 1`, everything else as it is.
@@ -842,7 +842,7 @@ class Analysis:
             replica(uid)
         return Layer(self.program, out)
 
-    @cached_property
+    @memo_property
     def occurrence_graph(self) -> OccurrenceGraph:
         """Every edge of the walked program's forward, at occurrence
         granularity, as the walk bound it (`input_references`). A rewritten
@@ -952,7 +952,7 @@ class Analysis:
                 "is the backbone's")
         return pools[0]
 
-    @cached_property
+    @memo_property
     def routed(self) -> Dict[int, RoutedLaunch]:
         """Each MoE dispatch's boundary on the rank this analysis sits on
         (`RoutedLaunch`: the tokens the rank holds, the rows routed onto its
@@ -1022,7 +1022,7 @@ class Analysis:
                 f"{sorted(padded)}; an item's rows are padded to one count")
         return padded.pop() if padded else rows
 
-    @cached_property
+    @memo_property
     def attention_families(self) -> Tuple[AttentionFamily, ...]:
         """The backbone's attention families (`AttentionFamily`), in layer
         group order; groups whose call has the same family and reads the
@@ -1077,7 +1077,7 @@ class Analysis:
                 dims=tuple(dims), rebound=frozenset(rebound))
         return tuple(families.values())
 
-    @cached_property
+    @memo_property
     def _moe_pool_stacks(self) -> Mapping[MoeFacts, frozenset]:
         """`{pool: stacks its banks sit in}`, backbone's pool first, then
         in walk order."""
@@ -1556,7 +1556,7 @@ class Analysis:
             return None
         return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
 
-    @cached_property
+    @memo_property
     def _axis_segments(self) -> Dict[Any, Any]:
         return self.rule.local_axis_segments(self)
 
@@ -1619,7 +1619,7 @@ class Analysis:
         """
         yield from self.rule.local_tensors(self)
 
-    @cached_property
+    @memo_property
     def copy_factors(self) -> Layer[Tuple[CopyFactor, ...]]:
         """The named counts each weight leaf is repeated by, outermost first,
         whose product is its `multiplicity`.
@@ -2034,7 +2034,7 @@ class _PointReading:
         # derived from the symbolic ones; they derive again from the read.
         memoised = [name for klass in type(out).__mro__
                     for name, attribute in vars(klass).items()
-                    if isinstance(attribute, cached_property)]
+                    if isinstance(attribute, memo_property)]
         if memoised:
             memo = vars(out)
             for name in memoised:

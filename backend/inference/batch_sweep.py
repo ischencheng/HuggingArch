@@ -73,11 +73,11 @@ from backend.measure.lookup import Key
 from backend.measure.scope import NONE as NO_MEASUREMENTS
 
 from dataclasses import asdict, replace
-from functools import lru_cache
 from typing import (Any, Dict, Iterable, Iterator, List, Mapping,
                     Optional, Sequence, Tuple)
 
 import sympy as sp
+from backend.code_trace.memo import memoize
 
 
 def _tensors(read: Mapping[Any, Any], laws: List[List[Any]]
@@ -851,7 +851,7 @@ def _measured_formula_weight(formula: MeasuredFormula, index: int,
     return _formula_term_weight(formula.text, index, count)
 
 
-@lru_cache(maxsize=8)
+@memoize(maxsize=8)
 def _read_formula(text: str) -> sp.Expr:
     """A measured formula's text, read once (`read_walk_law`): the chunks of
     one endpoint, and the endpoints of a sweep, write the same text.
@@ -870,7 +870,7 @@ def _read_formula(text: str) -> sp.Expr:
     return read_walk_law(text)
 
 
-@lru_cache(maxsize=1 << 16)
+@memoize(maxsize=1 << 16)
 def _formula_term_weight(text: str, index: int, count: int) -> sp.Expr:
     """`_measured_formula_weight` of a term that costs something: a function
     of the text, the term and the term count alone."""

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, replace
-from functools import cached_property
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
 from backend.arch import cache_families, roles as roles_mod
@@ -24,6 +23,7 @@ from backend.arch.precision_profile import (  # noqa: F401  (re-exported)
     PrecisionError, PrecisionProfile, Rule, presets, scheme_entry,
     vocabulary)
 from .formats import Formats, TensorFormat, _bits
+from backend.code_trace.memo import memo_property
 
 
 class ResolvedPrecision:
@@ -541,7 +541,7 @@ class ResolvedPrecision:
         bits, whose weights are loaded narrower than they are saved."""
         return self.model_dtype == self.shipped_model_dtype
 
-    @cached_property
+    @memo_property
     def weight_intent(self) -> Optional["WeightIntent"]:
         """The weight table asked per tensor, and — for a checkpoint no
         framework runs at its stored width — the serving downcast, which is
@@ -575,7 +575,7 @@ class ResolvedPrecision:
         return declared if declared is not None else CacheFormat.plain(
             self.model_dtype)
 
-    @cached_property
+    @memo_property
     def _model_cache_formats(self) -> Mapping[str, CacheFormat]:
         quant_context = self.program.spec.quant_context
         if quant_context is None:

@@ -47,6 +47,7 @@ from concurrent.futures.process import BrokenProcessPool
 from typing import Any, Callable, List, Optional, Tuple, TypeVar
 
 from backend.arch.loader import default_loader_generation, invalidate_default_loader
+from backend.code_trace.provider import current, provider, run_recorded
 
 logger = logging.getLogger(__name__)
 
@@ -309,9 +310,16 @@ def run_parallel(fn: Callable[[_T], _R], items: List[_T]) -> List[_R]:
         raise RuntimeError("sweep pool unavailable")
     # Submit in order, collect by index — `.result()` re-raises any
     # worker exception here so the caller's try/except can fall back.
+    inherited, requester = provider().snapshot(), current()
     try:
-        futures = [pool.submit(fn, item) for item in items]
-        return [f.result() for f in futures]
+        futures = [pool.submit(run_recorded, inherited, fn, item)
+                   for item in items]
+        out = []
+        for f in futures:
+            value, trace = f.result()
+            provider().merge(trace, into=requester)
+            out.append(value)
+        return out
     except BrokenProcessPool:
         # A worker died (OOM kill, segfault) and the executor refuses all
         # further work. Drop it so the next call builds a fresh pool.
@@ -337,19 +345,35 @@ def submit(fn: Callable[..., _R], /, *args: Any,
     pool = _get_pool(min_workers=1)
     if pool is None:
         raise RuntimeError("compute pool unavailable")
+    # The job is a computation of its own in the worker; it starts from what
+    # the requester had computed when it handed the job over (its arguments
+    # came from there), and its trace comes back to the requester's
+    # computations — not to every computation this process has open.
+    inherited, requester = provider().snapshot(), current()
     try:
         fut = pool.submit(_run_job, default_loader_generation(), fn, args,
-                          kwargs, progress_tag)
+                          kwargs, progress_tag, inherited)
     except BrokenProcessPool:
         _discard(pool)
         raise
+    out: "Future[_R]" = Future()
 
-    def _drop_if_broken(done: Future) -> None:
-        if not done.cancelled() and isinstance(done.exception(), BrokenProcessPool):
-            _discard(pool)
+    def _settle(done: Future) -> None:
+        if done.cancelled():
+            out.cancel()
+            return
+        exc = done.exception()
+        if exc is not None:
+            if isinstance(exc, BrokenProcessPool):
+                _discard(pool)
+            out.set_exception(exc)
+            return
+        value, trace = done.result()
+        provider().merge(trace, into=requester)
+        out.set_result(value)
 
-    fut.add_done_callback(_drop_if_broken)
-    return fut
+    fut.add_done_callback(_settle)
+    return out
 
 
 def _ready() -> int:
@@ -370,9 +394,11 @@ def prestart() -> None:
 
 
 def _run_job(loader_generation: int, fn: Callable[..., _R],
-             args: tuple, kwargs: dict, progress_tag: Any = None) -> _R:
+             args: tuple, kwargs: dict, progress_tag: Any = None,
+             inherited: Any = None) -> Tuple[_R, Any]:
     """Worker side of `submit`: the job, under the tag its ticks travel
-    under (`send_progress`)."""
+    under (`send_progress`), as one recorded computation
+    (`code_trace.provider.run_recorded`) — its value and its trace."""
     global _seen_loader_generation, _progress_tag
     if loader_generation != _seen_loader_generation:
         # The loader this worker holds answered for another generation (or
@@ -381,7 +407,7 @@ def _run_job(loader_generation: int, fn: Callable[..., _R],
         _seen_loader_generation = loader_generation
     _progress_tag = progress_tag
     try:
-        return fn(*args, **kwargs)
+        return run_recorded(inherited, fn, *args, **kwargs)
     except Exception as exc:
         try:
             pickle.loads(pickle.dumps(exc))

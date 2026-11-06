@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 # them through the same SSE generator that `POST /propose-op?chain_review=true`
 # uses. On by default; OP_PIPELINE_ENABLED=0 turns it off.
 from backend.api import offload as _offload
+from backend.code_trace.provider import seal as code_trace_seal
 from backend.measure import pool
 from backend.measure.lookup import MeasurementsUnavailable
 from backend.op_workers.pipeline import coordinator as _op_pipeline
@@ -85,6 +86,9 @@ async def health_details() -> dict:
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
+    # The code this server runs is fixed before it answers anything
+    # (`code_trace.provider.seal`; nothing under `GlobalHash`).
+    code_trace_seal()
     await _op_pipeline.startup()
     # The cache warm runs out of process (`python -m backend.warm_caches`, low
     # priority, its own sweep pool): inside this process it would compete

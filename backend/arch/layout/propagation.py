@@ -6,7 +6,6 @@ from .zone import COMBINE_OP, DISPATCH_OP
 
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
-from functools import cached_property
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -80,6 +79,7 @@ from .weight_endpoints import (
     WeightGeometry,
     _eval_extent,
 )
+from backend.code_trace.memo import memo_property
 
 
 @dataclass(frozen=True)
@@ -313,7 +313,7 @@ class LayoutPropagation(Rule):
                    pipeline_family=pipeline_family_for(parallel),
                    program=program)
 
-    @cached_property
+    @memo_property
     def encoder_view(self) -> "LayoutPropagation":
         """This rule as an encoder stack sees it (`Stack.is_encoder`).
 
@@ -338,7 +338,7 @@ class LayoutPropagation(Rule):
                 attention_tp=(self.families or {}).get("tp_attention"),
                 parallel=self.parallel, families=self.families or {}))
 
-    @cached_property
+    @memo_property
     def replicated_encoder_view(self) -> "LayoutPropagation":
         """`encoder_view` with no tensor-parallel world either: every weight
         of the stack whole on every rank, attention, MLP and projector alike.

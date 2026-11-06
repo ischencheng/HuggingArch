@@ -24,7 +24,6 @@ the same index.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from functools import cached_property
 from typing import (Any, Dict, FrozenSet, Hashable, Iterator, List, Mapping,
                     Optional, Set, Tuple)
 
@@ -38,6 +37,7 @@ from backend.arch.eval.transition import Redistribute, RedistributeSite
 from backend.arch.ops import is_identity_source
 
 from .parallel_config import stage_layer_ranges
+from backend.code_trace.memo import memo_property
 
 
 @dataclass(frozen=True)
@@ -87,17 +87,17 @@ class StagePlacement:
         program is walked, at any `pp`)."""
         return self.program.iteration_space
 
-    @cached_property
+    @memo_property
     def n_iterations(self) -> int:
         """The length of the partitioned iteration space."""
         return sum(depth for _offset, depth in self._partitioned.values())
 
-    @cached_property
+    @memo_property
     def ranges(self) -> Tuple[range, ...]:
         """The global iterations each stage holds (`stage_layer_ranges`)."""
         return tuple(stage_layer_ranges(self.n_iterations, self.pp))
 
-    @cached_property
+    @memo_property
     def _stage_of_global(self) -> Tuple[int, ...]:
         return tuple(stage for stage, held in enumerate(self.ranges)
                      for _ in held)
@@ -113,7 +113,7 @@ class StagePlacement:
 
     # -- units -------------------------------------------------------------
 
-    @cached_property
+    @memo_property
     def _aux(self) -> FrozenSet[str]:
         return frozenset(stack.name for stack in self.program.stacks
                          if stack.is_aux)
@@ -146,7 +146,7 @@ class StagePlacement:
                 yield (Occurrence(sink, iteration), index,
                        Occurrence(source, iteration), port)
 
-    @cached_property
+    @memo_property
     def _unit_graph(self) -> Tuple[Tuple[Hashable, ...],
                                    Mapping[Hashable, Set[Hashable]],
                                    Mapping[Hashable, Set[Hashable]],
@@ -195,7 +195,7 @@ class StagePlacement:
                 f"stage order runs it")
         return tuple(order), inputs, free, consumers
 
-    @cached_property
+    @memo_property
     def pulled(self) -> FrozenSet[Hashable]:
         """The pull set: units outside the partition whose every input is
         free or pulled (the least fixed point, in topological order)."""
@@ -206,7 +206,7 @@ class StagePlacement:
                 out.add(unit)
         return frozenset(out)
 
-    @cached_property
+    @memo_property
     def _stages(self) -> Mapping[Hashable, int]:
         """Each unit's stage. Forward, in topological order: an iteration
         on its partition's stage, any other unit outside the pull set after
@@ -246,7 +246,7 @@ class StagePlacement:
 
     # -- crossings -----------------------------------------------------------
 
-    @cached_property
+    @memo_property
     def crossings(self) -> Tuple[StageCrossing, ...]:
         """Every hop (layer 1): per computed value read on a later stage,
         one per cut between its stage and its sink's, deduplicated over
@@ -277,7 +277,7 @@ class StagePlacement:
                     item[0][2], item[0][0], -1 if item[0][1] is None
                     else item[0][1])))
 
-    @cached_property
+    @memo_property
     def backbone(self) -> FrozenSet[str]:
         """The default scope of every projection: the stacks that are not
         aux."""
@@ -398,7 +398,7 @@ class StagePlacement:
             raise ValueError(f"stage {stage} of {self.pp}")
         return StageView(self, stage)
 
-    @cached_property
+    @memo_property
     def _block_stages(self) -> Mapping[int, Stage]:
         """Block ordinal (`Program.blocks`) → the stage evaluating it."""
         index = {id(template): i
@@ -445,7 +445,7 @@ class StagePlacement:
             out[node.uid] = kept
         return out
 
-    @cached_property
+    @memo_property
     def free_reads(self) -> Mapping[int, FrozenSet[int]]:
         """Per stage, the parameters a computed occurrence there reads."""
         out: Dict[int, Set[int]] = {}

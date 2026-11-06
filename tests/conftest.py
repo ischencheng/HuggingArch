@@ -12,14 +12,21 @@ to skip models not checked out locally.
 from __future__ import annotations
 
 import io
+import os
 import pickle
 import sys
+import tempfile
 
 import pytest
 import yaml
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# Trace bodies a test session records (`backend.code_trace.provider.TRACES`)
+# stay out of the user's cache; set before anything under `backend` imports.
+os.environ.setdefault("HA_CODE_TRACE_DIR",
+                      tempfile.mkdtemp(prefix="ha-code-traces-"))
 
 
 class _ParsedYaml:

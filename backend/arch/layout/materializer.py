@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 from fractions import Fraction
-from functools import cached_property
 from itertools import pairwise
 from math import prod
 from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
@@ -44,6 +43,7 @@ from .materialize_rows import (
     reduction_row,
     scatter_row,
 )
+from backend.code_trace.memo import memo_property
 
 _DEFAULT_SOURCE = object()
 
@@ -643,11 +643,11 @@ class _Session:
             iteration for iteration in iterations
             if placement.stage(Occurrence(uid, iteration)) == self.stage.stage)
 
-    @cached_property
+    @memo_property
     def _domains(self) -> Dict[int, Tuple[Optional[int], ...]]:
         return dict(self.program.occurrence_domains())
 
-    @cached_property
+    @memo_property
     def _finalize_readers(self) -> Dict[Tuple[Any, ...], List[Redistribute]]:
         """The edge records that settle one value one way, by
         `_finalize_key`."""

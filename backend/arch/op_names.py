@@ -19,9 +19,10 @@ imports several of the modules declaring these sets.
 from __future__ import annotations
 
 from backend.arch.yaml_load import load_yaml
+from backend.code_trace.memo import memoize
 import inspect
 from pathlib import Path
-from typing import Dict, FrozenSet, List, Optional, Tuple
+from typing import Dict, FrozenSet, List, Tuple
 
 #: `(module, qualified name, names)` for every set declared through
 #: `op_names`. Populated at import time by the declaring module.
@@ -93,9 +94,7 @@ def universe() -> FrozenSet[str]:
     return frozenset(set(OP_REGISTRY) | set(_component_graphs()))
 
 
-_VIEW_ONLY: Optional[FrozenSet[str]] = None
-
-
+@memoize(maxsize=1)
 def view_only_components() -> FrozenSet[str]:
     """Components whose every node is a view op, so bytes pass through them.
 
@@ -107,10 +106,6 @@ def view_only_components() -> FrozenSet[str]:
 
     Cached, because it reads the component library off disk.
     """
-    global _VIEW_ONLY
-    if _VIEW_ONLY is not None:
-        return _VIEW_ONLY
-
     from backend.arch.ops import OP_REGISTRY
 
     found = set()
@@ -119,8 +114,7 @@ def view_only_components() -> FrozenSet[str]:
         if ops and all(o in OP_REGISTRY and OP_REGISTRY[o].is_view_op
                        for o in ops):
             found.add(name)
-    _VIEW_ONLY = frozenset(found)
-    return _VIEW_ONLY
+    return frozenset(found)
 
 
 def is_view_name(op: str) -> bool:

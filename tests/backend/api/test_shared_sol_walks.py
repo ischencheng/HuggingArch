@@ -6,6 +6,7 @@ import dataclasses
 
 import pytest
 
+from backend.code_trace.provider import recording
 from backend.measure.cache import KeyedCache, MemoryBackend
 from backend.inference.sol_data import ServingWalkFacts, StepLawKey
 from backend.inference.sol_pool import SolPool
@@ -25,6 +26,17 @@ def _record_name(gallery, view, layout):
     walk_key = stored.serving_key(view)
     return StepLawKey.of_layout(walk_key, layout).record_name
 
+
+
+@pytest.fixture(autouse=True)
+def _one_computation():
+    """Each test drives the worker side of a Gallery job directly — the
+    fold, the read, a bundle written — so each is one recorded computation,
+    as the job it stands in for is (`measure.pool.submit` runs every job in
+    one: `code_trace.provider.run_recorded`). What it keeps is stored with
+    the code it ran."""
+    with recording():
+        yield
 
 @pytest.fixture
 def shared(monkeypatch, tmp_path):

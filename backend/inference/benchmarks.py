@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import csv
 import datetime
-import functools
 import hashlib
 import io
 import json
@@ -28,6 +27,7 @@ from backend.arch.eval.formats import WEIGHT_GRANULARITY
 from backend.inference.benchmark_identity import (
     FORMAT_SLOTS, current_shape, declares_routed_token_total, format_refusal)
 from backend.inference.op_signatures import all_signatures, op_bindings, op_signature
+from backend.code_trace.memo import memoize
 
 
 # 3 adds the `cross_check` provenance column; 4 adds the two numbers behind that
@@ -1328,7 +1328,7 @@ def validate_text(text: str, *, source: str = "<csv>") -> Tuple[List[str], List[
     return header, rows
 
 
-@functools.lru_cache(maxsize=1)
+@memoize(maxsize=1)
 def validator_revision() -> str:
     """The revision rows are valid under: this module's code and the
     vocabularies it reads (the dim registry's symbols, the corpus dtype

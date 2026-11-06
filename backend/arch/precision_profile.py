@@ -47,7 +47,6 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass, field, replace
-from functools import cached_property, lru_cache
 from types import MappingProxyType
 from typing import (Any, ClassVar, Dict, FrozenSet, Iterable, List, Mapping, Optional,
                     Sequence, Tuple, get_args)
@@ -63,6 +62,7 @@ from backend.arch.dtypes import (UnknownDtype, canonical, dtype_bytes,
 from backend.arch.quant_schemes import QUANT_SCHEMES
 from backend.arch.schema.model import ModelLayer
 from backend.arch.schema.quant import PerRoleEntry
+from backend.code_trace.memo import memo_property, memoize
 
 #: Raised when selector semantics, resolution rules or the object
 #: definitions change: a key computed under the old meaning must not hit.
@@ -89,7 +89,7 @@ def _aux_kinds() -> Tuple[str, ...]:
     return tuple(get_args(literal))
 
 
-@lru_cache(maxsize=1)
+@memoize(maxsize=1)
 def _vocab() -> Mapping[str, FrozenSet[str]]:
     return {
         "roles": frozenset(roles_mod.all_roles()) | {OUTSIDE_ROLES},
@@ -125,7 +125,7 @@ def vocabulary() -> Dict[str, Any]:
     }
 
 
-@lru_cache(maxsize=1)
+@memoize(maxsize=1)
 def registry_fingerprint() -> str:
     """Content hash of every registry a canonical profile's formats and
     selectors are read against."""
@@ -529,7 +529,7 @@ class PrecisionProfile:
         out["layouts"] = list(self.layouts)
         return out
 
-    @cached_property
+    @memo_property
     def key(self) -> str:
         """`sha256(version ‖ registry fingerprint ‖ canonical JSON)[:12]`."""
         text = (f"{PROFILE_SCHEMA_VERSION}|{registry_fingerprint()}|"

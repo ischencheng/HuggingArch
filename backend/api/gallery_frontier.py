@@ -65,6 +65,7 @@ import copy
 import json
 import logging
 import statistics
+import functools
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from backend.api._models import BatchPoint, InferenceEstimateSweepRequest
@@ -136,6 +137,7 @@ from backend.inference.sol_data import (
     walkRecordSchema,
 )
 from backend.inference.sol_data import sharedSolPool
+from backend.code_trace.provider import recording, run_recorded
 from backend.inference.sol_law import (
     draftForwardsLaw,
     servingLawCapacity,
@@ -1057,16 +1059,21 @@ class _Stored(NamedTuple):
         class, never another class's."""
         return self.serving_key(view).identity
 
-    def keep_walk(self, view: FrontierView, walk: dict) -> None:
-        """Keep a model's class walk, when the view's is the kept one."""
+    def keep_walk(self, view: FrontierView, walk: dict,
+                  traces: Optional[List[Any]] = None) -> None:
+        """Keep a model's class walk, when the view's is the kept one; each
+        layout's record with the trace of the job that walked it (`traces`,
+        in layout order)."""
         if not (self.version and view.keeps_walk()):
             return False
         walk_key = self.serving_key(view)
+        names = [StepLawKey.of_layout(walk_key, item["parallel"]).record_name
+                 for item in walk["layouts"]]
         return sharedSolPool.write(
             walk_key.identity,
-            ((StepLawKey.of_layout(walk_key, item["parallel"]).record_name,
-              item)
-             for item in walk["layouts"]),
+            zip(names, walk["layouts"], strict=True),
+            traces=(dict(zip(names, traces, strict=True))
+                    if traces is not None else None),
             metadata={
                 "cards": list(walk["cards"]),
                 "layoutsByCard": walk["layoutsByCard"],
@@ -1314,7 +1321,8 @@ def _keep_and_draw(stored: _Stored, view: FrontierView, entry: dict,
 
 def _finish_frontier(model_id: str, view: FrontierView, plan: dict,
                      results: List[dict],
-                     track: Optional[Track] = None) -> dict:
+                     track: Optional[Track] = None,
+                     traces: Optional[List[Any]] = None) -> dict:
     """A model's layout laws (`_layout_law`, one per layout of `plan`) as its
     class bundle, kept (`_Stored.keep_walk`), projected on the view's card
     (`_restamp`), kept and drawn under `view` and `track`. One job, so the
@@ -1329,20 +1337,19 @@ def _finish_frontier(model_id: str, view: FrontierView, plan: dict,
     walk = {**plan, "layouts": [{"parallel": p, "walk": r} for p, r in
                                 zip(plan["layouts"], results, strict=True)]}
     stored = _Stored(model_id, _resolve_one(model_id)[2])
-    stored.keep_walk(view, walk)
+    stored.keep_walk(view, walk, traces)
     return _keep_and_draw(
         stored, view, _restamp(model_id, walk, view.gpu_sku, view), track)
 
 
-def _keepSharedWalk(model_id: str, view: FrontierView, plan: dict,
-                    results: List[dict]) -> bool:
-    """Keep a class's canonical records without projecting a Gallery entry."""
-    walk = {**plan, "layouts": [{"parallel": p, "walk": r} for p, r in
-                                zip(plan["layouts"], results, strict=True)]}
-    return _Stored(model_id, _resolve_one(model_id)[2]).keep_walk(view, walk)
-
-
 async def keepSharedWalk(model_id: str, gpu_sku: str) -> bool:
+    """`_keptSharedWalk` as one recorded computation
+    (`code_trace.provider.recording`)."""
+    with recording():
+        return await _keptSharedWalk(model_id, gpu_sku)
+
+
+async def _keptSharedWalk(model_id: str, gpu_sku: str) -> bool:
     """Ensure one card class's serving-walk records exist in the shared pool.
 
     A page need not be rendered for a class to contribute canonical facts:
@@ -1363,13 +1370,17 @@ async def keepSharedWalk(model_id: str, gpu_sku: str) -> bool:
                 for layout in plan["layouts"]]
     wanted = {key.record_name for key in stepKeys}
     existing = {}
+    traces: Dict[str, Any] = {}
     if recordIds is not None:
         if walkManifestIsValid(sharedSolPool.manifest(bundle_key)):
             for name in wanted:
+                # A record whose code changed reads as a miss
+                # (`SolPool.record`): only it is walked again.
                 record = sharedSolPool.record(bundle_key, name)
                 if (record is not None
                     and record.get("walk", {}).get("schema") == walkRecordSchema):
                     existing[name] = record
+                    traces[name] = sharedSolPool.recordTrace(bundle_key, name)
         published = {
             StepLawKey.of_layout(walk_key, layout).record_name
             for layouts in ((sharedSolPool.manifest(bundle_key).get(
@@ -1382,17 +1393,20 @@ async def keepSharedWalk(model_id: str, gpu_sku: str) -> bool:
                if StepLawKey.of_layout(walk_key, layout).record_name
                not in existing]
     results = await map_off_loop(
-        _layout_law, [(model_id, plan["cards"], float(view.gpu_memory_fraction),
-                       _GALLERY_PRECISION.canonical(), layout)
-                      for layout in layouts])
-    computed = {
-        StepLawKey.of_layout(walk_key, layout).record_name: {
-            "parallel": layout.to_dict(), "walk": result}
-        for layout, result in zip(layouts, results, strict=True)}
+        functools.partial(run_recorded, None, _layout_law),
+        [(model_id, plan["cards"], float(view.gpu_memory_fraction),
+          _GALLERY_PRECISION.canonical(), layout)
+         for layout in layouts])
+    computed = {}
+    for layout, (result, trace) in zip(layouts, results, strict=True):
+        name = StepLawKey.of_layout(walk_key, layout).record_name
+        computed[name] = {"parallel": layout.to_dict(), "walk": result}
+        traces[name] = trace
     return sharedSolPool.write(
         walk_key.identity,
         ((name, existing.get(name) or computed[name])
          for name in (key.record_name for key in stepKeys)),
+        traces=traces,
         metadata={
             "cards": list(plan["cards"]),
             "layoutsByCard": plan["layoutsByCard"],
@@ -1405,6 +1419,17 @@ async def keepSharedWalk(model_id: str, gpu_sku: str) -> bool:
 async def frontier_model(model_id: str, view: FrontierView,
                          track: Optional[Track] = None, *,
                          compute: Optional[PrioritySlots] = None) -> dict:
+    """`_frontier_model` as one recorded computation
+    (`code_trace.provider.recording`): the read, the layout jobs and the fold
+    (each a worker job whose trace comes back to it), so every part it
+    keeps is stored with the code that made it."""
+    with recording():
+        return await _frontier_model(model_id, view, track, compute=compute)
+
+
+async def _frontier_model(model_id: str, view: FrontierView,
+                          track: Optional[Track] = None, *,
+                          compute: Optional[PrioritySlots] = None) -> dict:
     """One model's frontier under `view` and `track`: read off the caches —
     the view's drawing, its entry, or its class walk priced on its card —
     or each layout of the class walk its own compute job and the fold
@@ -1435,13 +1460,18 @@ async def _compute_frontier(model_id: str, view: FrontierView,
         plan = _walk_plan(_resolve_one(model_id)[1], view)
     else:
         plan = got["walk"]
-    results = await map_off_loop(
-        (_layout_walk if readsMeasurements else _layout_law),
+    # Each layout is its own recorded job, so the record it becomes names
+    # only the code that walked it (`SolPool.write`).
+    recorded = await map_off_loop(
+        functools.partial(run_recorded, None,
+                          _layout_walk if readsMeasurements else _layout_law),
         [(model_id, plan["cards"], float(view.gpu_memory_fraction),
           _GALLERY_PRECISION.canonical(), p)
                       for p in plan["layouts"]], name=model_id)
+    results = [value for value, _trace in recorded]
+    traces = [trace for _value, trace in recorded]
     return await run_ranked(_finish_frontier, model_id, view, plan, results,
-                            track, name=model_id)
+                            track, traces, name=model_id)
 
 
 async def build_frontier(view: FrontierView) -> dict:

@@ -14,12 +14,12 @@ from __future__ import annotations
 
 from backend.arch.yaml_load import load_yaml
 from dataclasses import dataclass, field
-from functools import lru_cache
 from pathlib import Path
 from typing import Dict, FrozenSet, Mapping, Optional
 
 from backend.arch.activation_formats import ACTIVATION_FORMATS
 from backend.arch.dtypes import canonical
+from backend.code_trace.memo import memoize
 
 
 _REGISTRY_PATH = Path(__file__).parent / "cache_families.yaml"
@@ -55,12 +55,12 @@ class SlotKind:
     paired_operand: Mapping[str, str] = field(default_factory=dict)
 
 
-@lru_cache(maxsize=1)
+@memoize(maxsize=1)
 def _raw() -> dict:
     return load_yaml(_REGISTRY_PATH.read_text(encoding="utf-8")) or {}
 
 
-@lru_cache(maxsize=1)
+@memoize(maxsize=1)
 def _load() -> Dict[str, CacheFamily]:
     raw = _raw()
     out: Dict[str, CacheFamily] = {}
@@ -101,7 +101,7 @@ def of_kind(kind: str) -> FrozenSet[str]:
     return frozenset(n for n, f in _load().items() if f.kind == kind)
 
 
-@lru_cache(maxsize=1)
+@memoize(maxsize=1)
 def slot_kinds() -> Mapping[str, SlotKind]:
     """The cache slot kind vocabulary, `slot_kinds:` in cache_families.yaml."""
     out: Dict[str, SlotKind] = {}

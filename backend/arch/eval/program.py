@@ -49,7 +49,6 @@ import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
-from functools import cached_property
 from typing import (
     Any, ClassVar, Dict, FrozenSet, Iterator, List, Mapping, Optional, Sequence,
     Tuple, Union,
@@ -76,6 +75,7 @@ from .occurrence import Occurrence, Reference, Source
 from .op_ref import OpRef
 from .refusal import SpecRefusal
 from .storage import StorageKind
+from backend.code_trace.memo import memo_property
 
 
 @dataclass(frozen=True)
@@ -1113,7 +1113,7 @@ class Program:
         callers ask the program rather than reach into `resolved.config`."""
         return self.resolved.config is resolved.config
 
-    @cached_property
+    @memo_property
     def lookups(self) -> Dict[int, "LookupSite"]:
         """Leaf uid → the row gather it makes (`OpSpec.lookup`), resolved
         to this graph: the port its ids arrive on, and the uid holding the
@@ -1150,7 +1150,7 @@ class Program:
             out[node.uid] = LookupSite(ids=lookup.ids, table=table)
         return out
 
-    @cached_property
+    @memo_property
     def host_offloadable(self) -> FrozenSet[int]:
         """The uids whose stored weight a serving framework can keep in host
         memory (`GraphNode.host_offload`): DeepSeek-V4.1's Engram and
@@ -1160,7 +1160,7 @@ class Program:
         return frozenset(
             node.uid for node in self.nodes() if node.host_offload is not None)
 
-    @cached_property
+    @memo_property
     def read_aliases(self) -> Dict[int, Dict[int, Fraction]]:
         """Node uid → the uids whose STORED tensors it reads, when they are
         not its own, each with the share its declared weight is of the one
@@ -1191,7 +1191,7 @@ class Program:
             aliases[node.uid] = {node.tied_to_uid: Fraction(mine, held)}
         return aliases
 
-    @cached_property
+    @memo_property
     def embeddings_tied(self) -> bool:
         """Whether an input embedding table and a projection share one
         stored weight (HF's `tie_word_embeddings`): some `read_aliases`
@@ -1206,7 +1206,7 @@ class Program:
 
     # -- the base dim binding --------------------------------------------
 
-    @cached_property
+    @memo_property
     def base_binding(self) -> Binding:
         """The spec's dims, as the root frame. Nothing added.
 
@@ -1235,7 +1235,7 @@ class Program:
 
     # -- structure ------------------------------------------------------
 
-    @cached_property
+    @memo_property
     def model_inputs(self) -> Mapping[str, ModelInput]:
         """The spec's `model_inputs:`, each with the encoder stack that reads
         it. `ArchSpec._check_model_inputs` holds every input to at least one
@@ -1297,7 +1297,7 @@ class Program:
                 f"{sorted(map(str, found))}; one input is cut one way")
         return found.pop() if found else None
 
-    @cached_property
+    @memo_property
     def walked_inputs(self) -> Mapping[str, ModelInput]:
         """The model inputs this program's walk reads: the token ids for the
         language model, an encoder's own media for that encoder."""
@@ -1307,7 +1307,7 @@ class Program:
                 and (entry.stack in walked if entry.stack is not None
                      else self.walks_language_model)}
 
-    @cached_property
+    @memo_property
     def handoffs(self) -> Tuple["Handoff", ...]:
         """Every edge from an encoder into the language model, as the spec
         declares it (`ArchSpec.encoder_edges`, `prompt_slots`): the name the
@@ -1560,7 +1560,7 @@ class Program:
             components=child_ports,
         )
 
-    @cached_property
+    @memo_property
     def stacks(self) -> Tuple["Stack", ...]:
         """The model as a set of STACKS, each an ordered sequence of stages.
 
@@ -1695,7 +1695,7 @@ class Program:
     # `whole_stream_pairings` are their row views: no table is a second
     # statement of which element a reader takes.
 
-    @cached_property
+    @memo_property
     def _element_reads(self) -> Mapping[
             Tuple[Tuple[int, ...], str], Tuple[Tuple[int, str, int], ...]]:
         """Per `(layer_path, stream)`, every reading position of an element
@@ -1792,7 +1792,7 @@ class Program:
                 f"iteration {iteration}, which pairs with no element")
         return iterations.index(iteration)
 
-    @cached_property
+    @memo_property
     def stream_pairings(self) -> Tuple["StreamPairing", ...]:
         """Which iteration reads which element of each appended stream, one
         row per reading position and iteration (`paired_element`): the view
@@ -1826,7 +1826,7 @@ class Program:
                     inner=inner))
         return tuple(rows)
 
-    @cached_property
+    @memo_property
     def _concat_reads(self) -> Tuple[Tuple[Stage, int, str, Optional[int]],
                                      ...]:
         """Every reader that joins an appended stream whole, `(stage,
@@ -1884,7 +1884,7 @@ class Program:
                 out[name] = (name, 0)
         return out
 
-    @cached_property
+    @memo_property
     def whole_stream_pairings(self) -> Tuple["WholeStreamPairing", ...]:
         """Who reads an appended stream whole, or a prefix of it, and in
         which representation (`WholeStreamPairing`): the row view of the
@@ -1948,7 +1948,7 @@ class Program:
                     for uid, name, axis in joins.get(id(stage), ()))
         return tuple(rows)
 
-    @cached_property
+    @memo_property
     def joined_streams(self) -> FrozenSet[str]:
         """The appended streams some reader joins whole (`read: concat`,
         or a model-level `op:` with `axis:`): each element is held from
@@ -1975,7 +1975,7 @@ class Program:
         return Program(resolved=self.resolved, ir=tree,
                        schedule=self.schedule)
 
-    @cached_property
+    @memo_property
     def is_lowered(self) -> bool:
         """Whether every join the graph needs is a node of it: a reader of
         more than one element, or of a crop, reads the stream from a `src`
@@ -1992,7 +1992,7 @@ class Program:
                 return False
         return True
 
-    @cached_property
+    @memo_property
     def role_aliases(self) -> Mapping[str, str]:
         """Slot key → the role the component filling it declares for itself.
 
@@ -2021,14 +2021,14 @@ class Program:
     def custom_op(self, op_name: str) -> Optional[Any]:
         return (self.spec.custom_ops or {}).get(op_name)
 
-    @cached_property
+    @memo_property
     def has_dispatch_zone(self) -> bool:
         """Whether the model routes tokens to experts: some node is declared
         between a `permute` and its `combine`. The MoE question, asked of the
         graph — `n_experts > 1` is a dim that a dense spec may also bind."""
         return any(node.in_dispatch_zone for node in self.nodes())
 
-    @cached_property
+    @memo_property
     def attention_mix(self) -> Tuple[str, ...]:
         """The attention / sequence mixers the backbone runs: each call's
         cache identity (`variant or label`), once each, sorted. Auxiliary
@@ -2063,7 +2063,7 @@ class Program:
         return tuple(template for index, template in enumerate(self.blocks)
                      if kinds[self.stack_of_block(index)] == aux_kind)
 
-    @cached_property
+    @memo_property
     def headline(self) -> Headline:
         """The model card's sizes (`Headline`), read off the model-level
         dims (`base_binding`). A spec that declares no `d_model` or
@@ -2115,7 +2115,7 @@ class Program:
                 found |= ir_dim_symbols(leaf)
         return frozenset(found)
 
-    @cached_property
+    @memo_property
     def routed_uids(self) -> FrozenSet[int]:
         """Nodes whose work runs on dispatched tokens.
 
@@ -2136,7 +2136,7 @@ class Program:
                     routed.add(src.uid)
         return frozenset(routed)
 
-    @cached_property
+    @memo_property
     def dispatch_members(self) -> FrozenSet[int]:
         """The nodes of a MoE block: those running on dispatched tokens
         (`routed_uids`) plus the dispatch boundary ops themselves
@@ -2223,7 +2223,7 @@ class Program:
             if self.stack_of(node) in walked:
                 yield node
 
-    @cached_property
+    @memo_property
     def identity_sources_by_sole_reader(self) -> Mapping[int, Tuple[int, ...]]:
         """Per node, the identity sources it is the ONE reader of — in this
         walk's node order.
@@ -2262,7 +2262,7 @@ class Program:
             if node.uid not in encoders:
                 yield node
 
-    @cached_property
+    @memo_property
     def _prefix_by_uid(self) -> Mapping[int, str]:
         """Each node's checkpoint namespace, from the scope it belongs to.
 
@@ -2312,7 +2312,7 @@ class Program:
                           if at == 0 and node.uid in tables else t.kind))
             for at, t in enumerate(tensors))
 
-    @cached_property
+    @memo_property
     def _stack_by_uid(self) -> Mapping[int, str]:
         """Which stack each node belongs to, so cost can be bucketed by a
         group-by instead of by three more fields on the result."""
@@ -2343,7 +2343,7 @@ class Program:
     def stack_of(self, node: SpecIRNode) -> str:
         return self._stack_by_uid.get(node.uid, "")
 
-    @cached_property
+    @memo_property
     def _block_by_uid(self) -> Mapping[int, int]:
         return {n.uid: index for index, template in enumerate(self.blocks)
                 for n in template.nodes()}
@@ -2406,7 +2406,7 @@ class Program:
         return (node.boundary_role == "output_head"
                 and self.stack_of(node) == "")
 
-    @cached_property
+    @memo_property
     def encoder_uids(self) -> FrozenSet[int]:
         """Every node inside an encoder stack (`Stack.is_encoder`)."""
         encoders = {stack.name for stack in self.stacks if stack.is_encoder}
@@ -2463,7 +2463,7 @@ class Program:
                  or stack.name == self.encode_stack)
         )
 
-    @cached_property
+    @memo_property
     def contributions(self) -> Tuple["Contribution", ...]:
         """The model's accounting ROOTS: every node a total sums, with how many
         times the model holds it and which stack it belongs to.
@@ -2549,7 +2549,7 @@ class Program:
     # one value per input, and beside it the occurrences that produced the
     # value at each iteration (`Analysis.input_references`).
 
-    @cached_property
+    @memo_property
     def iteration_space(self) -> Mapping[Tuple[int, ...], Tuple[int, int]]:
         """The iteration space a pipeline partition cuts: the repeated model
         layers of every stack that is not aux (`Stack.is_aux`), concatenated
@@ -2592,14 +2592,14 @@ class Program:
                     f"with {found}; each iteration runs exactly one template")
         return out
 
-    @cached_property
+    @memo_property
     def layer_reads(self) -> Tuple[LayerRead, ...]:
         """Every read between model layers, resolved to the layers it names
         (`layer_reads`): the reads the walk orders its stacks by, and the
         edges a model-level diagram draws."""
         return layer_reads(self.ir, self.spec)
 
-    @cached_property
+    @memo_property
     def walk_stacks(self) -> Tuple["Stack", ...]:
         """The stacks this program's walk evaluates (`encode_stack`), in the
         order it evaluates them: every cross-stack read after its producer
@@ -2624,11 +2624,11 @@ class Program:
         # walk, so the encoders follow it.
         return language + tuple(st for st in ordered if st.is_encoder)
 
-    @cached_property
+    @memo_property
     def walked_stack_names(self) -> FrozenSet[str]:
         return frozenset(stack.name for stack in self.walk_stacks)
 
-    @cached_property
+    @memo_property
     def walked_components(self) -> FrozenSet[str]:
         """The components this program's walk invokes, at any depth."""
         out: set = set()
@@ -2639,7 +2639,7 @@ class Program:
                         out.add(node.op)
         return frozenset(out)
 
-    @cached_property
+    @memo_property
     def handed_exits(self) -> Mapping[int, str]:
         """A handed-over model-level op, by uid, with its name: a reader
         whose edge the tree resolved to that node by `src` reads the
@@ -2649,19 +2649,19 @@ class Program:
                 if isinstance(stage, OpStage)
                 and stage.name in self._handed_over}
 
-    @cached_property
+    @memo_property
     def _handed_over(self) -> FrozenSet[str]:
         """The names the language model reads from an encoder: what an
         encoder hands over, never an edge into the encoder's own walk, even
         where one walk evaluates both (`CHECKPOINT`)."""
         return frozenset(h.name for h in self.handoffs)
 
-    @cached_property
+    @memo_property
     def _walk_sequence(self) -> Tuple[Stage, ...]:
         return tuple(stage for stack in self.walk_stacks
                      for stage in stack.walk_order())
 
-    @cached_property
+    @memo_property
     def _occurrence_frames(self) -> Mapping[
             int, Tuple[int, Optional[SpecIRNode], SpecIRNode]]:
         """uid → (the position in `_walk_sequence` of the stage that
@@ -2743,7 +2743,7 @@ class Program:
                  for ref in inner.inputs_obj or () if ref.src is None}
         return tuple(name for name in node.stream_reads if name not in named)
 
-    @cached_property
+    @memo_property
     def _stage_positions(self) -> Mapping[int, int]:
         return {id(stage): position
                 for position, stage in enumerate(self._walk_sequence)}
@@ -2883,7 +2883,7 @@ class Program:
         return {name: tuple(self.by_uid(uid) for uid in uids)
                 for name, uids in out.items()}
 
-    @cached_property
+    @memo_property
     def stream_seed_nodes(self) -> FrozenSet[int]:
         """The model-level nodes an inner stream's `seed` names: each
         writes its stream at the stack's entry."""
@@ -2891,7 +2891,7 @@ class Program:
                          in self.ir.stream_writes.items()
                          if layer == STACK_ENTRY)
 
-    @cached_property
+    @memo_property
     def read_inner_streams(self) -> FrozenSet[str]:
         """The inner streams some layer reads."""
         return frozenset(name for _stack, _layer, name in self.ir.stream_reads)
@@ -2942,7 +2942,7 @@ class Program:
         return {name: (form, tuple(rows))
                 for name, (form, rows) in out.items()}
 
-    @cached_property
+    @memo_property
     def _block_stream_reads(self) -> Dict[int, Mapping[str, Tuple[int, ...]]]:
         return {}
 
@@ -2960,20 +2960,20 @@ class Program:
             out[name] = max(out.get(name, 0), layer - origin.iteration)
         return out
 
-    @cached_property
+    @memo_property
     def _by_uid(self) -> Mapping[int, SpecIRNode]:
         return {n.uid: n for n in self.nodes()}
 
     def by_uid(self, uid: int) -> Evaluable:
         return self._by_uid[uid]
 
-    @cached_property
+    @memo_property
     def blocks(self) -> Tuple[BlockTemplate, ...]:
         """One `BlockTemplate` per block instance, in spec.model order."""
         return tuple(BlockTemplate(meta=meta, roots=tuple(roots))
                      for meta, roots in self.ir.blocks)
 
-    @cached_property
+    @memo_property
     def copy_factors(self) -> Layer:
         """`Layer[Tuple[CopyFactor, ...]]`: the named counts each
         weight-bearing leaf is repeated by, outermost first.

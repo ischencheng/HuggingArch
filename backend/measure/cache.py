@@ -17,8 +17,18 @@ and an eviction rule:
 What a cache key is lives beside it: `scope.make_key` (the one key hash) and
 `scope.ResultIdentity` (what an estimate's result is a function of); a key is
 version-folded by its caller (`backend.fingerprint.result_version` /
-`engine_version`), so a code or data edit lands on a fresh key and no
-invalidation pass runs. Stdlib only.
+`cache_engine_version`), so a data edit lands on a fresh key and no
+invalidation pass runs.
+
+The code a value was computed by is the value's own: every entry is stored
+with the id of its trace (`backend.code_trace.provider`), the trace body
+once beside it (`TRACES`, and the remote tier for a shareable entry). A read
+returns a value only while the code this process runs still satisfies its
+trace, and hands the trace to every recording open around the read — a hit
+names the code it did not run. A stale entry reads as a miss, and the
+recomputed value overwrites it. Under `GlobalHash` the trace is the code
+hash the key already carries, so every stored entry is valid. Stdlib only
+(and `backend.code_trace`, which is).
 """
 
 from __future__ import annotations
@@ -33,7 +43,14 @@ import queue
 import threading
 from typing import Any, Callable, Optional
 
+from backend.code_trace.provider import TRACES, Trace, provider, recording
+
 _log = logging.getLogger(__name__)
+
+#: The field of a stored entry naming its trace; the value is beside it.
+TRACE_FIELD = "__code_trace__"
+#: Where a trace body is kept in a remote tier, by id.
+REMOTE_TRACE_PREFIX = "code-trace/"
 
 
 # ---------------------------------------------------------------------------
@@ -116,9 +133,10 @@ class DiskBackend:
     (oldest-by-mtime evicted). Persists across restarts. Best-effort: a read or
     write failure never raises — the endpoint just recomputes.
 
-    Values must be JSON-serializable. Content-addressed entries are never
-    overwritten in place — a changed key lands on a fresh file and the old one is
-    orphaned, so the cap bounds orphan growth (e.g. one set per engine bump)."""
+    Values must be JSON-serializable. A changed key lands on a fresh file and
+    the old one is orphaned, so the cap bounds orphan growth (e.g. one set per
+    data edit); an entry whose trace went stale is replaced under its own key,
+    atomically."""
 
     def __init__(self, directory: os.PathLike | str, max_files: int = 2000):
         self._dir = pathlib.Path(directory)
@@ -344,7 +362,8 @@ class KeyedCache:
     def get(self, key: str, *, remote_ok: bool = False) -> Optional[Any]:
         """Local-tier read; with ``remote_ok`` also falls through to the
         remote tier (and promotes a remote hit local). Same fail-closed
-        default as ``get_or_compute``."""
+        default as ``get_or_compute``. None for a missing entry and for one
+        whose trace the running code no longer satisfies."""
         return self._local_or_remote(key, remote_ok)
 
     def put(
@@ -352,31 +371,80 @@ class KeyedCache:
         key: str,
         value: Any,
         *,
+        trace: Optional[Trace] = None,
         remote_ok: bool = False,
         remote_if: Optional[Callable[[Any], bool]] = None,
     ) -> None:
-        self._store(key, value, remote_ok, remote_if)
+        """Store `value`, computed by the code `trace` names — by default
+        what the computation open around this call (`code_trace.provider.
+        recording`) has run so far. With no computation open there is no
+        telling what computed the value, and it is not stored."""
+        if trace is None:
+            p = provider()
+            trace = p.snapshot()
+            if trace is None:
+                message = (f"cache {self.name}: {key} put outside any "
+                           f"recorded computation (code_trace.provider."
+                           f"recording); nothing says what computed it")
+                if p.strict:
+                    raise RuntimeError(message)
+                _log.warning("%s; not stored", message)
+                return
+        self._store(key, value, trace, remote_ok, remote_if)
 
     def _local_or_remote(self, key: str, remote_ok: bool) -> Optional[Any]:
-        """Local hit, else (when shareable) a remote hit promoted into local."""
+        """Local hit, else (when shareable) a remote hit promoted into local;
+        either only while its trace holds."""
         hit = self._backend.get(key)
         if hit is not None:
-            return hit
+            return self._open(hit, remote_ok)
         if remote_ok and self._remote is not None:
             rhit = self._remote.get(key)
             if rhit is not None:
-                self._backend.put(key, rhit)  # promote so the next hit is local
-                return rhit
+                value = self._open(rhit, remote_ok)
+                if value is not None:
+                    self._backend.put(key, rhit)  # promote: the next hit is local
+                return value
         return None
 
-    def _store(self, key: str, value: Any, remote_ok: bool, remote_if: Optional[Callable[[Any], bool]] = None) -> None:
-        self._backend.put(key, value)
+    def _open(self, stored: Any, remote_ok: bool) -> Optional[Any]:
+        """The value of a stored entry, or None when its trace is unknown
+        here or stale (an entry from before traces is neither: a miss)."""
+        if not (isinstance(stored, dict) and TRACE_FIELD in stored):
+            return None
+        trace = self._trace(stored[TRACE_FIELD], remote_ok)
+        p = provider()
+        if trace is None or not p.valid(trace):
+            return None
+        p.merge(trace)
+        return stored["value"]
+
+    def _trace(self, tid: str, remote_ok: bool) -> Optional[Trace]:
+        trace = TRACES.get(tid)
+        if trace is None and remote_ok and self._remote is not None:
+            body = self._remote.get(REMOTE_TRACE_PREFIX + tid)
+            if body is not None:
+                try:
+                    trace = Trace.from_json(body)
+                except (TypeError, ValueError):
+                    return None
+                if trace.id != tid:
+                    return None
+                TRACES.put(trace)
+        return trace
+
+    def _store(self, key: str, value: Any, trace: Trace, remote_ok: bool,
+               remote_if: Optional[Callable[[Any], bool]] = None) -> None:
+        tid = TRACES.put(trace)
+        stored = {TRACE_FIELD: tid, "value": value}
+        self._backend.put(key, stored)
         if (
             remote_ok
             and self._remote is not None
             and (remote_if is None or remote_if(value))
         ):
-            self._remote.put(key, value)
+            self._remote.put(REMOTE_TRACE_PREFIX + tid, trace.to_json())
+            self._remote.put(key, stored)
 
     def get_or_compute(
         self,
@@ -402,10 +470,7 @@ class KeyedCache:
         if hit is not None:
             return hit
         if not self._single_flight:
-            value = compute()
-            if store_if is None or store_if(value):
-                self._store(key, value, remote_ok, remote_if)
-            return value
+            return self._compute(key, compute, store_if, remote_ok, remote_if)
         with self._locks_guard:
             entry = self._key_locks.setdefault(key, [threading.Lock(), 0])
             entry[1] += 1
@@ -414,15 +479,23 @@ class KeyedCache:
                 hit = self._local_or_remote(key, remote_ok)  # filled while we waited
                 if hit is not None:
                     return hit
-                value = compute()
-                if store_if is None or store_if(value):
-                    self._store(key, value, remote_ok, remote_if)
-                return value
+                return self._compute(key, compute, store_if, remote_ok,
+                                     remote_if)
         finally:
             with self._locks_guard:
                 entry[1] -= 1
                 if entry[1] == 0:
                     del self._key_locks[key]
+
+    def _compute(self, key: str, compute: Callable[[], Any],
+                 store_if: Optional[Callable[[Any], bool]], remote_ok: bool,
+                 remote_if: Optional[Callable[[Any], bool]]) -> Any:
+        """`compute()` as one recorded computation, stored with its trace."""
+        with recording() as rec:
+            value = compute()
+        if store_if is None or store_if(value):
+            self._store(key, value, rec["trace"], remote_ok, remote_if)
+        return value
 
     def clear(self) -> None:
         self._backend.clear()

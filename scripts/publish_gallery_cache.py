@@ -17,7 +17,9 @@ import tarfile
 import tempfile
 import urllib.request
 
-from backend.fingerprint import engine_version
+from backend.code_trace.provider import TRACES
+from backend.fingerprint import cache_engine_version
+from backend.measure.cache import TRACE_FIELD
 from backend.release_artifacts import INDEX_SCHEMA
 from backend.supabase_env import configured, service_role
 
@@ -42,11 +44,28 @@ def build(root: Path, destination: Path) -> int:
             fileobj=zipped, mode="w") as tar:
         tar.addfile(_tar_info("gallery", 0, directory=True))
         tar.addfile(_tar_info("gallery/frontier", 0, directory=True))
+        traces = set()
         for path in files:
             relative = path.relative_to(root)
             data = path.read_bytes()
             tar.addfile(_tar_info(
                 f"gallery/{relative.as_posix()}", len(data)), io.BytesIO(data))
+            try:
+                tid = json.loads(data).get(TRACE_FIELD)
+            except (ValueError, AttributeError):
+                tid = None
+            if tid:
+                traces.add(tid)
+        # Each trace an entry names, once: what a pulling machine checks the
+        # entries against (`gallery_cache_artifact._install`).
+        tar.addfile(_tar_info("gallery/code-traces", 0, directory=True))
+        for tid in sorted(traces):
+            trace = TRACES.get(tid)
+            if trace is None:
+                continue
+            data = json.dumps(trace.to_json()).encode()
+            tar.addfile(_tar_info(f"gallery/code-traces/{tid}.json", len(data)),
+                        io.BytesIO(data))
     return len(files)
 
 
@@ -67,7 +86,7 @@ def publish(root: Path) -> str:
     base, key = service_role()
     base = base.rstrip("/")
     bucket = os.environ.get("HA_ARTIFACT_BUCKET", "sol-pool")
-    engine = engine_version()
+    engine = cache_engine_version()
     with tempfile.TemporaryDirectory(prefix="gallery-cache-artifact.") as temporary:
         archive = Path(temporary) / "cache.tar.gz"
         files = build(root, archive)

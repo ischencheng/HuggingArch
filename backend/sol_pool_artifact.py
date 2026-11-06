@@ -20,7 +20,7 @@ import tarfile
 import tempfile
 import urllib.request
 
-from backend.fingerprint import engine_version
+from backend.fingerprint import cache_engine_version
 from backend.release_artifacts import artifact_to_pull
 
 
@@ -34,7 +34,7 @@ def _pool_root() -> Path:
 
 def _index_path() -> str:
     from backend.inference.sol_data import walkRecordSchema
-    return f"{walkRecordSchema}/{engine_version()}/index.json"
+    return f"{walkRecordSchema}/{cache_engine_version()}/index.json"
 
 
 def _request(url: str, key: str, timeout: float):
@@ -155,7 +155,7 @@ def pull(timeout: float = 900.0) -> int:
                             os.environ.get("HA_SOL_POOL_BUCKET", DEFAULT_BUCKET))
     selected = artifact_to_pull(
         os.environ.get("HA_SOL_POOL_ARTIFACT", ""), _index_path(),
-        engine_version(), base, key, bucket, min(30.0, timeout), _request)
+        cache_engine_version(), base, key, bucket, min(30.0, timeout), _request)
     if selected is None:
         print("SOL pool artifact: none for this engine; "
               "runtime warm will build it", flush=True)

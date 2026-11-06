@@ -8,7 +8,24 @@ local-only with no error.
 """
 from __future__ import annotations
 
-from backend.measure.cache import DiskBackend, KeyedCache, MemoryBackend, TieredBackend
+from backend.code_trace.provider import TRACES, Trace, provider
+from backend.measure.cache import (REMOTE_TRACE_PREFIX, TRACE_FIELD, DiskBackend,
+                                   KeyedCache, MemoryBackend, TieredBackend)
+
+
+def _trace() -> Trace:
+    """What the running code's provider records for a computation."""
+    p = provider()
+    return p.end(p.begin(nested=True))
+
+
+def _stored(value):
+    """An entry as a cache stores it: the value beside its trace's id."""
+    return {TRACE_FIELD: TRACES.put(_trace()), "value": value}
+
+
+def _value(stored):
+    return stored["value"]
 
 
 class FakeRemote:
@@ -35,7 +52,7 @@ def _cache(tmp_path):
 
 def test_shareable_remote_hit_is_promoted_to_local(tmp_path):
     cache, remote = _cache(tmp_path)
-    remote.store["k"] = {"v": 1}  # value only in the durable remote tier
+    remote.store["k"] = _stored({"v": 1})  # only in the durable remote tier
     got = cache.get_or_compute("k", lambda: {"v": "COMPUTED"}, remote_ok=True)
     assert got == {"v": 1}                      # served from remote, not recomputed
     assert cache.get("k") == {"v": 1}           # promoted into local
@@ -45,7 +62,7 @@ def test_shareable_put_writes_local_and_remote(tmp_path):
     cache, remote = _cache(tmp_path)
     cache.get_or_compute("k", lambda: {"v": 2}, remote_ok=True)
     assert cache.get("k") == {"v": 2}           # local
-    assert remote.store["k"] == {"v": 2}        # remote
+    assert _value(remote.store["k"]) == {"v": 2}  # remote
 
 
 def test_non_shareable_does_not_read_or_write_remote(tmp_path):
@@ -53,7 +70,7 @@ def test_non_shareable_does_not_read_or_write_remote(tmp_path):
     in the remote tier is NOT served, and a freshly computed one is NOT written
     there — so one user's calibrated numbers never reach the global table."""
     cache, remote = _cache(tmp_path)
-    remote.store["k"] = {"v": "REMOTE"}         # someone else's shareable entry
+    remote.store["k"] = _stored({"v": "REMOTE"})  # someone else's shareable entry
     # remote_ok=False: ignore the remote hit, compute locally.
     got = cache.get_or_compute("k2", lambda: {"v": "LOCAL"}, remote_ok=False)
     assert got == {"v": "LOCAL"}
@@ -88,23 +105,25 @@ def test_remote_if_gates_only_the_remote_write(tmp_path):
     # A clean value under another key writes both tiers.
     cache.get_or_compute(
         "ok", lambda: {"v": 1}, remote_ok=True, remote_if=lambda v: not v.get("error"))
-    assert remote.store["ok"] == {"v": 1}
+    assert _value(remote.store["ok"]) == {"v": 1}
 
 
 def test_get_put_remote_ok_roundtrip(tmp_path):
     """The manual get/put pair honours the same gates (gallery facts and
     frontier entries cache through them, outside get_or_compute)."""
     cache, remote = _cache(tmp_path)
-    cache.put("k", {"v": 1})                    # default: local-only
+    trace = _trace()
+    cache.put("k", {"v": 1}, trace=trace)       # default: local-only
     assert "k" not in remote.store
-    cache.put("k2", {"v": 2}, remote_ok=True)
-    assert remote.store["k2"] == {"v": 2}
-    cache.put("k3", {"v": 3}, remote_ok=True, remote_if=lambda v: False)
+    cache.put("k2", {"v": 2}, trace=trace, remote_ok=True)
+    assert _value(remote.store["k2"]) == {"v": 2}
+    cache.put("k3", {"v": 3}, trace=trace, remote_ok=True,
+              remote_if=lambda v: False)
     assert "k3" not in remote.store
     assert cache.get("k3") == {"v": 3}
     # A remote-only value is visible through get(remote_ok=True) and
     # promoted; a plain get() stays local-only.
-    remote.store["k4"] = {"v": 4}
+    remote.store["k4"] = _stored({"v": 4})
     assert cache.get("k4") is None
     assert cache.get("k4", remote_ok=True) == {"v": 4}
     assert cache.get("k4") == {"v": 4}          # promoted into local
@@ -123,3 +142,34 @@ def test_service_import_injects_the_durable_remote():
     assert isinstance(_SWEEP._remote, WriteBehindBackend)
     assert isinstance(_GALLERY._remote, WriteBehindBackend)
     assert isinstance(_FRONTIER._remote, WriteBehindBackend)
+
+
+def test_an_entry_from_before_traces_is_a_miss(tmp_path):
+    """A stored value that names no trace says nothing about the code that
+    computed it: recomputed, and overwritten with one that does."""
+    cache, remote = _cache(tmp_path)
+    remote.store["k"] = {"v": "OLD"}
+    assert cache.get_or_compute("k", lambda: {"v": "NEW"},
+                                remote_ok=True) == {"v": "NEW"}
+    assert _value(remote.store["k"]) == {"v": "NEW"}
+
+
+def test_an_entry_whose_trace_is_stale_is_a_miss_and_is_overwritten(tmp_path):
+    cache, remote = _cache(tmp_path)
+    stale = Trace((("<engine>", "an-older-engine"),))
+    cache.put("k", {"v": "OLD"}, trace=stale, remote_ok=True)
+    assert cache.get("k", remote_ok=True) is None
+    assert cache.get_or_compute("k", lambda: {"v": "NEW"},
+                                remote_ok=True) == {"v": "NEW"}
+    assert cache.get("k", remote_ok=True) == {"v": "NEW"}
+
+
+def test_a_remote_entry_brings_its_trace_from_the_remote_tier(tmp_path):
+    """Another machine's entry names a trace this one never recorded: its
+    body is read from the remote tier, where the writer put it."""
+    cache, remote = _cache(tmp_path)
+    trace = Trace(_trace().items + (("x.py::f", "0123456789abcdef"),))
+    other = KeyedCache("sweep", MemoryBackend(), remote=remote)
+    other.put("k", {"v": 1}, trace=trace, remote_ok=True)
+    assert REMOTE_TRACE_PREFIX + trace.id in remote.store
+    assert remote.store["k"][TRACE_FIELD] == trace.id

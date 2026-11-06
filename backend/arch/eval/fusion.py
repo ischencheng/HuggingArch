@@ -46,7 +46,6 @@ from backend.arch.ops import (
 )
 
 from dataclasses import dataclass, field
-from functools import cached_property
 from typing import (
     Any, ClassVar, Dict, FrozenSet, Iterator, List, Mapping, Optional, Sequence, Tuple,
 )
@@ -62,6 +61,7 @@ from .launch import FusedNode
 from .layer import Layer, Rewrite
 from .traffic import TensorReaders, reader_format
 from .values import Cost, Moved, Shape, product
+from backend.code_trace.memo import memo_property
 
 
 # -- what a match produced ------------------------------------------------
@@ -94,14 +94,14 @@ class FusedProgram:
     def __getattr__(self, name: str) -> Any:
         return getattr(self.base, name)
 
-    @cached_property
+    @memo_property
     def routed_uids(self) -> FrozenSet[int]:
         """The base's `Program.routed_uids`, and each fused kernel whose
         origins run on dispatched tokens (a span cannot straddle the zone,
         `_routed_span`)."""
         return self._with_fused(self.base.routed_uids)
 
-    @cached_property
+    @memo_property
     def dispatch_members(self) -> FrozenSet[int]:
         """The base's `Program.dispatch_members`, and each fused kernel that
         absorbed one: a launch that took a dispatch boundary in is one."""

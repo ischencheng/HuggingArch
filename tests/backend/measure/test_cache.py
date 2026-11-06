@@ -148,7 +148,7 @@ def test_write_behind_put_does_not_wait_on_the_store():
     assert not writes.drain(timeout=0.05)        # still in flight
     slow.release.set()
     assert writes.drain(timeout=5)
-    assert slow.store["k"] == {"v": 1}
+    assert slow.store["k"]["value"] == {"v": 1}
 
 
 def test_write_behind_drops_when_full():

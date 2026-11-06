@@ -21,11 +21,11 @@ import csv
 import math
 import os
 from dataclasses import dataclass, asdict, fields
-from functools import cache, lru_cache
 from types import MappingProxyType
 from typing import Dict, FrozenSet, Mapping, Optional, Tuple, get_type_hints
 
 from backend.arch.dtypes import DTYPES, peak_kind
+from backend.code_trace.memo import memoize
 
 _CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gpu_specs.csv")
 
@@ -79,7 +79,7 @@ class GPUSpec:
         return asdict(self)
 
     @classmethod
-    @cache
+    @memoize(maxsize=None)
     def numeric_columns(cls) -> frozenset:
         """The CSV columns parsed as float: the fields typed `Optional[float]`."""
         hints = get_type_hints(cls)
@@ -110,7 +110,7 @@ def _parse_row(row: dict) -> GPUSpec:
     return GPUSpec(**kwargs)
 
 
-@lru_cache(maxsize=1)
+@memoize(maxsize=1)
 def load_gpu_specs() -> list[GPUSpec]:
     # The CSV sits in a shared working tree other processes may rewrite; a read
     # that races a write can see a truncated/half-written file. Retry a few

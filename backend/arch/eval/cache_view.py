@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field, replace
-from functools import cached_property
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -34,6 +33,7 @@ from .cache import law_grows
 from ..dtypes import display_name
 from .dim import algebra, expr_of, substitute, value_of
 from .values import CACHE_LEN
+from backend.code_trace.memo import memo_property
 
 if TYPE_CHECKING:
     from .cache import CacheGeometry
@@ -235,7 +235,7 @@ class CacheView:
         return tuple(sorted(((t.name, *self._tensor_sig(t))
                              for t in cache.tensors), key=repr))
 
-    @cached_property
+    @memo_property
     def storage_identity(self) -> str:
         """What a request's cache IS, as one digest: every class's
         `_storage_sig` with the layers it has. Two views with the same
@@ -409,7 +409,7 @@ class CacheView:
                      for tensor in entry.tensors)
         return static * self.occupancy().scale
 
-    @cached_property
+    @memo_property
     def growth_formula(self) -> dict:
         """The per-token slope formula, per rank: `growth_and_floor`'s
         growth, written out — the number the KV formula badge explains, and

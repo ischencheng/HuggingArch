@@ -276,12 +276,28 @@ class TestMemoAndGrant(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(analysable._memo_read(key), result)
 
+    def test_an_entry_whose_code_trace_is_stale_is_a_miss(self):
+        # The code is not in the key: an entry names the code it was
+        # computed by (its trace), and code that no longer satisfies it
+        # replays — under either provider.
+        from backend.code_trace.provider import Trace
+        config, resolved = _resolved("Qwen__Qwen3-8B")
+        key = analysable.memo_key(config, resolved)
+        calls = []
+        with mock.patch.object(analysable, "replay",
+                               lambda *args: calls.append(1) or []):
+            result = analysable.replay_result(config, resolved)
+            analysable._memo_write(key, result, Trace((("<engine>", "stale"),
+                                                       ("<import-time>", "stale"))))
+            analysable.replay_result(config, resolved)
+        self.assertEqual(len(calls), 2)
+
     def test_any_input_changes_the_key(self):
         config, resolved = _resolved("Qwen__Qwen3-8B")
         base = analysable.memo_key(config, resolved)
         self.assertNotEqual(base, analysable.memo_key(
             {**config, "num_hidden_layers": 1}, resolved))
-        with mock.patch.object(analysable, "result_version", lambda r: "other"):
+        with mock.patch.object(analysable, "data_version", lambda r: "other"):
             self.assertNotEqual(base, analysable.memo_key(config, resolved))
         patch = Path(self.tmp.name) / "proposal" / "patch.py"
         patch.parent.mkdir()

@@ -72,6 +72,7 @@ from fastapi.responses import JSONResponse, Response
 from backend.api._models import InferenceEstimateRequest
 from backend.measure.scope import of_request
 from backend.arch.loader import default_loader_generation, get_default_loader
+from backend.code_trace.provider import seal as code_trace_seal
 from backend.fingerprint import engine_code_version, engine_version, shared_data_version
 from backend.measure import pool
 
@@ -171,7 +172,7 @@ def serve_requests_off_process(*, deadline_s: Optional[float] = DEADLINE_S) -> N
     global _off_process, _deadline_s
     pool.configure_workers(
         imports=("backend.api",),
-        prepare=(get_default_loader, engine_code_version,
+        prepare=(code_trace_seal, get_default_loader, engine_code_version,
                  shared_data_version, engine_version))
     _off_process = True
     _deadline_s = deadline_s

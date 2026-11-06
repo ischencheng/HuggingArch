@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import math
-from functools import lru_cache
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import Any, Iterable, Mapping, Sequence
@@ -38,6 +37,7 @@ from .prefill_geometry import PrefillChunkSchedule, PrefillEndpointGeometry
 from .row_roofline import StepSum, law_symbol, rung_symbols
 from .sol_data import walkRecordSchema as servingLawSchema
 from .serving_view import servingCapacityView
+from backend.code_trace.memo import memoize
 
 
 _lawOutputs = {
@@ -153,7 +153,7 @@ def _replaceKeepingShape(expr: sp.Expr, rule: Mapping[sp.Expr, sp.Expr]):
         return expr.func(*args)
 
 
-@lru_cache(maxsize=32768)
+@memoize(maxsize=32768)
 def _read(text: str, local: frozenset[str]) -> sp.Expr:
     def symbol(name: str) -> sp.Symbol:
         if name in local:
@@ -163,7 +163,7 @@ def _read(text: str, local: frozenset[str]) -> sp.Expr:
     return read_walk_law(text, symbol=symbol)
 
 
-@lru_cache(maxsize=1024)
+@memoize(maxsize=1024)
 def _compiledGraph(inputs: tuple[str, ...],
                    definitions: tuple[tuple[str, str], ...],
                    outputs: tuple[tuple[str, str], ...]):

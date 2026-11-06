@@ -34,7 +34,6 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from functools import lru_cache
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from packaging.version import InvalidVersion, Version
@@ -52,6 +51,7 @@ from .benchmark_identity import (
     project_shape_for_op,
     workload_hash,
 )
+from backend.code_trace.memo import memoize
 
 _LOG = logging.getLogger(__name__)
 
@@ -215,14 +215,14 @@ def physical_identity(op: str, shape_json: str) -> Dict[str, str]:
 _IDENTITY_MEMO = 1 << 16
 
 
-@lru_cache(maxsize=_IDENTITY_MEMO)
+@memoize(maxsize=_IDENTITY_MEMO)
 def _physical_parts(op: str, shape_json: str) -> Tuple[str, str]:
     """`physical_identity` as a (signature, physical_shape) pair."""
     ident = physical_identity(op, shape_json)
     return ident["signature"], ident["physical_shape"]
 
 
-@lru_cache(maxsize=_IDENTITY_MEMO)
+@memoize(maxsize=_IDENTITY_MEMO)
 def _workload_hash_of(shape_json: str, dtype_env_json: str) -> str:
     """`workload_hash` of a row's two JSON identity cells. The dtype cell is
     parsed so `workload_hash` computes its own canonical form (two
@@ -256,7 +256,7 @@ def _workload_hash_of(shape_json: str, dtype_env_json: str) -> str:
     )
 
 
-@lru_cache(maxsize=_IDENTITY_MEMO)
+@memoize(maxsize=_IDENTITY_MEMO)
 def _hardware_hash_of(gpu: str, framework: str, framework_version: str,
                       phase: str, parallel: str) -> str:
     return hardware_hash(gpu=gpu, framework=framework,
@@ -264,7 +264,7 @@ def _hardware_hash_of(gpu: str, framework: str, framework_version: str,
                          phase=phase, parallel=parallel)
 
 
-@lru_cache(maxsize=_IDENTITY_MEMO)
+@memoize(maxsize=_IDENTITY_MEMO)
 def _op_kernel_hash_of(node_spec_id: str, op: str, kernel_impl: str) -> str:
     return op_kernel_hash(node_spec_id=node_spec_id, op=op, kernel_impl=kernel_impl)
 

@@ -9,11 +9,11 @@ shards with replicated cells).
 """
 from __future__ import annotations
 
-from collections import OrderedDict
 from typing import Dict, Optional
 
 from backend.arch import dims
 from backend.arch.eval.dim import common_divisor, same_law
+from backend.code_trace.memo import Memo
 
 from . import mesh
 
@@ -51,10 +51,8 @@ def _groups_from_span(stride: int, size: int, world_size: int):
 #: key stores equivalent entries once per irrelevant-field value, and a
 #: dict-carrying field would make a legal config unhashable. A parallel
 #: sweep asks per CELL (`capacity.py`), so entries are shared, read-only
-#: objects. Concurrent first misses may construct twice; both results are
-#: equal and either may win — harmless.
-_FAMILIES: "OrderedDict[tuple, Dict[str, ProcessGroupFamily]]" = OrderedDict()
-_FAMILIES_MAX = 256
+#: objects.
+_FAMILIES = Memo(maxsize=256)
 
 
 def _deployment_key(pc, phase: str) -> tuple:
@@ -73,15 +71,8 @@ def families_for(pc, phase: str) -> Dict[str, ProcessGroupFamily]:
     one in this phase. Subgroup worlds (dcp) use their declared fill
     order via `mesh.subgroup_stride`. Cached per (topology, phase);
     callers treat the returned mapping as immutable."""
-    key = _deployment_key(pc, phase)
-    hit = _FAMILIES.get(key)
-    if hit is None:
-        hit = _FAMILIES[key] = _resolve_families(pc, phase)
-    else:
-        _FAMILIES.move_to_end(key)
-    while len(_FAMILIES) > _FAMILIES_MAX:
-        _FAMILIES.popitem(last=False)
-    return hit
+    return _FAMILIES.get(_deployment_key(pc, phase),
+                         lambda: _resolve_families(pc, phase))
 
 
 def _resolve_families(pc, phase: str) -> Dict[str, ProcessGroupFamily]:

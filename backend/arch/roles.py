@@ -23,9 +23,9 @@ from __future__ import annotations
 
 from backend.arch.yaml_load import load_yaml
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 from typing import Dict, FrozenSet, Mapping, Optional, Tuple
+from backend.code_trace.memo import memoize
 
 
 _REGISTRY_PATH = Path(__file__).parent / "roles.yaml"
@@ -56,7 +56,7 @@ class Role:
     label: Optional[str] = None
 
 
-@lru_cache(maxsize=1)
+@memoize(maxsize=1)
 def _load() -> Dict[str, Role]:
     raw = load_yaml(_REGISTRY_PATH.read_text(encoding="utf-8")) or {}
     out: Dict[str, Role] = {}

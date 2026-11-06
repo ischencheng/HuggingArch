@@ -21,6 +21,7 @@ from typing import (Any, Callable, Dict, FrozenSet, Iterator, List, Mapping,
 from fastapi.responses import Response
 
 from backend.arch.loader import get_default_loader
+from backend.code_trace.provider import recording
 from backend.fingerprint import engine_version, result_version
 from backend.hf.metadata import fetch_config
 from backend.measure.cache import (DiskBackend, KeyedCache, MemoryBackend,
@@ -794,6 +795,16 @@ async def _publish_partials(sweep: _CachedSweep, start: _SweepStart,
 
 
 async def _run_sweep(sweep: _CachedSweep, req: Any, render: bool) -> Any:
+    """`_sweep_computed` as one recorded computation
+    (`code_trace.provider.recording`): its start, its cells (their worker
+    jobs' traces come back to it, `measure.pool.submit`) and its finish, so
+    the answer and every step it keeps are stored with the code that made
+    them."""
+    with recording():
+        return await _sweep_computed(sweep, req, render)
+
+
+async def _sweep_computed(sweep: _CachedSweep, req: Any, render: bool) -> Any:
     """The one place a Scaling-panel sweep is keyed, computed, and stored —
     so the warm job fills the SAME key the endpoint reads and a warmed value
     is byte-identical to a live one. `key is None` (no spec fingerprint)

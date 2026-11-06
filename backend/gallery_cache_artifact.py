@@ -19,7 +19,8 @@ import tarfile
 import tempfile
 import urllib.request
 
-from backend.fingerprint import engine_version
+from backend.code_trace.provider import TRACES, Trace
+from backend.fingerprint import cache_engine_version
 from backend.release_artifacts import artifact_to_pull
 
 
@@ -33,7 +34,7 @@ def _cache_root() -> Path:
 
 
 def _index_path() -> str:
-    return f"gallery-cache-v1/{engine_version()}/index.json"
+    return f"gallery-cache-v1/{cache_engine_version()}/index.json"
 
 
 def _request(url: str, key: str, timeout: float):
@@ -114,7 +115,8 @@ def _install(archive: Path, root: Path, artifact: str, digest: str) -> int:
         with tarfile.open(archive, "r:gz") as tar:
             tar.extractall(staging, filter="data")
         unpacked = staging / "gallery"
-        files = [path for path in unpacked.rglob("*.json") if path.is_file()]
+        files = [path for path in unpacked.rglob("*.json") if path.is_file()
+                 and path.parent != unpacked / "code-traces"]
         if not files:
             raise ValueError("gallery cache archive has no JSON entries")
         # Measured views are machine-local: a new deterministic artifact must
@@ -135,6 +137,18 @@ def _install(archive: Path, root: Path, artifact: str, digest: str) -> int:
                 os.replace(temporary, destination)
             finally:
                 temporary.unlink(missing_ok=True)
+        # The traces the entries name travel with them (`gallery/code-traces`,
+        # `scripts.publish_gallery_cache.build`): an entry is served only
+        # while the running code satisfies its trace, and this machine never
+        # recorded those.
+        for body in (unpacked / "code-traces").glob("*.json"):
+            try:
+                trace = Trace.from_json(json.loads(body.read_text(
+                    encoding="utf-8")))
+            except (OSError, ValueError, TypeError):
+                continue
+            if trace.id == body.stem:
+                TRACES.put(trace)
         _write_marker(root, artifact, digest, len(files))
         return len(files)
     finally:
@@ -152,7 +166,7 @@ def pull(timeout: float = 900.0) -> int:
     base = base.rstrip("/")
     selected = artifact_to_pull(
         os.environ.get("HA_GALLERY_CACHE_ARTIFACT", ""), _index_path(),
-        engine_version(), base, key, bucket, min(30.0, timeout), _request)
+        cache_engine_version(), base, key, bucket, min(30.0, timeout), _request)
     if selected is None:
         print("gallery cache artifact: none for this engine; "
               "runtime warm will build it", flush=True)

@@ -39,7 +39,7 @@ class _BrokenExecutor:
     def __init__(self):
         self.shut_down = False
 
-    def submit(self, fn, item):
+    def submit(self, fn, *args, **kwargs):
         raise BrokenProcessPool("a worker was killed")
 
     def shutdown(self, wait=True, cancel_futures=False):
@@ -52,9 +52,9 @@ class _InlineExecutor:
     def __init__(self, **_kw):
         pass
 
-    def submit(self, fn, item):
+    def submit(self, fn, *args, **kwargs):
         fut = Future()
-        fut.set_result(fn(item))
+        fut.set_result(fn(*args, **kwargs))
         return fut
 
     def shutdown(self, wait=True, cancel_futures=False):

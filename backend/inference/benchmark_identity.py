@@ -40,9 +40,9 @@ import math
 import json
 from dataclasses import dataclass
 from fractions import Fraction
-from functools import cached_property, lru_cache
 from typing import (Any, Dict, FrozenSet, List, Optional, Tuple,
                     TYPE_CHECKING)
+from backend.code_trace.memo import memo_property, memoize
 
 if TYPE_CHECKING:
     from backend.arch.loader import ResolvedSpec
@@ -857,7 +857,7 @@ def _launched(shape: Any, launch: RoutedLaunch, routed: Any) -> Any:
     return out if isinstance(shape[0], (list, tuple)) else out[0]
 
 
-@lru_cache(maxsize=None)
+@memoize(maxsize=None)
 def _names_an_expert_axis(expr: str) -> bool:
     """Whether an axis whose identity is `expr` (`as_wire`'s `expr`) is an
     expert axis (`storage.is_expert_axis`)."""
@@ -1458,7 +1458,7 @@ class RowIdentity:
         with node_context(node.display_path):
             return self._keyed(row, node)
 
-    @cached_property
+    @memo_property
     def _resident_caches(self) -> Dict[Any, Any]:
         """Every persisting cached tensor, by reference (`cache.resident`):
         what a row's own cache accesses (`kv_access`) name."""

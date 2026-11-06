@@ -8,7 +8,6 @@ composition root's import path)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import cached_property
 from typing import Any, Dict, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from .dim import (as_extent, as_number, bound_or_folded, expr_of, floored,
@@ -21,6 +20,7 @@ from .cache import main_port
 from .launch import FusedNode
 from ..ops_base import declaration_is_gemm
 from .layer import Layer
+from backend.code_trace.memo import memo_property
 
 
 def _int(value: Any) -> int:
@@ -201,7 +201,7 @@ class LeafAccess:
             return None
         return self.output_cached.format_name
 
-    @cached_property
+    @memo_property
     def _text(self) -> Dict[str, Any]:
         if self.display is None:
             return {"params_sym": None, "params_val": None,

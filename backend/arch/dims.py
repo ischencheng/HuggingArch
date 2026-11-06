@@ -35,7 +35,6 @@ import itertools
 import re
 import threading
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 from enum import Enum
 from typing import Any, Dict, FrozenSet, Mapping, Optional, Tuple
@@ -43,6 +42,7 @@ from typing import Any, Dict, FrozenSet, Mapping, Optional, Tuple
 import sympy as sp
 
 from backend.arch.law_text import LAW_OPERATORS
+from backend.code_trace.memo import memoize
 
 _REGISTRY_PATH = Path(__file__).parent / "dims.yaml"
 
@@ -504,7 +504,7 @@ def _parse_symbol(name: str, entry, *, slugs, worlds) -> DimSymbol:
     return sym
 
 
-@lru_cache(maxsize=1)
+@memoize(maxsize=1)
 def _load_base() -> Tuple[Dict[str, DimSymbol], Tuple[DimGroup, ...],
                           Dict[str, World]]:
     """`dims.yaml` (+ a spec-gen child's `_PENDING` fragment), parsed once.
@@ -1005,7 +1005,7 @@ def degree_fields(*meshes: str) -> Mapping[str, str]:
     return out
 
 
-@lru_cache(maxsize=1)
+@memoize(maxsize=1)
 def world_by_label() -> Mapping[str, World]:
     """`{World.label: World}` — the registry keyed the way the placement
     algebra names a world. The join, derived rather than written down a

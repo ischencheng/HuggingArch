@@ -13,6 +13,7 @@ Responsibilities:
 from __future__ import annotations
 
 from backend.arch.yaml_load import load_yaml
+from backend.code_trace.memo import memoize
 import hashlib
 import json
 import logging
@@ -631,10 +632,10 @@ class ResolvedSpec:
 # Spec registry
 # ---------------------------------------------------------------------------
 
-_default_loader_singleton: Optional["SpecLoader"] = None
 _default_loader_generation = 0
 
 
+@memoize(maxsize=1)
 def get_default_loader() -> "SpecLoader":
     """Module-level cached SpecLoader for routes/CLI that don't customize
     `base_dir`. Profiling /inference/estimate showed ~5.9s/request spent
@@ -644,18 +645,15 @@ def get_default_loader() -> "SpecLoader":
     SpecLoader cost into a one-shot startup tax. Tests + callers that
     need an isolated loader (writable component dir, hermetic test
     fixtures) keep using `SpecLoader(...)` directly."""
-    global _default_loader_singleton
-    if _default_loader_singleton is None:
-        _default_loader_singleton = SpecLoader()
-    return _default_loader_singleton
+    return SpecLoader()
 
 
 def invalidate_default_loader() -> None:
     """Drop the cached loader. Called by `/refresh-specs` (future) or
     after a runtime promotion writes a new yaml file — otherwise the
     next request would still see the pre-write component manifest."""
-    global _default_loader_singleton, _default_loader_generation
-    _default_loader_singleton = None
+    global _default_loader_generation
+    get_default_loader.cache_clear()
     _default_loader_generation += 1
 
 

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from functools import cached_property
 from math import prod
 from typing import Any, Dict, Mapping, NamedTuple, Optional, Tuple
 
@@ -39,6 +38,7 @@ from .physical import (
     physical_kernel_shapes,
 )
 from .physical_cache import cache_geometry
+from backend.code_trace.memo import memo_property
 
 
 class PhysicalProjection:
@@ -55,45 +55,45 @@ class PhysicalProjection:
         self.analysis = analysis
         self._artifacts = artifacts
 
-    @cached_property
+    @memo_property
     def artifacts(self) -> Tuple[PhysicalArtifact, ...]:
         """What each rank stores (`persistent.physical_artifacts`)."""
         return (physical_artifacts(self.analysis) if self._artifacts is None
                 else self._artifacts)
 
-    @cached_property
+    @memo_property
     def shapes(self) -> Layer[Shape]:
         """Per-rank tensor shapes (`physical.physical_shapes`)."""
         return self.analysis.physical_shapes()
 
-    @cached_property
+    @memo_property
     def kernel_shapes(self) -> Layer[Shape]:
         """Per-rank kernel geometry (`physical.physical_kernel_shapes`)."""
         return physical_kernel_shapes(self.analysis, self.shapes)
 
-    @cached_property
+    @memo_property
     def access_shapes(self) -> Layer[Shape]:
         """The buffers the kernels read (`physical.physical_access_shapes`)."""
         return physical_access_shapes(self.analysis, self.kernel_shapes)
 
-    @cached_property
+    @memo_property
     def cache_geometry(self) -> cache_mod.CacheGeometry:
         """Per-rank cache geometry (`physical_cache.cache_geometry`)."""
         return cache_geometry(self.analysis, shapes=self.shapes,
                               kernel_shapes=self.kernel_shapes)
 
-    @cached_property
+    @memo_property
     def traffic_geometry(self) -> traffic_mod.TrafficGeometry:
         """`physical_traffic_geometry`."""
         return physical_traffic_geometry(self.analysis, projection=self)
 
-    @cached_property
+    @memo_property
     def traffic(self) -> Layer[Any]:
         """`physical_traffic`."""
         return traffic_mod.derive(self.analysis,
                                   geometry=self.traffic_geometry)
 
-    @cached_property
+    @memo_property
     def cost_plan(self) -> "PhysicalCostPlan":
         """`physical_cost_plan`."""
         return physical_cost_plan(self.analysis, projection=self)

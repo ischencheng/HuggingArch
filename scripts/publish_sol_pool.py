@@ -12,7 +12,7 @@ import tarfile
 import tempfile
 import urllib.request
 
-from backend.fingerprint import engine_version
+from backend.fingerprint import cache_engine_version
 from backend.inference.sol_data import walkRecordSchema
 from backend.release_artifacts import INDEX_SCHEMA
 from backend.supabase_env import configured, service_role
@@ -31,10 +31,14 @@ def build(root: Path, destination: Path) -> int:
     manifests = sorted(root.glob("*/*/manifest.json"))
     if not manifests:
         raise ValueError(f"no SOL bundles under {root}")
+    # A bundle being written lives beside its key until it is swapped in
+    # (`SolPool._swapIn`: `<key>.<pid>.<thread>.new` / `.old`, the writer's
+    # lock `<key>.writer`); a key itself has no dot. Only bundles ship.
     files = sorted(
         path for path in root.rglob("*")
         if path.is_file() and path.name not in {
             ".bootstrap.json", ".writer"}
+        and "." not in path.relative_to(root).parts[1]
     )
     with destination.open("wb") as raw, gzip.GzipFile(
             filename="", mode="wb", fileobj=raw, mtime=0) as zipped, tarfile.open(
@@ -72,7 +76,7 @@ def publish(root: Path) -> str:
     base, key = service_role()
     base = base.rstrip("/")
     bucket = os.environ.get("HA_ARTIFACT_BUCKET", "sol-pool")
-    engine = engine_version()
+    engine = cache_engine_version()
     with tempfile.TemporaryDirectory(prefix="sol-pool-artifact.") as temporary:
         archive = Path(temporary) / "pool.tar.gz"
         manifests = build(root, archive)

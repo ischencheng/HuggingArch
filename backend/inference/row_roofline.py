@@ -106,7 +106,6 @@ import re
 from fractions import Fraction
 from dataclasses import dataclass
 from enum import Enum
-from functools import lru_cache
 from typing import (Any, Callable, Dict, Iterable, List, Mapping, NamedTuple,
                     Optional, Sequence, Tuple)
 
@@ -127,6 +126,7 @@ from .intensity import arithmetic_intensity, intensity_formula
 from .phase_formulas import (_collective_bytes_formula, _t_comm_formula_for_row,
                              _t_compute_formula_for_row,
                              _t_memory_formula_for_row, _t_op_formula_for_row)
+from backend.code_trace.memo import memoize
 
 #: The workload a point sets: the batch, the prompt, the output, the cached
 #: prefix and the verify width (`transforms.Workload.symbols`), the symbols
@@ -1437,7 +1437,7 @@ class CardForm:
             tuple(str(s) for s in d.get("sigs") or ()))
 
 
-@lru_cache(maxsize=4096)
+@memoize(maxsize=4096)
 def _sig_ladder(sig: str, fabric: Fabric) -> Tuple[Segment, ...]:
     """A collective signature's ladder on `fabric` (`CardForm.sigs`) —
     built at a unit step latency, so a segment's `latency_s` is the hops

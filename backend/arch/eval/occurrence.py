@@ -23,9 +23,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-from functools import cached_property
 from typing import (TYPE_CHECKING, Any, Dict, FrozenSet, Iterator, List,
                     Mapping, Optional, Tuple)
+from backend.code_trace.memo import memo_property
 
 if TYPE_CHECKING:
     from .program import Program
@@ -252,7 +252,7 @@ class OccurrenceGraph:
         return (edge for edge in self.pairs
                 if via is None or edge.via == via)
 
-    @cached_property
+    @memo_property
     def fan_in(self) -> Dict[Tuple[Occurrence, int],
                              Tuple[OccurrenceEdge, ...]]:
         """Each explicitly resolved input's sources, in fan-in order."""

@@ -9,10 +9,15 @@ walks for the same facts even though both were careful to walk only once
 *within* their own call.
 
 This is deliberately not the durable `WalkKey` tier (`measure.scope.of_walk`):
-it is a bounded, in-process derivation registry. It names the model's result
+it is a bounded, in-process derivation registry. It names the model's data
 version, the checkpoint config a binding may read, the deployment and the
 precision profile — the facts `StepCells` is a function of — and never a
-point, card price, framework view or measurement.
+point, card price, framework view or measurement. The code is not in the key:
+it cannot change under a live process. What a computation reads through an
+entry is filled lazily by whichever computation asks first, so the entry
+carries a growing trace (`code_trace.provider.Growing`) that every reader
+attaches to: a computation that reads walks another one built still depends
+on the code that built them.
 Framework bindings, pipeline stages and timed-stack projections are readers
 attached to a cell (`Cell.serving`, keyed there by exactly those facts), so a
 plan's measurable-launch projection and an estimate's served view share the
@@ -25,7 +30,8 @@ from dataclasses import dataclass, field
 import threading
 from typing import Any, Callable, Optional
 
-from backend.fingerprint import result_version
+from backend.code_trace.provider import Growing, provider
+from backend.fingerprint import data_version
 from backend.measure.cache import KeyedCache, MemoryBackend
 from backend.measure.scope import make_key
 
@@ -59,6 +65,8 @@ class SharedWalkCells:
     resolved: Any
     cells: StepCells
     key: WalkCellKey
+    #: The code every computation that read this entry ran.
+    trace: Growing = field(default_factory=Growing, repr=False)
     _readers: dict[str, Any] = field(default_factory=dict, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -84,16 +92,21 @@ def shared_walk_cells(resolved: Any, parallel: Any, precision: Any, *,
     `parallel` and `precision` are their canonical domain objects
     (`ParallelConfig`, `PrecisionProfile`), not request dictionaries: this is
     below the HTTP boundary, where spelling has already been resolved once.
-    The raw config is named beside the engine version because a framework
+    The raw config is named beside the data version because a framework
     binding may read checkpoint fields (the Mamba scan chunk, for example)
     that the model footprint digest does not change.
     """
-    key = WalkCellKey(model_id=model_id, version=result_version(resolved),
-                      config=json.dumps(resolved.config, sort_keys=True,
-                                        default=str, separators=(",", ":")),
-                      parallel=repr(parallel), precision=precision.key)
+    p = provider()
+    # The key is derivation, not a dependency of what the entry holds.
+    with p.untraced():
+        key = WalkCellKey(model_id=model_id, version=data_version(resolved),
+                          config=json.dumps(resolved.config, sort_keys=True,
+                                            default=str, separators=(",", ":")),
+                          parallel=repr(parallel), precision=precision.key)
 
     def build() -> SharedWalkCells:
         return SharedWalkCells(resolved, StepCells(), key)
 
-    return WALK_CELLS.get_or_compute(key.key(), build)
+    entry = WALK_CELLS.get_or_compute(key.key(), build)
+    p.attach(entry.trace)
+    return entry

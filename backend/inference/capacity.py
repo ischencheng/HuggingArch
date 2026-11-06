@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field, fields, replace
-from functools import cached_property
 from typing import (Callable, FrozenSet, Any, Dict, Iterable, Iterator, List,
                     Literal, Mapping, NamedTuple, Optional, Tuple, Union)
 
@@ -82,6 +81,7 @@ from .encode_phase import plan_encode
 from backend.measure.scope import NONE as NO_MEASUREMENTS
 from .walk_registry import shared_walk_cells
 from backend.arch.eval.analysis import Point
+from backend.code_trace.memo import memo_property
 
 _GB = 1024 ** 3
 
@@ -1299,14 +1299,14 @@ class CellBasis:
     _lock: Any = field(default_factory=threading.RLock)
     _views: Dict[FrozenSet[str], Tuple[Any, Any]] = field(default_factory=dict)
 
-    @cached_property
+    @memo_property
     def analysis(self) -> Any:
         """The one walk every budget scalar descends from (`_capacity_walk`)."""
         with self._lock:
             return _capacity_walk(self._resolved, self._parallel,
                                   self._precision, self._cells)
 
-    @cached_property
+    @memo_property
     def artifacts(self) -> Tuple[Any, ...]:
         """The walk's physical artifacts, every weight leaf's
         (`layout.persistent.physical_artifacts`)."""
@@ -1314,7 +1314,7 @@ class CellBasis:
         with self._lock:
             return physical_artifacts(self.analysis)
 
-    @cached_property
+    @memo_property
     def placement(self) -> Optional[StagePlacement]:
         """The pipeline stages' placement, None without pipeline parallelism."""
         with self._lock:

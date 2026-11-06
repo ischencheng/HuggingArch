@@ -80,7 +80,6 @@ retired syntax is not, and has to be regenerated.
 from __future__ import annotations
 
 from backend.arch.yaml_load import load_yaml
-import functools
 import pathlib
 import re
 from dataclasses import dataclass
@@ -102,6 +101,7 @@ from backend.arch.spec_parsing import (
     _RETIRED_IDENTITY_KEYS,
     _RETIRED_KV_KEYS,
 )
+from backend.code_trace.memo import memoize
 
 
 # Same condition the current schema accepts for `tied_weight.when`
@@ -122,7 +122,7 @@ SCHEMA_ERROR = "Schema error."
 _TABLES_PATH = pathlib.Path(__file__).with_name("spec_migrations.yaml")
 
 
-@functools.lru_cache(maxsize=1)
+@memoize(maxsize=1)
 def _tables() -> dict:
     with _TABLES_PATH.open(encoding="utf-8") as handle:
         return load_yaml(handle) or {}

@@ -14,9 +14,21 @@ import copy
 import pytest
 
 import backend.api.gallery_frontier as f
+from backend.code_trace.provider import recording
 from backend.inference.parallel_config import ParallelConfig
 from backend.inference.parallel_sweep import class_cards
 from backend.inference.sweep_grid import FRONTIER_BATCH_GRID, GALLERY_SEQ_LENS
+
+
+@pytest.fixture(autouse=True)
+def _one_computation():
+    """Each test drives the worker side of a Gallery job directly — the
+    fold, the read, a bundle written — so each is one recorded computation,
+    as the job it stands in for is (`measure.pool.submit` runs every job in
+    one: `code_trace.provider.run_recorded`). What it keeps is stored with
+    the code it ran."""
+    with recording():
+        yield
 
 
 def _pt(user, gpu, batch=1):

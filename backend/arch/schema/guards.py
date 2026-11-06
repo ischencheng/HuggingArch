@@ -7,6 +7,7 @@ from typing import (Optional,
                     Tuple)
 
 from backend.arch.quant_schemes import QUANT_SCHEMES
+from backend.code_trace.memo import memoize
 
 
 
@@ -57,10 +58,7 @@ _LITERAL_INT_DIVISION = re.compile(r"/\s*\d+")
 # Cached union of every registered scheme's metadata-sibling suffix
 # AND non-trivial weight-storage suffix. Computed once on first
 # access so the schemes registry has a chance to load.
-_QUANT_SUFFIX_BLACKLIST_CACHE: Optional[Tuple[str, ...]] = None
-
-
-
+@memoize(maxsize=1)
 def _quant_suffix_blacklist() -> Tuple[str, ...]:
     """Suffixes that mark a `parameter_vector` as quant metadata,
     derived from the registered schemes' `metadata_siblings` +
@@ -68,12 +66,8 @@ def _quant_suffix_blacklist() -> Tuple[str, ...]:
     must come from the engine via materialize, not be hand-coded in
     spec components.
     """
-    global _QUANT_SUFFIX_BLACKLIST_CACHE
-    if _QUANT_SUFFIX_BLACKLIST_CACHE is None:
-        _QUANT_SUFFIX_BLACKLIST_CACHE = tuple(sorted(
-            set(_quant_metadata_sibling_suffixes())
-            | set(_quant_storage_suffixes())))
-    return _QUANT_SUFFIX_BLACKLIST_CACHE
+    return tuple(sorted(set(_quant_metadata_sibling_suffixes())
+                        | set(_quant_storage_suffixes())))
 
 
 

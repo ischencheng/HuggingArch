@@ -149,7 +149,9 @@ def test_liveness_and_rows_write_one_book():
 
 
 def _entries():
-    return list(walk_registry.WALK_CELLS._backend._store.values())
+    # Each entry is stored beside its trace's id (`measure.cache.KeyedCache`).
+    return [stored["value"]
+            for stored in walk_registry.WALK_CELLS._backend._store.values()]
 
 
 def test_a_step_that_speculates_is_another_walk():

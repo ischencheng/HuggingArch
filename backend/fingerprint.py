@@ -14,6 +14,7 @@ spans every model (the gallery frontier request, `code_version`).
 from __future__ import annotations
 
 from backend.arch.yaml_load import load_yaml
+import functools
 import hashlib
 import json
 import pathlib
@@ -23,6 +24,8 @@ from typing import Any, ClassVar, Dict, FrozenSet, Iterator, Tuple
 
 
 from backend.arch.eval.program import Program
+from backend.code_trace import provider as code_trace_provider
+from backend.code_trace.source import normalized_py_source
 from backend.arch.eval.transforms import (rebind_decode_variants,
                                           splice_sampled_head)
 from backend.arch.loader import ResolvedSpec, strip_machine_paths
@@ -38,129 +41,22 @@ from backend.inference.materialize_cast import GRAFTED_OPS
 # ---------------------------------------------------------------------------
 
 
-def _docstring_spans(tree: Any, lines: list) -> list:
-    """(start, end) (lineno, CHAR col) spans of every module/class/function
-    docstring. Docstrings are documentation, not semantics — a doc typo fix
-    must not invalidate every cached result. (One engine file reads
-    ``__doc__`` for a CLI help string — no cached *result* depends on it.)
-
-    ast col offsets are UTF-8 BYTE offsets while tokenize / str indexing are
-    char-based — without the conversion, a non-ASCII docstring over-blanks
-    and erases the semantic code beside it from the hash."""
-    import ast
-
-    def _char_col(lineno: int, byte_col: int) -> int:
-        return len(lines[lineno - 1].encode("utf-8")[:byte_col].decode("utf-8"))
-
-    spans = []
-    # Only a Module / ClassDef / FunctionDef holds a docstring, and Python's
-    # grammar puts no statement inside an expression — so no def or class is
-    # reachable through an `ast.expr`, and an expression subtree cannot hold
-    # a docstring. Descending into one only costs: `ast.walk` visited all
-    # 523k AST nodes of the engine trees to find 3,028 docstrings, where the
-    # statements alone are 58k. Order is not part of the answer —
-    # `normalized_py_source` only ever blanks these spans, and blanking is
-    # order-independent.
-    pending = [tree]
-    while pending:
-        node = pending.pop()
-        pending.extend(child for child in ast.iter_child_nodes(node)
-                       if not isinstance(child, ast.expr))
-        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        body = node.body
-        if (
-            body
-            and isinstance(body[0], ast.Expr)
-            and isinstance(body[0].value, ast.Constant)
-            and isinstance(body[0].value.value, str)
-        ):
-            e = body[0].value
-            spans.append((
-                (e.lineno, _char_col(e.lineno, e.col_offset)),
-                (e.end_lineno, _char_col(e.end_lineno, e.end_col_offset)),
-            ))
-    return spans
-
-
-def normalized_py_source(src: str) -> str:
-    """Semantic form of a Python source file: comments, docstrings, trailing
-    whitespace and blank lines removed. Two files that differ only in those
-    normalize identical — so a comment typo fix or a reformat no longer
-    invalidates every cached engine result, while any change to names,
-    literals, or structure still does. Lines that are (partly) inside a
-    multi-line STRING LITERAL are content, not formatting: their text is
-    kept byte-exact (a blank line inside ``X = \"\"\"a\\n\\nb\"\"\"`` is a
-    different value than without it).
-
-    Version-stable by construction: positions come from ``ast.parse`` +
-    ``tokenize`` of the same source on the one supported interpreter
-    (``requires-python``), and both agree on docstring spans and COMMENT
-    tokens — a hard requirement now that cache keys are shared across
-    machines over the Supabase tier. Unparseable source falls back to the raw bytes (a
-    broken file still hashes distinctly)."""
-    import ast
-    import io
-    import tokenize
-
-    try:
-        tree = ast.parse(src)
-        raw_lines = src.splitlines()
-        spans = _docstring_spans(tree, raw_lines)
-        doc_spans = set(spans)
-        # Interior of a multi-line string literal: those lines' whitespace IS
-        # the value. Covers plain strings and f-strings (which lex as
-        # FSTRING_START…FSTRING_END).
-        protected: set = set()
-        fstring_start = None
-        for tok in tokenize.generate_tokens(io.StringIO(src).readline):
-            if tok.type == tokenize.COMMENT:
-                spans.append((tok.start, tok.end))
-            elif tok.type == tokenize.STRING:
-                if (tok.start, tok.end) not in doc_spans and tok.start[0] < tok.end[0]:
-                    # From the opening line (its tail is literal content) to
-                    # the line before the closing quotes.
-                    protected.update(range(tok.start[0], tok.end[0]))
-            elif tok.type == tokenize.FSTRING_START:
-                fstring_start = tok.start[0]
-            elif tok.type == tokenize.FSTRING_END and fstring_start is not None:
-                if fstring_start < tok.end[0]:
-                    protected.update(range(fstring_start, tok.end[0]))
-                fstring_start = None
-    except (SyntaxError, ValueError, tokenize.TokenError, IndentationError):
-        return "\x00raw\x00" + src
-
-    # Spanned text becomes spaces (so a docstring or comment contributes
-    # nothing but the layout around it). Only the lines a span touches are
-    # rewritten: of the engine's 105k lines, 21k are docstring and the rest
-    # are returned as read, so splitting every line into a list of single
-    # characters to blank those did the work of 4.9 MB to edit 0.8 MB.
-    blanked: Dict[int, str] = {}
-    for (l1, c1), (l2, c2) in spans:
-        for ln in range(l1, l2 + 1):
-            text = blanked.get(ln)
-            if text is None:
-                text = blanked[ln] = raw_lines[ln - 1]
-            lo = c1 if ln == l1 else 0
-            # Blanking never changes a line's length, so `len(text)` is the
-            # raw line's length however many spans already landed on it.
-            hi = min(c2 if ln == l2 else len(text), len(text))
-            if hi > lo:
-                blanked[ln] = text[:lo] + " " * (hi - lo) + text[hi:]
-    out = []
-    for i, raw in enumerate(raw_lines):
-        text = blanked.get(i + 1, raw)
-        if (i + 1) in protected:
-            out.append(text)  # literal content — byte-exact, even blank
-            continue
-        stripped = text.rstrip()
-        if stripped:
-            out.append(stripped)
-    return "\n".join(out)
-
-
 #: `backend/`, under which the engine trees live.
 _ROOT = pathlib.Path(__file__).resolve().parent
+
+
+def _key_derivation(fn: Any) -> Any:
+    """Run `fn` as key derivation: no recorded computation counts the code
+    it runs (`code_trace.provider.untraced`). Every version here names what
+    a cached value is keyed on, never what the value is: a computation that
+    asks for a key — or for a stamp — does not depend on how it is hashed,
+    and whether it ran the hashing or hit a memo of it would otherwise be
+    two traces of one computation."""
+    @functools.wraps(fn)
+    def run(*args: Any, **kwargs: Any) -> Any:
+        with code_trace_provider.provider().untraced():
+            return fn(*args, **kwargs)
+    return run
 
 
 def _engine_files(suffixes: Tuple[str, ...]) -> Iterator[pathlib.Path]:
@@ -205,6 +101,7 @@ def _hash_data(h: Any, skipped: FrozenSet[str]) -> None:
 
 
 @lru_cache(maxsize=1)
+@_key_derivation
 def engine_code_version() -> str:
     """Semantic hash of the engine's code alone: the normalized source of
     every `.py` under `backend/inference` and `backend/arch`. Global by
@@ -215,7 +112,14 @@ def engine_code_version() -> str:
     return h.hexdigest()[:16]
 
 
+# `GlobalHash` traces are this hash; the provider cannot import the engine
+# trees it describes, so the hash is named to it here. A lambda, so a test
+# that clears or patches `engine_code_version` is followed.
+code_trace_provider.use_engine_code_version(lambda: engine_code_version())  # noqa: PLW0108
+
+
 @lru_cache(maxsize=1)
+@_key_derivation
 def shared_data_version() -> str:
     """Hash of the engine data every model reads, or may read in a way its
     spec does not name: the dims / roles / cache-family / migration
@@ -228,6 +132,7 @@ def shared_data_version() -> str:
 
 
 @lru_cache(maxsize=1)
+@_key_derivation
 def engine_version() -> str:
     """Semantic hash of the estimation/rendering engine: normalized source of
     every ``.py`` under ``backend/inference`` and ``backend/arch`` (see
@@ -248,6 +153,7 @@ def engine_version() -> str:
     return h.hexdigest()[:16]
 
 
+@_key_derivation
 def spec_fingerprint(resolved: Any) -> str:
     """Per-model spec identity: a content hash of a *resolved* spec — its own
     params + inlined components, config-independent. Identical specs collide (as
@@ -405,9 +311,52 @@ _FOOTPRINTS: Dict[str, str] = {}
 _FOOTPRINTS_MAX = 4096
 
 
+def _key_code() -> str:
+    """The code half of a cache key: the engine's code hash when the
+    process's provider keys on the code (`GlobalHash`), else a constant — the
+    code is then each entry's trace (`backend.code_trace.provider`)."""
+    if code_trace_provider.provider().keys_code:
+        return engine_code_version()
+    return "code:traced"
+
+
+@_key_derivation
 def result_version(resolved: Any) -> str:
-    """The engine identity one model's cached result is keyed on: the code,
-    the shared data, and that model's own footprint (`ModelFootprint`)."""
+    """The engine identity one model's cached result is keyed on: the code
+    (`_key_code`), the shared data, and that model's own footprint
+    (`ModelFootprint`)."""
+    return hashlib.sha256("\x00".join((
+        _key_code(), shared_data_version(),
+        _footprint_digest(resolved))).encode()).hexdigest()[:16]
+
+
+@_key_derivation
+def cache_engine_version() -> str:
+    """`engine_version()` as a key or an artifact path names what spans every
+    model: exactly `engine_version()` when the provider keys on the code;
+    else the engine's data alone, the code being each entry's trace. A stamp
+    that reports which engine answered stays `engine_version()`."""
+    if code_trace_provider.provider().keys_code:
+        return engine_version()
+    h = hashlib.sha256(_key_code().encode())
+    _hash_data(h, frozenset({"models", "snapshots"}))
+    return h.hexdigest()[:16]
+
+
+@_key_derivation
+def data_version(resolved: Any) -> str:
+    """`result_version` without the code: the shared data and the model's
+    footprint. What a key names when the code half is answered elsewhere —
+    a process-local memo, whose code cannot change under it, or a trace
+    (`backend.code_trace.provider`)."""
+    return hashlib.sha256("\x00".join((
+        shared_data_version(), _footprint_digest(resolved))).encode()
+    ).hexdigest()[:16]
+
+
+def _footprint_digest(resolved: Any) -> str:
+    """`ModelFootprint(resolved).digest`, memoised by what it is a function
+    of."""
     footprint = ModelFootprint(resolved)
     inputs = hashlib.sha256(json.dumps([
         [spec_fingerprint(spec) for spec in footprint.specs],
@@ -418,6 +367,4 @@ def result_version(resolved: Any) -> str:
         if len(_FOOTPRINTS) >= _FOOTPRINTS_MAX:
             _FOOTPRINTS.clear()
         digest = _FOOTPRINTS[inputs] = footprint.digest
-    return hashlib.sha256("\x00".join((
-        engine_code_version(), shared_data_version(),
-        digest)).encode()).hexdigest()[:16]
+    return digest

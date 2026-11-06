@@ -58,7 +58,8 @@ from backend.arch.eval.transforms import Deployment
 from backend.arch.ops_registry import PENDING_OP_PATCH_ENV
 from backend.arch.validate._analysable import Refusal, grouped_findings
 from backend.arch.validate._orchestrator import GateOutcome
-from backend.fingerprint import result_version
+from backend.code_trace.provider import Trace, provider, recording
+from backend.fingerprint import data_version
 
 from .capacity import estimate_capacity
 from .framework_bindings import THEORY
@@ -233,9 +234,13 @@ def replay_one(config: dict, resolved: Any,
 _JOB: Optional[Tuple[dict, Any, Tuple[ReplayDeployment, ...]]] = None
 
 
-def _worker(index: int) -> Optional[Refusal]:
+def _worker(index: int) -> Tuple[Optional[Refusal], Trace]:
+    """One deployment in a pool worker, and the trace of what it ran there:
+    the worker's recording is not the parent's, so it ships back."""
     config, resolved, deployments = _JOB
-    return replay_one(config, resolved, deployments[index])
+    with recording() as rec:
+        outcome = replay_one(config, resolved, deployments[index])
+    return outcome, rec["trace"]
 
 
 # -- host-wide worker grant -------------------------------------------------
@@ -317,7 +322,10 @@ def replay(config: dict, resolved: Any,
             context = multiprocessing.get_context("fork")
             with ProcessPoolExecutor(max_workers=workers,
                                      mp_context=context) as pool:
-                outcomes = list(pool.map(_worker, range(len(deployments))))
+                outcomes = []
+                for outcome, trace in pool.map(_worker, range(len(deployments))):
+                    provider().merge(trace)
+                    outcomes.append(outcome)
                 return [r for r in outcomes if r is not None]
         except BrokenProcessPool as exc:
             raise OSError(f"validate replay pool broke: {exc}") from exc
@@ -341,12 +349,14 @@ def _pending_patch_hash() -> str:
 
 
 def memo_key(config: dict, resolved: Any) -> str:
-    """Everything the replay result depends on: the resolved spec and the
-    engine data it reads (model yaml and drafts as resolved, `result_version`),
-    the config, the engine code, a pending op proposal, and the replay's own
-    constants."""
+    """Everything the replay result depends on but the code: the resolved
+    spec and the engine data it reads (model yaml and drafts as resolved,
+    `data_version`), the config, a pending op proposal, and the replay's own
+    constants. The code is the entry's trace (`replay_result`)."""
+    with provider().untraced():
+        version = data_version(resolved)
     parts = [
-        result_version(resolved),
+        version,
         json.dumps(config, sort_keys=True, default=str),
         _pending_patch_hash(),
         json.dumps([asdict(REPLAY_WORKLOAD), MAX_DEGREE,
@@ -362,24 +372,32 @@ def _memo_path(key: str) -> Path:
 
 
 def _memo_read(key: str) -> Optional["ReplayResult"]:
-    """The memoised result, or None to replay: no entry, or one that does
-    not read back as a whole result (a partial write, an older layout)."""
+    """The memoised result, or None to replay: no entry, one that does not
+    read back as a whole result (a partial write, an older layout), or one
+    whose trace the code this process runs no longer satisfies."""
     path = _memo_path(key)
     if not path.is_file():
         return None
     try:
-        return ReplayResult.from_json(
-            json.loads(path.read_text(encoding="utf-8")))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        trace = Trace.from_json(data["trace"])
+        result = ReplayResult.from_json(data)
     except (ValueError, KeyError, TypeError) as exc:
         logger.warning("validate replay memo %s unreadable (%s); replaying",
                        path.name, exc)
         return None
+    p = provider()
+    if not p.valid(trace):
+        return None
+    p.merge(trace)
+    return result
 
 
-def _memo_write(key: str, result: "ReplayResult") -> None:
+def _memo_write(key: str, result: "ReplayResult", trace: Trace) -> None:
     path = _memo_path(key)
     tmp = path.with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(result.to_json()), encoding="utf-8")
+    tmp.write_text(json.dumps({**result.to_json(), "trace": trace.to_json()}),
+                   encoding="utf-8")
     tmp.replace(path)
 
 
@@ -419,11 +437,12 @@ def replay_result(config: dict, resolved: Any) -> ReplayResult:
     cached = _memo_read(key)
     if cached is not None:
         return cached
-    deployments = product_deployments(resolved)
-    result = ReplayResult(
-        tuple((d.label, _describe(d.parallel)) for d in deployments),
-        tuple(replay(config, resolved, deployments)))
-    _memo_write(key, result)
+    with recording() as rec:
+        deployments = product_deployments(resolved)
+        result = ReplayResult(
+            tuple((d.label, _describe(d.parallel)) for d in deployments),
+            tuple(replay(config, resolved, deployments)))
+    _memo_write(key, result, rec["trace"])
     return result
 
 
