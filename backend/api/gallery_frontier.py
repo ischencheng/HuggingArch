@@ -725,8 +725,7 @@ def _measured_rates(core: dict,
                              "per_gpu": meas["per_gpu"]}
         if "decode" in item["measures"]:
             coverage.add(i, dec["coverage"])
-    for key, value in getattr(measureAt, "timings", {}).items():
-        timings[key] = value
+    timings.update(getattr(measureAt, "timings", {}))
     return {"rates": rates, "coverage": coverage.to_json(),
             "timings": timings}
 

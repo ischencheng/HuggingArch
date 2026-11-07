@@ -279,7 +279,7 @@ def lookup(scope: MeasurementScope, keys: Sequence[Any], *,
     excluded = 0
     if missing:
         started = time.perf_counter()
-        out, request_s = _call("POST", "/internal/bench/lookup", timed=True, json={
+        out, _request_s = _call("POST", "/internal/bench/lookup", timed=True, json={
             "keys": [key_json(k) for k in missing], "owner": scope.owner,
             "snapshot": scope.snapshot}, timeout=lookup_timeout(len(missing), timeout))
         service_s = float(out.get("service_s") or 0.0)
