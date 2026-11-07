@@ -21,10 +21,12 @@ export type FrontierCoverage = {
 };
 
 /** A frontier entry's measured track: whether Kernel Bench rows were read
- *  (`reads`), the server reads none (`none`), or the lake could not be
- *  read (`unavailable`); coverage by context only when read. */
+ *  (`reads`), the server reads none (`none`), the lake could not be read
+ *  (`unavailable`), or our fold has an engine error (`engine_error`);
+ *  coverage by context only when read. */
 export type FrontierMeasuredTrack = {
-  state: "reads" | "none" | "unavailable";
+  state: "reads" | "none" | "unavailable" | "engine_error";
+  error?: string;
   coverage?: Record<string, FrontierCoverage>;
 };
 
@@ -79,6 +81,7 @@ function whyNone(rows: CoverageRow[], speculative: boolean): string | null {
   if (speculative) return "Speculative decoding is on: Kernel Bench measures the plain decode step, so there is no measured track to cover.";
   if (rows.some((r) => r.track?.state === "reads")) return null;
   if (rows.some((r) => r.track?.state === "unavailable")) return "The Kernel Bench lake could not be read; coverage is unknown, not zero.";
+  if (rows.some((r) => r.track?.state === "engine_error")) return "A measured-fold engine error occurred; SOL is shown while the error is investigated.";
   if (rows.some((r) => r.track?.state === "none")) return "This server reads no Kernel Bench measurements.";
   return null;
 }
@@ -129,7 +132,12 @@ export function CoverageTable({
                     {r.label}
                   </span>
                   {r.track?.state !== "reads" ? (
-                    <span className="text-gray-400">{r.track?.state === "unavailable" ? "lake unreadable" : "not read"}</span>
+                    <span
+                      className={r.track?.state === "engine_error" ? "text-red-600" : "text-gray-400"}
+                      title={r.track?.error}
+                    >
+                      {r.track?.state === "unavailable" ? "lake unreadable" : r.track?.state === "engine_error" ? "measured-fold error" : "not read"}
+                    </span>
                   ) : !cov || !cov.points || cov.median == null ? (
                     <span className="text-gray-400">no frontier at this context</span>
                   ) : (

@@ -164,7 +164,7 @@ pareto_front = _pareto_front
 # drawn view). A drawing's fields change without the entry's, and an entry is
 # priced again only when its own do.
 _FRONTIER_SCHEMA = "gallery-frontier-v12"
-_DRAWING_SCHEMA = "gallery-frontier-drawing-v3"
+_DRAWING_SCHEMA = "gallery-frontier-drawing-v4"
 _GALLERY_SELECTION = "envelope"
 #: The precision profile every frontier is priced under: as shipped.
 _GALLERY_PRECISION = AS_SHIPPED
@@ -867,9 +867,9 @@ def _draw(core: dict, view: FrontierView, state: str,
 class MeasurementFoldMismatch(ValueError):
     """A kept SOL entry and the current measurement fold disagree on points.
 
-    Measurement overlays are live state, while a pre-materialized SOL entry
-    can outlive one lake snapshot. The SOL drawing remains valid; the
-    measured overlay must be dropped rather than failing the whole page.
+    This is an engine bug, not a lake state: the SOL drawing remains valid,
+    but the degraded measured drawing is neither cached nor labelled as if
+    Kernel Bench had been unreadable.
     """
 
 
@@ -881,18 +881,27 @@ def _point_coverage(cov: dict, i: int, core: dict) -> list:
     got = cov["points"].get(str(i))
     if got is None:
         t = core["_theory"][i]
+        decode = t["sol"]["phases"]["decode"]
         raise MeasurementFoldMismatch(
             f"frontier point {t['label']} at {t['seq']} "
+            f"batch {decode.get('batch')} (K={_stepDraftTokens(decode)}) "
             "has no decode measure to fold")
     return got
 
 
 def _rates_cover(core: dict, rates: dict) -> bool:
-    """Whether a kept rates entry has a fold for every point in this entry."""
+    """Whether a rates entry folds every plain point in this entry.
+
+    A draft-only capacity point is a K-step stored for K views; its binding
+    is the one statement of which step it is. The measured rates are the
+    plain decode track, so their coverage obligation is exactly K=0.
+    """
     try:
         coverage = rates.get("coverage") or {}
-        for i in range(len(core.get("_theory") or [])):
-            _point_coverage(coverage, i, core)
+        for i, point in enumerate(core.get("_theory") or []):
+            decode = point["sol"]["phases"]["decode"]
+            if not _stepDraftTokens(decode):
+                _point_coverage(coverage, i, core)
     except (MeasurementFoldMismatch, KeyError, TypeError):
         return False
     return True
@@ -1044,10 +1053,18 @@ class _Stored(NamedTuple):
                     if rates is None or not _rates_cover(core, rates):
                         raise MeasurementFoldMismatch(
                             "the fold did not cover every frontier point")
-                except (MeasurementsUnavailable, MeasurementFoldMismatch) as e:
+                except MeasurementsUnavailable as e:
                     logger.warning("gallery frontier: %s: measured track "
                                    "dropped: %s", self.model_id, e)
                     scope, state = NO_MEASUREMENTS, "unavailable"
+                except MeasurementFoldMismatch as e:
+                    logger.error(
+                        "gallery frontier engine bug: %s: measured fold "
+                        "did not cover the plain frontier: %s", self.model_id,
+                        e, exc_info=e)
+                    out = _draw(core, view, "engine_error", None)
+                    out["measured_track"]["error"] = str(e)
+                    return _labelled(out, "engine_error")
                 else:
                     if key:
                         _FRONTIER_VIEWS.put(key, rates)

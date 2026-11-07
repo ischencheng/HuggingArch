@@ -441,7 +441,7 @@ list.
 | `/inference/estimate` `phases.<phase>` | `t_measured_s` (null unless complete), `coverage`, and the older `measured_rows` / `total_rows` (the page falls back to these, with no states, when `coverage` is absent) |
 | `/inference/estimate-sweep`, each point's `phases.<phase>` | The same after a measured fold; its SOL projection carries no breakdown row counts |
 | `/inference/estimate-parallel-sweep`, each chart point | `<phase>_tps_per_gpu_measured`, `<phase>_t_measured_s` (null unless complete), `<phase>_measured_coverage` |
-| `/gallery/frontier`, each model | `frontier_measured` (through fully measured points only), `measured_track.state` (`reads` / `none` / `unavailable`) and, when it reads, `measured_track.coverage` per context (points, complete points, best and median share, keys most needed per state) |
+| `/gallery/frontier`, each model | `frontier_measured` (through fully measured points only), `measured_track.state` (`reads` / `none` / `unavailable` / `engine_error`) and, when it reads, `measured_track.coverage` per context (points, complete points, best and median share, keys most needed per state) |
 | Per-op rows (`per_op_timing*`, `phases.<phase>.flops_by_module`) | `t_measured_s` (`0` on zero-cost rows, null where not measured), `measured_state`, `measured_key` |
 
 ## 7. Caching: theory and measured answers

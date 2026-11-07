@@ -318,6 +318,25 @@ def test_a_plain_view_omits_a_batch_served_only_by_the_draft(monkeypatch):
                 "speculative_draft_tokens"] == 0 else None),
         None)
     assert set(folded) <= {1, 2}
+    rates = f._measured_rates(
+        entry, lambda _i, point: (
+            {"any": 1}
+            if point["sol"]["phases"]["decode"]["binding"][
+                "speculative_draft_tokens"] == 0 else None),
+        None)
+    assert f._rates_cover(entry, rates)
+
+    from backend.measure.scope import MeasurementScope
+    monkeypatch.setattr(f, "_frontier_scope", lambda: (
+        MeasurementScope(None, "lake", 1, 1, "r"), "reads"))
+    monkeypatch.setattr(
+        f, "_measureReader",
+        lambda _core, _gpu, _timings: lambda _i, point: (
+            {"any": 1}
+            if point["sol"]["phases"]["decode"]["binding"][
+                "speculative_draft_tokens"] == 0 else None))
+    plain = f._read_entry(entry, f.FrontierView("B200"))
+    assert plain["measured_track"]["state"] == "reads"
 
 
 def test_a_model_with_no_mtp_draft_reads_an_empty_speculative_frontier():
@@ -712,9 +731,9 @@ def test_floors_and_k_read_the_entry_but_never_its_measure_records(
 
 
 def test_an_entry_missing_its_measure_record_draws_sol(monkeypatch, tmp_path):
-    """A record the artifact did not carry is a missing measured overlay, not
-    a second Gallery key table: the SOL entry still draws, measured reads are
-    labelled unavailable, and no walk is started to paper over the cache."""
+    """A record the artifact did not carry is an engine/deployment error, not
+    a second Gallery key table or a lake outage: the SOL entry still draws
+    and no walk is started to paper over the cache."""
     entries, _reads, _folds = _kept(monkeypatch, tmp_path)
     plan, results = _built_entry(monkeypatch)
     model = "test/Model"
@@ -729,7 +748,8 @@ def test_an_entry_missing_its_measure_record_draws_sol(monkeypatch, tmp_path):
     monkeypatch.setattr(f, "_layout_law", lambda *_a, **_k: (_ for _ in ()).throw(
         AssertionError("walked")))
     got = f._frontier_read(model, f.FrontierView("B200"))
-    assert got["drawn"]["measured_track"] == {"state": "unavailable"}
+    assert got["drawn"]["measured_track"]["state"] == "engine_error"
+    assert "did not cover" in got["drawn"]["measured_track"]["error"]
     assert got["drawn"]["frontier"][str(GALLERY_SEQ_LENS[0])]
     # A view that reads no measurements draws off the same entry.
     assert "drawn" in f._frontier_read(model, f.FrontierView("B200", draft_tokens=1))
@@ -916,14 +936,15 @@ def test_a_frontier_point_the_fold_did_not_reach_is_refused(monkeypatch):
 
     A point no measure reached cannot be reported as zero coverage, and one
     stale/partial overlay must not 500 the entire Gallery response. The SOL
-    drawing remains valid and is labelled unavailable for this read.
+    drawing remains valid and is labelled as an engine error for this read.
     """
     sk = str(GALLERY_SEQ_LENS[0])
     item = _covered_item(sk, batch=1, tpot=0.01, coverage={"measured": 0, "total": 2})
     item.pop("measures")
     out = _read_folded(monkeypatch, [item])
     assert out["frontier"][sk]
-    assert out["measured_track"] == {"state": "unavailable"}
+    assert out["measured_track"]["state"] == "engine_error"
+    assert "did not cover" in out["measured_track"]["error"]
 
 
 def test_no_coverage_when_the_lake_is_unavailable(monkeypatch):
@@ -1031,6 +1052,39 @@ def test_a_fold_the_lake_drops_keeps_the_sol_drawing(monkeypatch, tmp_path):
     reads.clear()
     assert f._frontier_read(model, view) == {"drawn": built}
     assert reads == []
+
+
+def test_a_fold_mismatch_is_an_engine_error_not_a_lake_outage(
+        monkeypatch, tmp_path):
+    """A deterministic coverage hole is our bug, not Kernel Bench's state.
+
+    The SOL drawing still ships, but the degraded drawing is labelled
+    `engine_error` and is not kept: a later request must retry the fold
+    rather than read back what looks like an unavailable lake.
+    """
+    _kept(monkeypatch, tmp_path)
+    plan, results = _built_entry(monkeypatch)
+    model, view = "test/Model", f.FrontierView("B200")
+    sk = str(GALLERY_SEQ_LENS[0])
+
+    def incomplete(core, _measureAt, _scope):
+        plain = [str(i) for i, point in enumerate(core["_theory"])
+                 if not f._stepDraftTokens(point["sol"]["phases"]["decode"])]
+        return {"rates": {}, "timings": {},
+                "coverage": {"keys": [], "points": {
+                    i: [1, 1, []] for i in plain[1:]}}}
+
+    monkeypatch.setattr(f, "_measured_rates", incomplete)
+    built = f._finish_frontier(model, view, plan, results)
+    assert built["measured_track"]["state"] == "engine_error"
+    assert "did not cover" in built["measured_track"]["error"]
+    assert built["frontier"][sk]
+    assert built["frontier_measured"][sk] == []
+    stored = f._Stored(model, "v1")
+    assert f._FRONTIER_VIEWS.get(stored.view_key(
+        view, f.NO_MEASUREMENTS, "engine_error")) is None
+    assert f._FRONTIER_VIEWS.get(stored.view_key(
+        view, f.NO_MEASUREMENTS, "unavailable")) is None
 
 
 def test_one_request_reads_the_lake_once(monkeypatch):
