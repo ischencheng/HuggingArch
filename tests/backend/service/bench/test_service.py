@@ -257,27 +257,45 @@ class TestVersion:
                 report["rows_rejected"]) == (1, 1, 0)
 
 
-def test_rules_rev_covers_the_annotation_closure():
-    """The revision hashes every module the annotation rules can run —
-    `current_shape`'s and `project_shape_for_op`'s module, the signature
-    catalog, the canonicalization, kernel_bench's catalog — not only the
-    entry points."""
-    import ast
-    seen = set()
-    seen.add("backend.service.bench.data_rules")
-    todo = list(A.rule_roots())
-    while todo:
-        name = todo.pop()
-        if name in seen or A._module_file(name) is None:
-            continue
-        seen.add(name)
-        todo.extend(A._imports(A._module_file(name), name))
-    for module in ("backend.inference.benchmark_identity", "backend.inference.op_signatures",
-                   "backend.inference.op_signatures_catalog", "backend.arch.spec_migrate",
-                   "backend.service.bench.store", "backend.service.bench.data_rules",
-                   "kernel_bench.providers"):
-        assert module in seen, module
-    assert ast and len(A.rules_rev()) == 16
+def test_rules_rev_follows_the_declared_rule_boundary(monkeypatch):
+    """Connection and lookup execution code is infrastructure; the validator
+    and physical identity are rules.  The revision must say which is which."""
+    from pathlib import Path
+    from importlib import import_module
+    from backend.service.bench import lake as bench_lake
+    from backend.service.bench import lookup as bench_lookup
+    from backend.service.bench import rules_revision
+    from backend.inference import benchmarks
+    from backend.inference.op_calibration import physical_identity
+
+    owners = {entry.owner.__module__ if callable(entry.owner)
+              else entry.owner.__name__ for entry in rules_revision.rule_inputs()}
+    assert "backend.inference.benchmarks" in owners
+    assert "backend.inference.op_calibration" in owners
+    assert "backend.service.bench.data_rules" in owners
+    assert not {"backend.service.bench.lake", "backend.service.bench.lookup",
+                "backend.service.bench.serving"} & owners
+
+    def with_probe(path: Path, marker: str) -> str:
+        rules_revision.rules_rev.cache_clear()
+        original = path.read_bytes()
+        path.write_bytes(original + f"\n# {marker}\n".encode())
+        try:
+            rules_revision.rules_rev.cache_clear()
+            return rules_revision.rules_rev()
+        finally:
+            path.write_bytes(original)
+            rules_revision.rules_rev.cache_clear()
+
+    assert with_probe(Path(bench_lake.__file__), "connection-budget probe") == (
+        rules_revision.rules_rev())
+    assert with_probe(Path(bench_lookup.__file__), "lookup execution probe") == (
+        rules_revision.rules_rev())
+    assert with_probe(Path(benchmarks.__file__), "validator probe") != (
+        rules_revision.rules_rev())
+    identity_module = import_module(physical_identity.__module__)
+    assert with_probe(Path(identity_module.__file__),
+                      "physical identity probe") != rules_revision.rules_rev()
 
 
 def test_repeated_op_shapes_compute_their_physical_identity_once(monkeypatch):

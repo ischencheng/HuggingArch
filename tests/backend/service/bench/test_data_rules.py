@@ -12,7 +12,7 @@ from backend.service.bench import data_rules, store
 
 def test_the_registered_chain_reaches_the_live_rule_code():
     """A key or validator edit must be registered, not left to fork a lake."""
-    from backend.service.bench.annotations import rules_rev
+    from backend.service.bench.rules_revision import rules_rev
 
     manifest = json.loads(
         (Path(data_rules.__file__).parent / "data_rules_version.json").read_text())

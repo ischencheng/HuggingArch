@@ -69,13 +69,13 @@ from backend.service import profiles as _profiles
 from backend.service.bench.annotations import (
     registered_kernels,
     row_annotations,
-    rules_rev,
 )
 from backend.service.bench import browse as _browse
 from backend.service.bench import identity as _identity
 from backend.service.bench import lake as _lake_mod
 from backend.service.bench import lookup as _lookup
 from backend.service.bench import maintain as _maintain
+from backend.service.bench.rules_revision import rules_rev
 from backend.service.bench import serving as _serving
 from backend.service.bench import sets as _sets
 from backend.service.bench import store as _store

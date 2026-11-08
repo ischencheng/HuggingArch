@@ -1,7 +1,7 @@
 r"""Registered data-format migrations for the authoritative measurement lake.
 
 The format of a lake row has one owner: the key and validator code named by
-`annotations.rules_rev`.  A deployment cannot describe that revision by hand; it
+`rules_revision.rules_rev`.  A deployment cannot describe that revision by hand; it
 registers the chain of migrations it knows how to apply in
 `data_rules_version.json`.  The registration's final target is compared with
 the live revision by a test, so changing a key, a validator, or shared-data
@@ -29,6 +29,7 @@ from typing import Any, Mapping
 
 from backend.inference import benchmarks
 from backend.service.bench import store
+from kernel_bench import rekey_lake
 
 _LOG = logging.getLogger(__name__)
 _HERE = Path(__file__).parent
@@ -37,6 +38,7 @@ _MANIFEST = json.loads((_HERE / "data_rules_version.json").read_text())
 _MIGRATIONS = tuple(_MANIFEST["migrations"])
 _SCAN_ROWS = 5_000
 _REKEY_ROWS = 25
+rekey_apply = rekey_lake.apply
 
 
 class DataRulesError(RuntimeError):
@@ -145,7 +147,6 @@ def _duplicate_shared_rows(lake: Any) -> int:
 def _apply_registered(step: Mapping[str, Any], lake: Any) -> MigrationResult:
     rekeyed = 0
     if step.get("rekey_plan"):
-        from kernel_bench import rekey_lake
         path = _HERE / "migrations" / str(step["rekey_plan"])
         rewrites = [(dict(group), new)
                     for group, new in json.loads(path.read_text())]
@@ -153,7 +154,7 @@ def _apply_registered(step: Mapping[str, Any], lake: Any) -> MigrationResult:
         # slices keeps the whole-lake UPDATE inside the service's DuckDB memory
         # budget; an interrupted slice simply matches no rows when replayed.
         for start in range(0, len(rewrites), _REKEY_ROWS):
-            rekeyed += int(rekey_lake.apply(
+            rekeyed += int(rekey_apply(
                 lake, rewrites[start:start + _REKEY_ROWS]))
     env_rekeyed = int(store.rekey_env(lake)) if step.get("rekey_env") else 0
     dropped, reasons = (_invalid_rows(lake)

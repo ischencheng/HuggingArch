@@ -388,15 +388,30 @@ inputs' annotations before it commits them, so a committed row always has
 them. An input the rules refuse has no `annot` entry: its rows are visible
 in row views but belong to no envelope.
 
-A change to the annotation rules or catalogs takes effect at the next
-service start. `annotations.rules_rev` names the data format's revision: a
-hash of the source of every repository module the rules can run (their import
-closure), the registered migration owner (`data_rules.py`), the engine's
-shared data version, and the loaded signature and kernel catalogs. It is part
-of every measurement scope (§7.1). A key, validator, shared-data, or migration
-change that can make an older lake invalid must extend the registered chain
-and regenerate `data_rules_version.json`; `test_data_rules.py` turns an
-unregistered edit red.
+A change to the annotation rules or catalogs takes effect at the next service
+start. `rules_revision.rules_rev` names the data format's revision from the
+semantic owners declared by `rules_revision.rule_inputs`:
+
+| Input | Why it can change a row or its key |
+|---|---|
+| `annotations.row_annotations`, `registered_kernels`, provider `catalog_kernel` | input annotations and the implementation catalog |
+| `benchmark_identity.current_shape`, `measured_row_migration`, `workload_coordinates` | retired/derived shape axes and workload coordinates |
+| `op_calibration.physical_identity` | signature and physical-shape projection |
+| `store.canonical_json` and the storage schema in that module | canonical identity JSON and row storage format |
+| `benchmarks.validate_row`, `row_identity` | row validity and duplicate identity |
+| dtype, activation-format, eval-format, and measured-row migration modules | vocabulary and migrations the validator/key derivation reads |
+| loaded `all_signatures()` and `registered_kernels()` | signature and kernel catalogs as data |
+| `data_rules.migrate` and `kernel_bench.rekey_lake.apply` | the migration algorithm itself |
+| `shared_data_version()` | shared migration tables read by `current_shape` |
+
+The revision hashes the source module of each declared owner, not that owner's
+transitive import closure. Connection, budget, startup, HTTP, and lookup
+execution modules are deliberately outside the boundary. It is part of every
+measurement scope (§7.1). A key, validator, shared-data, or migration change
+that can make an older lake invalid must extend the registered chain and
+regenerate `data_rules_version.json`; `test_data_rules.py` turns an
+unregistered edit red, and `test_service.py` proves lake/lookup execution
+edits do not move the revision while validator/physical-identity edits do.
 
 ### 4.3 Writes
 
@@ -1021,7 +1036,8 @@ new development lake instead.
 | Replacement lake lineage | `tools/reidentify_authoritative_lake.py`, `supabase/migrations/0027_bench_lake_transfer_lineage.sql` |
 | Backup and restore | `backend/service/bench/backup.py`, `scripts/bench_lake_backup_now.py` |
 | Maintainer | `backend/service/bench/maintain.py` |
-| Annotation rules, kernel catalog, `rules_rev` | `backend/service/bench/annotations.py` |
+| Annotation rules and kernel catalog | `backend/service/bench/annotations.py` |
+| Data-rules revision boundary | `backend/service/bench/rules_revision.py` |
 | Kernel Bench HTTP routes | `backend/service/bench/routes.py` |
 | Service process, trust boundary | `backend/service/bench/server.py`, `backend/service/bench/identity.py` |
 | API proxy | `backend/service/bench_proxy.py` |
