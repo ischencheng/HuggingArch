@@ -178,6 +178,22 @@ def test_health_carries_the_services(client, service):
     assert detail["state"] == "up" and detail["status"] == "ok" and "lake" in detail
 
 
+def test_an_unmigrated_lake_is_degraded_at_the_api_level(client, route_to):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/health"
+        return httpx.Response(200, json={
+            "status": "ok",
+            "lake": {"state": "degraded",
+                     "reason": "the lake's data rules are legacy; migrating",
+                     "data_rules": {"state": "behind"}},
+        })
+
+    route_to(httpx.MockTransport(handler))
+    detail = client.get("/health").json()["detail"]["kernel_bench"]
+    assert detail["state"] == "degraded"
+    assert detail["lake"]["data_rules"]["state"] == "behind"
+
+
 def test_the_response_headers_are_the_services_own(client, route_to):
     def handler(request):
         return httpx.Response(200, content=b"a,b\n1,2\n", headers={

@@ -50,7 +50,7 @@ from typing import Callable, Optional
 import httpx
 
 from backend import supabase_env, supabase_rest
-from backend.service.bench import store
+from backend.service.bench import data_rules, store
 from backend.service.bench import backup as _backup
 from backend.service.bench.backup import Backup, BackupConfig, Trigger
 from backend.service.bench.lake import Lake, LakeConfig, LakeUnavailable, get_lake
@@ -150,6 +150,14 @@ class _Refused(Exception):
         self.transient = transient
 
 
+class _Degraded(Exception):
+    """Startup put the lake in a named degraded state; retrying may help."""
+
+    def __init__(self, reason: str, *, transient: bool = True):
+        super().__init__(reason)
+        self.transient = transient
+
+
 class Gate:
     """The process's Kernel Bench lake behind the startup checks."""
 
@@ -164,9 +172,11 @@ class Gate:
         self._restore = restore
         self._on_serving, self._clock = on_serving, clock
         self._guard = threading.Lock()
-        self.phase = "new"         # new | starting | serving | unavailable
+        self.phase = "new"         # new | starting | serving | degraded | unavailable
         self.reason = ""
         self.lease_state = "unknown"
+        self.data_rules = {"state": "unknown",
+                           "registered": data_rules.registered_version()}
         self._retry_at: Optional[float] = None
         self.lake: Optional[Lake] = None
         self.backup: Optional[Backup] = None
@@ -189,6 +199,8 @@ class Gate:
             self._unavailable(str(e), transient=e.transient)
         except (LakeUnavailable, LeaseUnreachable) as e:
             self._unavailable(str(e), transient=True)
+        except _Degraded as e:
+            self._degraded(str(e), transient=e.transient)
         except Exception as e:
             _LOG.exception("bench lake startup failed")
             self._unavailable(f"startup failed: {type(e).__name__}: {e}", transient=True)
@@ -198,6 +210,27 @@ class Gate:
         with self._guard:
             self.phase, self.reason = "unavailable", reason
             self._retry_at = self._clock() + RETRY_AFTER if transient else None
+
+    def _degraded(self, reason: str, *, transient: bool) -> None:
+        _LOG.error("Kernel Bench store degraded: %s", reason)
+        with self._guard:
+            self.phase, self.reason = "degraded", reason
+            self._retry_at = self._clock() + RETRY_AFTER if transient else None
+
+    def _set_data_rules(self, state: str, *, lake: str | None = None,
+                        migration: dict | None = None, error: str | None = None,
+                        phase: tuple[str, str] | None = None) -> None:
+        """Publish the migration owner's in-memory answer without reading the lake."""
+        with self._guard:
+            self.data_rules = {
+                "state": state,
+                "registered": data_rules.registered_version(),
+                **({"lake": lake} if lake is not None else {}),
+                **({"migration": migration} if migration is not None else {}),
+                **({"error": error} if error is not None else {}),
+            }
+            if phase is not None:
+                self.phase, self.reason = phase
 
     def _startup(self) -> None:
         try:
@@ -220,6 +253,7 @@ class Gate:
                     raise _Refused(f"not the authoritative lake (an empty lake; the lease names lake "
                                    f"{holder}) — restore it from backup")
             store.ensure_schema(lake, lake_id=str(uuid.uuid4()), import_state="none")
+            data_rules.initialize(lake)
         meta = store.meta(lake)
         if "lake_id" not in meta:        # a lake made before lake_meta (tests, scripts)
             store.set_meta(lake, lake_id=str(uuid.uuid4()), import_state="none")
@@ -229,14 +263,34 @@ class Gate:
                            "and those tables are gone — restore the lake from backup")
         if lease is not None:
             self._claim(lease, meta["lake_id"], here)
+        before = data_rules.lake_version(lake)
+        if not data_rules.known_version(before):
+            reason = (f"the lake's data rules are {before!r}, outside this "
+                      f"deployment's registered chain")
+            self._set_data_rules("failed", lake=before, error=reason)
+            raise _Degraded(f"the lake's data rules did not migrate: {reason}",
+                            transient=False)
+        if before != data_rules.registered_version():
+            self._set_data_rules(
+                "behind", lake=before,
+                phase=("degraded", f"the lake's data rules are {before}; migrating"))
         # A lake written before annotations moved to memory (docs/measured_calibration.md §4.2) still
         # has them as `inputs` columns, and an upload's insert of the key
         # alone fails against them: drop them (idempotent; after the lease,
         # like every other write).
         store.ensure_schema(lake)
-        rekeyed = store.rekey_env(lake)
-        if rekeyed:
-            _LOG.warning("bench lake: %d rows rekeyed to the envelope key without parallel", rekeyed)
+        try:
+            migrated = data_rules.migrate(lake)
+        except Exception as e:
+            self._set_data_rules("failed", lake=before, error=f"{type(e).__name__}: {e}")
+            raise _Degraded(
+                f"the lake's data rules did not migrate: {type(e).__name__}: {e}",
+                transient=not isinstance(e, data_rules.DataRulesError)) from e
+        if before == data_rules.registered_version():
+            self._set_data_rules("current", lake=before)
+        else:
+            self._set_data_rules(
+                "current", lake=migrated.version, migration=migrated.report())
         store.annotate_all(lake, self._annotate)
         self._start_backups(lake)
         with self._guard:
@@ -301,7 +355,8 @@ class Gate:
     def health(self) -> dict:
         """For /health's detail: never raises."""
         out = {"state": self.phase, "reason": self.reason or None, "lease": self.lease_state,
-               "backup": self.backup.status() if self.backup is not None else "off"}
+               "backup": self.backup.status() if self.backup is not None else "off",
+               "data_rules": self.data_rules}
         try:
             free = self.lake.free_bytes() if self.lake is not None else None
             out["free_mb"] = None if free is None else free // 2**20

@@ -185,7 +185,9 @@ async def forward(request: Request) -> Response:
 
 async def bench_health() -> dict:
     """`/health`'s Kernel Bench detail: the service's own health (its lake's
-    state, never a lake read there), or why it cannot be had."""
+    state, never a lake read there), or why it cannot be had.  A lake that is
+    starting a required data migration, or failed one, is reported at this
+    level as `degraded`; `/health` must not call an unmigrated lake `up`."""
     base = measurements.service_url()
     if not base:
         return {"state": "not_configured"}
@@ -197,7 +199,13 @@ async def bench_health() -> dict:
         return {"state": "unreachable", "reason": f"{type(e).__name__}: {e}"}
     if r.status_code != 200:
         return {"state": "unreachable", "reason": f"the service answered {r.status_code}"}
-    return {"state": "up", **r.json()}
+    body = r.json()
+    out = dict(body)
+    out.setdefault("state", "up")
+    lake = out.get("lake")
+    if isinstance(lake, dict) and lake.get("state") in ("degraded", "unavailable"):
+        out["state"] = "degraded"
+    return out
 
 
 def install(app: Any, health_detail: Callable[[str, Any], None]) -> None:

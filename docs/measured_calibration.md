@@ -348,7 +348,7 @@ The lake stores four tables and nothing derived (`store.py`):
 | `batches` | One row per upload: `batch_id`, `owner`, `upload_id`, `piece`, `run_id`, `label`, `created_at`, `status` (§6.1), `within_peak`, `nominated_at`, `decided_at`, `decided_by`. Unique on `(owner, upload_id, piece)`. |
 | `inputs` | An input's identity only: `input_id` and the key `(op, phase, kernel_impl, shape_json)`. |
 | `measurements` | Every CSV column (`benchmarks.ALL_COLUMNS`, typed by `store.MEASUREMENT_TYPES`) plus `id` (UUID), `batch_id`, `input_id`, `env`, `created_at`. Written sorted by `(batch_id, input_id)`. |
-| `lake_meta` | The lake's own facts: `lake_id` (a UUID written when the lake is created), `import_state`, `lease_claimed_at`. |
+| `lake_meta` | The lake's own facts: `lake_id` (a UUID written when the lake is created), `import_state`, `lease_claimed_at`, `data_rules` and the last data-rules migration's report. |
 
 Ids are hashes of the identities they name, not counters
 (`md5_number_upper` over the identity's fields joined by `0x1F`), so two
@@ -359,15 +359,24 @@ row's `dtype_env_json` and `gpu` (`store.env_key`); the deployment
 shape (§4.2).
 
 A measurement is never updated after it is written, with two exceptions: the
-roofline columns may be restamped (§4.3), and a lake whose `env` was written
-under an older definition is rekeyed once at startup (`store.rekey_env`).
+roofline columns may be restamped (§4.3), and a registered data-rules migration
+may rekey an older lake (below). The migration owner is not an ad-hoc script:
+`backend/service/bench/data_rules.py` follows the chain registered in
+`data_rules_version.json`, whose final target is the live `rules_rev`, and a
+test refuses a key/validator edit whose target has not been registered. A
+brand-new lake is stamped with the current revision; an older lake is migrated
+after the lease is claimed and before annotations or serving. The heavy legacy
+dtype-env rewrite ships as `migrations/prod_rekey_plan.json` (the same plan
+`kernel_bench.rekey_lake` made offline), then today's validator is run over
+shared rows and rows it refuses are deleted through the owner deletion path.
+`data_rules` is written only after every registered step commits.
 
 ### 4.2 Annotations
 
 An input's **annotations** are the grouping labels the uploader does not
 state: `signature`, `physical_shape`, `workload_batch`, `workload_context`,
 `catalog_kernel` and `phys`. They are pure functions of the input under the
-current code (`routes.row_annotations`, composing `physical_identity`,
+current code (`annotations.row_annotations`, composing `physical_identity`,
 `workload_coordinates` and the provider catalog's `catalog_kernel`) and are
 **not stored**. At startup the service computes them for every input into an
 in-memory table `annot` (`store.annotate_all`); an upload adds its new
@@ -376,10 +385,14 @@ them. An input the rules refuse has no `annot` entry: its rows are visible
 in row views but belong to no envelope.
 
 A change to the annotation rules or catalogs takes effect at the next
-service start. `routes.rules_rev` names the rules' revision: a hash of the
+service start. `annotations.rules_rev` names the rules' revision: a hash of the
 source of every repository module the rules can run (their import closure),
 the engine's shared data version, and the loaded signature and kernel
 catalogs. It is part of every measurement scope (§7.1).
+A key, validator, or shared-data change that can make an older lake invalid
+must add a migration (or an explicit no-op step) to the registered chain and
+regenerate `data_rules_version.json`; `test_data_rules.py` turns an
+unregistered edit red.
 
 ### 4.3 Writes
 
@@ -621,6 +634,10 @@ The service's `/health` never reads the lake and never fails: it reports the
 gate's state and reason, the lease state, the backup's status (newest
 recoverable snapshot, lag, last error), free space, and lookup statistics
 (count, keys, rows, rows per key, the largest answer, refusals, the bound).
+The gate also reports `data_rules`: the registered revision, the lake's
+revision while a migration is pending, the completed migration's counts, or
+the migration error. A lake behind or failed is `degraded`, and the HA API's
+`kernel_bench` health carries that state instead of reporting the service up.
 The HA API's `/health` includes it (`bench_proxy.bench_health`, bounded at
 2 s).
 
@@ -919,13 +936,15 @@ backup directory).
 | Plan, run, check, upload CLI (`hbench`) | `kernel_bench/cli.py`, [`kernel_bench/README.md`](../kernel_bench/README.md) |
 | Lake instance, locks, content identity | `backend/service/bench/lake.py` |
 | Tables and writes | `backend/service/bench/store.py` |
+| Registered lake data-format migrations | `backend/service/bench/data_rules.py`, `backend/service/bench/data_rules_version.json` |
 | Kernel Bench page views | `backend/service/bench/browse.py` |
 | Batch pages | `backend/service/bench/sets.py` |
 | Estimate lookup (service side) | `backend/service/bench/lookup.py` |
 | Startup gate, lease, restore | `backend/service/bench/serving.py` |
 | Backup and restore | `backend/service/bench/backup.py`, `scripts/bench_lake_backup_now.py` |
 | Maintainer | `backend/service/bench/maintain.py` |
-| HTTP routes, annotation rules, `rules_rev` | `backend/service/bench/routes.py` |
+| Annotation rules, kernel catalog, `rules_rev` | `backend/service/bench/annotations.py` |
+| Kernel Bench HTTP routes | `backend/service/bench/routes.py` |
 | Service process, trust boundary | `backend/service/bench/server.py`, `backend/service/bench/identity.py` |
 | API proxy | `backend/service/bench_proxy.py` |
 | Measurement scope, result identity | `backend/measure/scope.py`, `backend/api/_access.py` |

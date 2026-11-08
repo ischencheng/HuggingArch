@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from collections import namedtuple
 
 import httpx
@@ -94,6 +95,8 @@ def test_a_new_lake_with_no_lease_holder_claims_it(env, opened, httpx_mock):
     assert gate.lease_state == "claimed" and served == [(lake, None)]
     req = httpx_mock.get_requests(method="POST", url=CLAIM_URL)[0]
     assert req.headers["apikey"] == TEST_SERVICE_KEY
+    assert meta["data_rules"] == serving.data_rules.registered_version()
+    assert gate.health()["data_rules"]["state"] == "current"
 
 
 def test_an_empty_lake_while_another_holds_the_lease_writes_nothing(env, opened, httpx_mock):
@@ -224,6 +227,82 @@ def test_a_lake_made_before_lake_meta_gets_an_identity(env, opened):
     gate = _gate(opened)
     meta = store.meta(gate.reader())
     assert meta["import_state"] == "none" and len(meta["lake_id"]) == 36
+
+
+def test_an_old_lake_migrates_its_data_rules_before_it_serves(
+        env, opened, make_rows, annotate, new_owner):
+    env.setenv("BENCH_LAKE_LEASE", "off")
+    lake = opened()
+    store.ensure_schema(lake, lake_id="x", import_state="none")
+    store.annotate_all(lake, annotate)
+    store.upload(lake, owner=new_owner(), upload_id=str(uuid.uuid4()), run_id=None,
+                 label=None, rows=make_rows(1), annotate=annotate)
+    assert "data_rules" not in store.meta(lake)
+    gate = _gate(opened)
+    gate.reader()
+    assert store.meta(lake)["data_rules"] == serving.data_rules.registered_version()
+    assert gate.health()["data_rules"] == {
+        "state": "current", "registered": serving.data_rules.registered_version(),
+        "lake": serving.data_rules.registered_version(),
+        "migration": {"rekeyed_rows": 0, "env_rekeyed_rows": 0,
+                      "dropped_shared_rows": 0, "reasons": {}},
+    }
+
+
+def test_a_lake_behind_is_degraded_while_it_migrates_and_failed_migrations_stay_degraded(
+        env, opened, monkeypatch):
+    env.setenv("BENCH_LAKE_LEASE", "off")
+    store.ensure_schema(opened(), lake_id="x", import_state="none")
+    gate = None
+    real = serving.data_rules.migrate
+
+    def migrating(lake):
+        health = gate.health()
+        assert health["state"] == "degraded"
+        assert health["data_rules"]["state"] == "behind"
+        assert "migrating" in health["reason"]
+        return real(lake)
+
+    monkeypatch.setattr(serving.data_rules, "migrate", migrating)
+    gate = _gate(opened)
+    gate.reader()
+    assert gate.phase == "serving"
+
+    def failed(_lake):
+        raise RuntimeError("the plan is truncated")
+
+    store.set_meta(opened(), data_rules="legacy")
+    monkeypatch.setattr(serving.data_rules, "migrate", failed)
+    failed_gate = _gate(opened)
+    with pytest.raises(LakeUnavailable, match="the plan is truncated"):
+        failed_gate.reader()
+    health = failed_gate.health()
+    assert health["state"] == "degraded"
+    assert health["data_rules"]["state"] == "failed"
+    assert health["data_rules"]["error"] == "RuntimeError: the plan is truncated"
+
+
+def test_an_unregistered_lake_version_is_refused_before_any_schema_write(
+        env, opened, monkeypatch):
+    env.setenv("BENCH_LAKE_LEASE", "off")
+    store.ensure_schema(opened(), lake_id="x", import_state="none")
+    store.set_meta(opened(), data_rules="from-a-newer-deployment")
+
+    def refused(*_args, **_kwargs):
+        raise AssertionError("an unregistered lake must not reach ensure_schema")
+
+    monkeypatch.setattr(store, "ensure_schema", refused)
+    gate = _gate(opened)
+    with pytest.raises(LakeUnavailable, match="outside this deployment"):
+        gate.reader()
+    health = gate.health()
+    assert health["state"] == "degraded"
+    assert health["data_rules"] == {
+        "state": "failed", "registered": serving.data_rules.registered_version(),
+        "lake": "from-a-newer-deployment",
+        "error": "the lake's data rules are 'from-a-newer-deployment', outside "
+                 "this deployment's registered chain",
+    }
 
 
 # --- annotations --------------------------------------------------------------------------

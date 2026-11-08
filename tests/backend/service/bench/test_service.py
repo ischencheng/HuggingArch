@@ -14,8 +14,8 @@ from fastapi.testclient import TestClient
 
 import tests.corpus_row as _corpus
 from backend.measure.scope import MeasurementScope
+from backend.service.bench import annotations as A
 from backend.service.bench import lake as lake_mod
-from backend.service.bench import routes as R
 from backend.service.bench import store
 
 from ..conftest import BENCH_SECRET, as_user
@@ -41,7 +41,7 @@ def _upload(client, user: str, rows: list, *, public: bool = False) -> dict:
 
 def _key(row: dict) -> dict:
     """The lookup key an estimate builds for the row's physical op."""
-    ann = R.row_annotations(row)
+    ann = A.row_annotations(row)
     return {"signature": ann["signature"], "physical_shape": ann["physical_shape"],
             "dtype_env_json": row["dtype_env_json"], "gpu": row["gpu"], "phase": row["phase"]}
 
@@ -169,13 +169,13 @@ class TestLookup:
             if dims.get("d_head") == 64:
                 dims["d_head"] = 128
             return json.dumps(dims, sort_keys=True, separators=(",", ":"))
-        monkeypatch.setattr(R, "current_shape", migrate)
+        monkeypatch.setattr(A, "current_shape", migrate)
         stored = json.loads(_row(0)["shape_json"])
         stored["d_head"] = 64
         row = _corpus.row(shape_json=json.dumps(stored, sort_keys=True, separators=(",", ":")))
         _upload(bench_client, ADMIN, [row], public=True)
         current = _key(row)
-        raw = {**current, "physical_shape": R.physical_identity(
+        raw = {**current, "physical_shape": A.physical_identity(
             row["op"], row["shape_json"])["physical_shape"]}
         assert json.loads(current["physical_shape"])["d_head"] == 128
         assert json.loads(raw["physical_shape"])["d_head"] == 64
@@ -191,7 +191,7 @@ class TestLookup:
         bench_client.get("/api/bench/list", headers=as_user(ALICE))       # the lake serves
         lake = lake_mod.get_lake()
         store.upload(lake, owner=ALICE, upload_id=str(uuid.uuid4()), run_id=None, label=None,
-                     rows=[old, good], annotate=R.row_annotations)
+                     rows=[old, good], annotate=A.row_annotations)
         keys = [_key(old), _key(good)]
         got = _lookup(bench_client, keys, owner=ALICE)
         assert got["excluded_mine"] == 1
@@ -200,7 +200,7 @@ class TestLookup:
         assert (report["rows_used"], report["rows_rejected"]) == (1, 1)
         assert "unknown symbol 'H'" in report["rejected_reasons"][0]["reason"]
         store.upload(lake, owner=BOB, upload_id=str(uuid.uuid4()), run_id=None, label=None,
-                     rows=[old], annotate=R.row_annotations, status="shared", decided_by=ADMIN)
+                     rows=[old], annotate=A.row_annotations, status="shared", decided_by=ADMIN)
         r = bench_client.post("/internal/bench/lookup", json={"keys": keys})
         assert r.status_code == 500 and "fails the validator" in r.json()["detail"]
 
@@ -262,18 +262,18 @@ def test_rules_rev_covers_the_annotation_closure():
     entry points."""
     import ast
     seen = set()
-    todo = list(R.rule_roots())
+    todo = list(A.rule_roots())
     while todo:
         name = todo.pop()
-        if name in seen or R._module_file(name) is None:
+        if name in seen or A._module_file(name) is None:
             continue
         seen.add(name)
-        todo.extend(R._imports(R._module_file(name), name))
+        todo.extend(A._imports(A._module_file(name), name))
     for module in ("backend.inference.benchmark_identity", "backend.inference.op_signatures",
                    "backend.inference.op_signatures_catalog", "backend.arch.spec_migrate",
                    "backend.service.bench.store", "kernel_bench.providers"):
         assert module in seen, module
-    assert ast and len(R.rules_rev()) == 16
+    assert ast and len(A.rules_rev()) == 16
 
 
 def test_repeated_op_shapes_compute_their_physical_identity_once(monkeypatch):
@@ -297,10 +297,10 @@ def test_repeated_op_shapes_compute_their_physical_identity_once(monkeypatch):
         def catalog_kernel(kernel_impl):
             return kernel_impl.upper()
 
-    monkeypatch.setattr(R, "current_shape", current_shape)
-    monkeypatch.setattr(R, "physical_identity", physical_identity)
-    monkeypatch.setattr(R, "_catalog", lambda: Catalog)
-    R._shape_identity.cache_clear()
+    monkeypatch.setattr(A, "current_shape", current_shape)
+    monkeypatch.setattr(A, "physical_identity", physical_identity)
+    monkeypatch.setattr(A, "_catalog", lambda: Catalog)
+    A._shape_identity.cache_clear()
     try:
         shape = _row(0)["shape_json"]
         rows = [
@@ -309,9 +309,9 @@ def test_repeated_op_shapes_compute_their_physical_identity_once(monkeypatch):
             for phase in ("decode", "prefill")
             for impl in ("a", "b")
         ]
-        answers = [R.row_annotations(row) for row in rows]
+        answers = [A.row_annotations(row) for row in rows]
     finally:
-        R._shape_identity.cache_clear()
+        A._shape_identity.cache_clear()
     assert calls == {"shape": 1, "identity": 1}
     assert {answer["catalog_kernel"] for answer in answers} == {"A", "B"}
 
@@ -408,14 +408,14 @@ import sys, json, uuid
 sys.path.insert(0, {str(root)!r})
 import tests.corpus_row as C
 from fastapi.testclient import TestClient
-from backend.service.bench import server, routes as R
+from backend.service.bench import annotations as A, server
 app = server.create_app(start_lake=False)
 c = TestClient(app, client=("127.0.0.1", 1), headers={{"X-HA-Internal": "s"}})
 admin = {{"X-HA-User": str(uuid.uuid4()), "X-HA-Admin": "1"}}
 r = c.post("/api/bench/upload", headers=admin, json={{"csv_text": C.to_csv([C.row()]), "make_public": True}})
 assert r.status_code == 200, r.text
 row = C.row()
-ann = R.row_annotations(row)
+ann = A.row_annotations(row)
 key = {{"signature": ann["signature"], "physical_shape": ann["physical_shape"],
        "dtype_env_json": row["dtype_env_json"], "gpu": row["gpu"], "phase": row["phase"]}}
 v = c.get("/internal/bench/version").json()
