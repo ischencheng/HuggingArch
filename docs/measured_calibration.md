@@ -415,7 +415,8 @@ never taken while a write lock is held. A write transaction that loses to a
 concurrent commit is attempted at most three times, then answered 503. Every
 write, maintenance run and backup first checks the volume's free space and
 refuses below 500 MiB (`lake.MIN_FREE_BYTES`). DuckDB runs with 4 threads, a
-memory limit of `BENCH_LAKE_MEMORY_LIMIT` (default 384 MB), a 32 MB target
+memory limit of `BENCH_LAKE_MEMORY_LIMIT` (default 384 MB) of which the held
+selection table may take `BENCH_LAKE_SELECTION_LIMIT` (default 32 MiB), a 32 MB target
 file size, and at most two concurrent analytical reads.
 
 ### 4.4 Snapshots and content identity
@@ -838,7 +839,7 @@ estimate never reads stays in the lake.
 |---|---|---|
 | Keys per lookup (`lookup.MAX_KEYS`) | 20,000 | Request refused. |
 | Candidate rows per answer (`lookup.MAX_ROWS`) | 50,000 | 503 before any wide column is read; never truncated, since a partial candidate set would change what an estimate picks. |
-| In-memory selection table (`Selection.BUDGET_BYTES`) | 32 MiB (~500k rows) | Above it, or at an older pin, the service runs the exact pinned query over the lake's files instead. |
+| In-memory selection table (`BENCH_LAKE_SELECTION_LIMIT`, a share of `BENCH_LAKE_MEMORY_LIMIT`) | default 32 MiB (~460k rows at ~72 B a row) | Above it, or at an older pin, the service runs the exact pinned query over the lake's files instead. |
 | Row cells held by the service (`Verdicts`) | 120,000 rows | Lookup's cells are remembered by id; owner calibration computes validator verdicts. |
 | Rows held per client process (`measure.lookup.ROWS_KEPT`) | 50,000 rows | Evicted keys are asked again. |
 | Client timeout (`lookup_timeout`) | 5 s + 2 ms per key sent | A slower answer is a failure (§7.3). |
@@ -951,7 +952,7 @@ results, which are valid in production as baked.
 | Variable | Read by | Meaning |
 |---|---|---|
 | `BENCH_LAKE_CATALOG`, `BENCH_LAKE_DATA` | service | Catalog file and data directory (set in the Dockerfile). |
-| `BENCH_LAKE_CACHE`, `BENCH_LAKE_MEMORY_LIMIT` | service | Spill directory; DuckDB memory limit (default 384 MB). |
+| `BENCH_LAKE_CACHE`, `BENCH_LAKE_MEMORY_LIMIT`, `BENCH_LAKE_SELECTION_LIMIT` | service | Spill directory; DuckDB memory limit (default 384 MB); the share of it the held selection table may take (default 32 MiB, must be below the memory limit). |
 | `BENCH_LAKE_S3_*` | service | Credentials for an `s3://` data path (unused in production). |
 | `BENCH_LAKE_BACKUP_DATA`, `BENCH_LAKE_BACKUP_S3_*` | service | Backup location and its own access key. |
 | `BENCH_LAKE_BACKUP=off` | service | Development only: no backups. |
@@ -977,7 +978,7 @@ worst case is about 4.5 GiB, leaving room for three agents
 (`SPEC_AGENT_MAX_CONCURRENT=3`).
 
 Inside the service, DuckDB's memory is bounded by `BENCH_LAKE_MEMORY_LIMIT`,
-the selection table by 32 MiB, and a lookup's answer by 50,000 rows (§7.2).
+the selection table by `BENCH_LAKE_SELECTION_LIMIT` (within that limit), and a lookup's answer by 50,000 rows (§7.2).
 The volume is 3 GB; writes, maintenance and backups stop when less than
 500 MiB is free (§4.3).
 

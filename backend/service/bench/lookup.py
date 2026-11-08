@@ -262,20 +262,24 @@ class Selection:
     hash narrows and text equality decides.
 
     * One table, for the newest snapshot a lookup asked: a lookup at an
-      older pin, or a lake whose table would exceed `BUDGET_BYTES`, takes
-      the exact pinned query over the lake's files instead (`None`).
+      older pin, or a lake whose table would exceed the lake's configured
+      share of its memory for it (`Lake.selection_bytes`,
+      BENCH_LAKE_SELECTION_LIMIT — the table lives in that DuckDB
+      instance's memory, so its budget is that memory's, not this
+      module's), takes the exact pinned query over the lake's files
+      instead (`None`).
     * Lifetime: a lookup holds the table while it reads it (`use`); a newer
       snapshot's table replaces it for new lookups, and the old one is
       dropped when its last reader lets go — never under a reader.
-    * Cost (docs/measured_calibration.md §7.2): ~66 bytes a row; the local
-      lake's 71k rows ~5 MB, built in ~15 ms when a write moves the
-      snapshot. The 2.2M-row scale copy would take ~145 MB, over the
-      budget: there every lookup is the pinned query, whose time is the
-      rows it returns (at that scale ~280 per key), not the selection."""
+    * Cost (docs/measured_calibration.md §7.2): ~72 bytes a row (measured
+      on a 4.28M-row lake: 295 MiB, built in ~0.4 s when a write moves
+      the snapshot); the local lake's 71k rows ~5 MB. Holding it saves
+      the selection's scan of the lake's files — ~0.2 s of a 5,000-key
+      lookup at 4.28M rows — not the wide read of the rows not yet held
+      (`_entries`), which is most of a cold lookup either way."""
 
-    #: Bytes a held table may take (at ~66 bytes a row, ~500k rows).
-    BUDGET_BYTES = 32 * 2**20
-    ROW_BYTES = 66
+    #: Bytes a held table takes per measurement (DuckDB's in-memory table).
+    ROW_BYTES = 72
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -288,7 +292,7 @@ class Selection:
     def _build(self, lake: Lake, snapshot: int) -> Optional[str]:
         rows = lake.read("SELECT count(*) AS n FROM lake.measurements AT (VERSION => ?)",
                          [snapshot])[0]["n"]
-        if rows * self.ROW_BYTES > self.BUDGET_BYTES:
+        if rows * self.ROW_BYTES > lake.selection_bytes:
             return None
         self._built += 1
         name = f"sel_{int(snapshot)}_{self._built}"

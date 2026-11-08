@@ -1,9 +1,11 @@
 """The lookup's memory-budgeted selection table (`lookup.Selection`,
 docs/measured_calibration.md §7.2): one table, for the newest snapshot
-asked; an older pin or an over-budget lake takes the pinned query, with the
-same answer; a table is never dropped under a lookup reading it."""
+asked; an older pin or a lake over its configured selection limit
+(BENCH_LAKE_SELECTION_LIMIT) takes the pinned query, with the same answer; a
+table is never dropped under a lookup reading it."""
 from __future__ import annotations
 
+import copy
 import threading
 import uuid
 
@@ -11,6 +13,7 @@ import pytest
 
 from backend.service.bench import lookup as LK
 from backend.service.bench import store
+from backend.service.bench.lake import Lake, LakeConfig, LakeUnavailable
 
 
 def _upload(lake, annotate, owner, rows, *, status="private"):
@@ -31,6 +34,48 @@ def _tables(lake) -> set:
         "SELECT table_name AS name FROM duckdb_tables() WHERE table_name LIKE 'sel_%'")}
 
 
+def _limited(lake, selection_bytes: int):
+    """Another handle on the same lake whose selection limit is
+    `selection_bytes` (as a lake opened with that BENCH_LAKE_SELECTION_LIMIT)."""
+    handle = copy.copy(lake)
+    handle.selection_bytes = selection_bytes
+    return handle
+
+
+def _open(root, **over) -> Lake:
+    lk = Lake.open(LakeConfig(catalog=str(root / "catalog.ducklake"),
+                              data=str(root / "data"), **over))
+    store.ensure_schema(lk)
+    return lk
+
+
+def test_the_held_tables_budget_is_the_lakes_configured_limit(tmp_path, annotate, make_rows,
+                                                               new_owner, monkeypatch):
+    """A table over the old fixed 32 MiB budget is held when the lake's
+    configured limit holds it, and one within 32 MiB is not when the
+    configured limit does not: the budget is the lake's, not the module's."""
+    rows = make_rows(3)
+    # Each row priced at 16 MiB: the three rows' table (48 MiB) is over
+    # the old fixed budget and within a 64 MiB configured limit.
+    monkeypatch.setattr(LK.Selection, "ROW_BYTES", 16 * 2**20)
+    for limit, held in (("64MiB", True), ("32MiB", False)):
+        lk = _open(tmp_path / limit, selection_limit=limit)
+        try:
+            store.annotate_all(lk, annotate)
+            snap = _upload(lk, annotate, new_owner(), rows, status="shared")
+            with LK.Selection().use(lk, snap) as table:
+                assert (table is not None) is held, limit
+        finally:
+            lk.close()
+
+
+def test_a_selection_limit_not_below_the_memory_limit_is_refused(tmp_path):
+    with pytest.raises(LakeUnavailable, match="BENCH_LAKE_SELECTION_LIMIT"):
+        Lake.open(LakeConfig(catalog=str(tmp_path / "catalog.ducklake"),
+                             data=str(tmp_path / "data"),
+                             memory_limit="256MB", selection_limit="256MB"))
+
+
 def test_the_held_table_answers_as_the_pinned_query(lake, annotate, make_rows, new_owner):
     alice, admin = new_owner(), new_owner()
     rows = make_rows(3)
@@ -38,15 +83,15 @@ def test_the_held_table_answers_as_the_pinned_query(lake, annotate, make_rows, n
     s2 = _upload(lake, annotate, alice, rows[1:])
     keys = [_key(annotate, r) for r in rows]
     held, pinned = LK.Selection(), LK.Selection()
-    pinned.BUDGET_BYTES = 0
+    unheld = _limited(lake, 0)
     for owner in (None, alice):
         for snap in (s2, s1):
             a = LK.lookup(lake, keys, owner=owner, snapshot=snap, verdicts=LK.Verdicts(),
                           selection=held)
-            b = LK.lookup(lake, keys, owner=owner, snapshot=snap, verdicts=LK.Verdicts(),
+            b = LK.lookup(unheld, keys, owner=owner, snapshot=snap, verdicts=LK.Verdicts(),
                           selection=pinned)
             assert a == b and a["rows"] != [[], [], []]
-    assert len(_tables(lake)) == 1 and pinned._current[lake][1] is None
+    assert len(_tables(lake)) == 1 and pinned._current[unheld][1] is None
 
 
 def test_a_table_is_never_dropped_under_its_reader(lake, annotate, make_rows, new_owner):
@@ -91,15 +136,16 @@ def test_an_older_pin_takes_the_pinned_query(lake, annotate, make_rows, new_owne
         assert table is None
 
 
-@pytest.mark.parametrize("budget", [0, LK.Selection.BUDGET_BYTES])
+@pytest.mark.parametrize("held", [False, True])
 def test_concurrent_lookups_at_moving_snapshots_never_fail(lake, annotate, make_rows,
-                                                           new_owner, budget):
+                                                           new_owner, held):
     owner = new_owner()
     rows = make_rows(6)
     snaps = [_upload(lake, annotate, owner, [r], status="shared") for r in rows]
     keys = [_key(annotate, r) for r in rows]
     sel = LK.Selection()
-    sel.BUDGET_BYTES = budget
+    if not held:
+        lake = _limited(lake, 0)
     errors: list = []
 
     def run(snap):
