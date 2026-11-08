@@ -3427,6 +3427,114 @@ register_op(dataclasses.replace(OP_REGISTRY["rope"],
 ))
 
 
+# --- Video sparse attention (VSA) ---
+# A diffusion transformer can read fewer key rows per query row than the whole
+# packed sequence: pool Q and K over spatio-temporal tiles, score the tile
+# pairs, keep each video query tile's top keys, and run the attention over the
+# kept tiles only. A gated branch adds a tile-level compressed answer back.
+# Every step recomputes this: nothing is cached. FastH3 V2 is the first model
+# that runs it (FastVideo `attention/backends/video_sparse_attn_h3.py`,
+# `models/dits/minimax_h3_vsa_fp4.py`).
+
+register_op(OpSpec("tile_pool",
+    couples_on=("s_query",),
+    # One add per value of the pooled rows; the divide is per tile and small.
+    flops_fn=lambda d: d["B"] * d["n_heads"] * _s_query(d) * d["d_head"],
+    params_fn=_zero,
+    shape_in=("B", "n_heads", "s_query", "d_head"),
+    shape_out=("B", "n_heads", "tiles", "d_head"),
+    shape_kind="explicit",
+    input_rank_is_exact=True,
+    formula="y[h, t] = mean of x[h, s] over the rows s of tile t",
+    description="Mean of each tile's rows, per head: Q and K for the tile "
+                "scores, V for the compression branch (FastVideo `_pool_tiles`).",
+    required_dims=("n_heads", "d_head", "tiles"),
+))
+
+register_op(OpSpec("tile_score",
+    input_roles=("q", "k"),
+    couples_on=("tiles", "d_head"),
+    flops_fn=lambda d: 2 * d["B"] * d["n_heads"] * d["tiles"] * d["tiles"] * d["d_head"],
+    params_fn=_zero,
+    shape_in=(("B", "n_heads", "tiles", "d_head"), ("B", "n_heads", "tiles", "d_head")),
+    shape_out=("B", "n_heads", "tiles", "tiles"),
+    shape_kind="explicit",
+    input_rank_is_exact=True,
+    formula="A = Q_tile · K_tileᵀ / sqrt(d_head)",
+    description="Scores of every (query tile, key tile) pair, per head: what "
+                "the selection and the compression branch read. Dense over "
+                "tiles, whatever the sparsity.",
+    required_dims=("n_heads", "d_head", "tiles"),
+))
+
+register_op(OpSpec("tile_topk_mask",
+    couples_on=("tiles",),
+    # A top-k over each tile row's scores: one pass per row, as `dsa_topk_mask`.
+    flops_fn=lambda d: d["B"] * d["n_heads"] * d["tiles"] * d["tiles"],
+    params_fn=_zero,
+    output_kind="mask",
+    shape_in=("B", "n_heads", "tiles", "tiles"),
+    shape_out=("B", "n_heads", "tiles", "tiles"),
+    shape_kind="preserve",
+    formula="mask[h, q, k] = k among q's kept tiles",
+    description="Per head, the key tiles each query tile keeps. Non-video "
+                "query tiles keep all, every query keeps the non-video key "
+                "tiles, a video query keeps its top (1 - sparsity) of the "
+                "video tiles (FastVideo `_build_block_mask`, exempt mode).",
+    required_dims=("n_heads", "tiles"),
+))
+
+register_op(OpSpec("block_sparse_attention",
+    input_roles=("q", "k", "v", "select"),
+    # Bidirectional: every kept pair is one scored and applied pair, whatever
+    # the phase; the count is the selection's, stated by the node.
+    couples_on=("s_query", "d_head"),
+    input_rank_is_exact=True,
+    flops_fn=lambda d: (4 * d["d_head"] + 5) * d["B"] * d["n_heads"] * d["s_pairs_kept"],
+    params_fn=_zero,
+    shape_in=(("B", "n_heads", "s_query", "d_head"), ("B", "n_heads", "s_query", "d_head"),
+              ("B", "n_heads", "s_query", "d_head"), ("B", "n_heads", "tiles", "tiles")),
+    shape_out=("B", "n_heads", "s_query", "d_head"),
+    shape_kind="preserve",
+    input_kinds=("activation", "activation", "activation", "mask"),
+    formula="O[h, q] = softmax(Q[h, q] · K[h, kept(q)]ᵀ / sqrt(d_head)) · V[h, kept(q)]",
+    description="Attention over the kept tiles only, one kernel: score, "
+                "softmax and apply, priced on `s_pairs_kept`, the (query row, "
+                "key row) pairs the selection keeps, not on the whole matrix.",
+    required_dims=("n_heads", "d_head", "s_pairs_kept"),
+))
+
+register_op(OpSpec("tile_compress",
+    input_roles=("probs", "v"),
+    couples_on=("tiles", "d_head"),
+    flops_fn=lambda d: (5 + 2 * d["d_head"]) * d["B"] * d["n_heads"] * d["tiles"] * d["tiles"],
+    params_fn=_zero,
+    shape_in=(("B", "n_heads", "tiles", "tiles"), ("B", "n_heads", "tiles", "d_head")),
+    shape_out=("B", "n_heads", "tiles", "d_head"),
+    shape_kind="explicit",
+    input_rank_is_exact=True,
+    formula="C = softmax(scores) · V_tile",
+    description="The compression branch: every tile's answer from the dense "
+                "tile scores, the coarse attention the selection leaves out.",
+    required_dims=("n_heads", "d_head", "tiles"),
+))
+
+register_op(OpSpec("tile_unpool",
+    couples_on=(),
+    flops_fn=_zero,
+    params_fn=_zero,
+    shape_in=("B", "n_heads", "tiles", "d_head"),
+    shape_out=("B", "n_heads", "s_query", "d_head"),
+    shape_kind="explicit",
+    input_rank_is_exact=True,
+    gather_source=0,
+    formula="y[h, s] = x[h, tile of row s]",
+    description="Each row reads its own tile's value (FastVideo `row_tile`). "
+                "Zero FLOPs.",
+    required_dims=("n_heads", "d_head"),
+))
+
+
 def _conv_weight_elements(template):
     def elements(d):
         shape = resolve_shape_template(template, d)

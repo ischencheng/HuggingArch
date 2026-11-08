@@ -1,0 +1,28 @@
+# FastVideo `MiniMaxH3FeedForward`: the diffusers SwiGLU under its own names,
+# `fc_in` to 2·d_ffn (value rows first, gate second: `chunk(2, dim=-1)`,
+# `x * silu(gate)`), then `fc_out` back down. No bias.
+#
+# Required dims: d_model, d_ffn
+
+role: ffn_dense
+description: "FastVideo SwiGLU feed-forward: fc_in → (value | gate) → value · silu(gate) → fc_out."
+graph:
+  fc_in:
+    op: linear
+    in: x
+    dims: { in: d_model, out: "2 * d_ffn" }
+    weight_axes:
+      - segments:
+          - { segment: value, extent: d_ffn, placement_by_symbol: { d_ffn: { world: dense_ffn, parts: d_ffn, fit: exact } } }
+          - { segment: gate, extent: d_ffn, placement_by_symbol: { d_ffn: { world: dense_ffn, parts: d_ffn, fit: exact } } }
+      - { replicated: true }
+  value_slice: { op: slice, in: fc_in, dims: { in: "2 * d_ffn", out: d_ffn } }
+  gate_slice:  { op: slice, in: fc_in, dims: { in: "2 * d_ffn", out: d_ffn, start: d_ffn } }
+  silu:        { op: silu, in: gate_slice, dim: d_ffn }
+  gate_mul:    { op: mul, in: [value_slice, silu], dim: d_ffn }
+  fc_out:
+    op: linear
+    in: gate_mul
+    dims: { in: d_ffn, out: d_model }
+    weight_axes: [{ replicated: true }, { placement_by_symbol: { d_ffn: { world: dense_ffn, parts: d_ffn, fit: exact } } }]
+outputs: [fc_out]

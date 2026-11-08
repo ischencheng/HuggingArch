@@ -10,7 +10,7 @@ import json
 import logging
 import re
 
-from backend.arch.checkpoint_unread import UnreadSplit
+from backend.arch.checkpoint_unread import UnreadSplit, undeclared_sidecars
 from backend.arch.dtypes import dtype_bytes as dtype_bytes_of
 from backend.arch.eval import capacity as capacity_mod
 from backend.arch.eval.checkpoint import Reconciliation
@@ -474,7 +474,8 @@ def _analyze_from_spec(model_id: str, config: dict, resolved, hf_meta: dict,
     # splits them.
     unread = UnreadSplit.of(hf_meta.get("header"),
                             resolved.spec.checkpoint_unread)
-    hf_meta = unread.read_part(hf_meta)
+    hf_meta = unread.read_part(hf_meta, sidecars=undeclared_sidecars(
+        model_result.analysis, hf_meta.get("quant_scheme")))
     if unread.parts:
         summary["checkpoint_unread"] = [part.as_dict() for part in unread.parts]
     hf_total_params = hf_meta.get("total_params", 0)

@@ -426,6 +426,54 @@ symbols:
     kind: whole
     group: diffusion_pipeline
     meaning: Latent frames a temporal chunk advances by (`tokens_chunk_size`).
+  n_vsa_tile:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Tokens per sparse-attention tile (FastVideo `vsa_tile_size`).
+  n_vsa_sparsity_pct:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Percent of the video key tiles a video query tile drops (`vsa_sparsity`, as a percentage).
+  s_vsa_t:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Latent frames of the clip sparse attention is priced at (1×2×2 patches).
+  s_vsa_h:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Patch rows of that clip's height.
+  s_vsa_w:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Patch rows of that clip's width.
+  s_vsa_text:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Prompt rows assumed for that clip (a prompt's length varies).
+  s_vsa_audio:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Audio rows of that clip, every stereo channel's.
+  s_vsa_prefix:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Non-video rows of the packed sequence, always kept as keys.
+  n_vsa_video_tiles:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Video tiles of that clip (partial tiles included).
+  n_vsa_prefix_tiles:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Non-video tiles of that clip.
+  n_vsa_tiles:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Tiles of that clip.
+  s_pairs_kept:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: (query row, key row) pairs a block-sparse attention keeps, per batch row and head.
   n_vae_token_drop:
     kind: whole
     group: diffusion_pipeline

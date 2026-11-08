@@ -137,6 +137,14 @@ SNAPSHOT = {'attention_apply': {'s_kv': ('contract',
  'swa_softmax_with_sink': {'s_attend': ('normalize',
                                     'softmax',
                                     'attention_kernel')},
+ 'block_sparse_attention': {'d_head': ('contract', 'sum', ''),
+                            's_query': ('separable', '', 'attention_kernel')},
+ 'tile_compress': {'d_head': ('contract', 'sum', ''),
+                   'tiles': ('contract', 'sum', '')},
+ 'tile_pool': {'s_query': ('contract', 'sum', '')},
+ 'tile_score': {'d_head': ('contract', 'sum', ''),
+                'tiles': ('separable', '', 'attention_kernel')},
+ 'tile_topk_mask': {'tiles': ('normalize', 'topk', '')},
  'topk': {'in': ('normalize', 'topk', '')}}
 
 #: Same pin for the spec-scoped custom ops.

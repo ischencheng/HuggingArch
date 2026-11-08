@@ -613,7 +613,10 @@ class UnreadCheckpointModule(BaseModel):
         return frozenset(out)
 
     def selects(self, name: str) -> bool:
-        """Whether a tensor named `name` sits under this module."""
+        """Whether a tensor named `name` sits under this module, or is the
+        tensor this entry names (a bare parameter has no module of its own)."""
+        if name == self.module:
+            return self.indices() is None
         if not name.startswith(self.module + "."):
             return False
         indices = self.indices()

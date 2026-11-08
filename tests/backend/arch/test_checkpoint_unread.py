@@ -59,6 +59,33 @@ def test_a_module_path_is_matched_by_whole_segments():
     assert any("selects no tensor" in e for e in split.errors)
 
 
+def test_an_entry_can_name_a_bare_parameter():
+    entry = _entry("vae.decoder.mask_token")
+    assert entry.selects("vae.decoder.mask_token")
+    assert not entry.selects("vae.decoder.mask_token_2")
+
+
+def test_sidecars_the_config_names_no_scheme_for_are_filed_as_sidecars():
+    from types import SimpleNamespace
+
+    from backend.arch.checkpoint_unread import undeclared_sidecars
+    from backend.hf.header import SafetensorsHeader
+    from backend.hf.metadata import summarize
+    from backend.arch.quant_schemes import SCHEME_NONE
+    row = SimpleNamespace(is_metadata=True, name="a.linear::_scale",
+                          tensor=SimpleNamespace(suffix="::_scale"))
+    weight = SimpleNamespace(is_metadata=False, name="a.linear::_w",
+                             tensor=SimpleNamespace(suffix="::_w"))
+    analysis = SimpleNamespace(iter_checkpoint=lambda: (row, weight))
+    assert undeclared_sidecars(analysis, "none") == ("::_scale",)
+    header = SafetensorsHeader.from_tensors(
+        {"a.linear::_w": ("U8", (8, 2)), "a.linear::_scale": ("U8", (8, 1))})
+    totals = summarize(header, scheme=SCHEME_NONE, num_bits=0,
+                       sidecars=("::_scale",))
+    assert totals["model_storage_bytes"] == 16
+    assert totals["quantization_metadata_bytes"] == 8
+
+
 def test_an_entry_selecting_nothing_is_stale():
     split = UnreadSplit.of(_header(), [_entry("text_encoder.model.layers", "7-9")])
     assert len(split.errors) == 1 and "selects no tensor" in split.errors[0]
@@ -95,6 +122,7 @@ def test_the_reconciliation_compares_the_read_part():
     entries = [_entry("text_encoder"), _entry("vae.encoder")]
     analysis = SimpleNamespace(
         checkpoint_tensors=lambda: (),
+        iter_checkpoint=lambda: (),
         program=SimpleNamespace(spec=SimpleNamespace(checkpoint_unread=entries)))
     whole = summarize(header, scheme=SCHEME_NONE, num_bits=0)
     result = Reconciliation.of(analysis, whole)

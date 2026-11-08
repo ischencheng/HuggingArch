@@ -22,9 +22,23 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from backend.arch.dtypes import dtype_bytes
-from backend.arch.quant_schemes import SCHEME_NONE, scheme_named
+from backend.arch.quant_schemes import (SCHEME_NONE, is_quantization_metadata,
+                                        scheme_named)
 from backend.hf.header import SafetensorsHeader
 from backend.hf.metadata import summarize
+
+
+def undeclared_sidecars(analysis: Any, quant_scheme: Optional[str]
+                        ) -> Tuple[str, ...]:
+    """Tail suffixes of the metadata tensors a spec declares that the header's
+    own split (`hf.metadata.summarize`, by the scheme the config names) has
+    no suffix for. A diffusers pipeline's config names no scheme whatever its
+    components quantise, so without this its scales are filed with the weights
+    and every byte check compares them with the spec's weights."""
+    scheme = scheme_named(quant_scheme) if quant_scheme else SCHEME_NONE
+    return tuple(sorted({row.tensor.suffix for row in analysis.iter_checkpoint()
+                         if row.is_metadata and not is_quantization_metadata(
+                             row.name or "", scheme)}))
 
 
 @dataclass(frozen=True)
@@ -57,16 +71,20 @@ class UnreadSplit:
     def unread_bytes(self) -> int:
         return sum(part.bytes for part in self.parts)
 
-    def read_part(self, meta: Dict[str, Any]) -> Dict[str, Any]:
+    def read_part(self, meta: Dict[str, Any], *,
+                  sidecars: Tuple[str, ...] = ()) -> Dict[str, Any]:
         """`meta` (a `hf.metadata` fetch: the header and its totals) for the
         part of the file the spec's path reads, the totals summed again
-        under the scheme the whole was. Unchanged when nothing is unread."""
-        if not self.parts:
+        under the scheme the whole was, with `sidecars`
+        (`undeclared_sidecars`) filed as quant sidecars too. Unchanged when
+        nothing is unread and nothing is refiled."""
+        if self.read is None or (not self.parts and not sidecars):
             return meta
         scheme = (scheme_named(meta["quant_scheme"])
                   if meta.get("quant_scheme") else SCHEME_NONE)
         totals = summarize(self.read, scheme=scheme,
-                           num_bits=int(meta.get("num_bits") or 0))
+                           num_bits=int(meta.get("num_bits") or 0),
+                           sidecars=sidecars)
         return {**meta, **{key: totals[key] for key in (
             "header", "total_params", "model_storage_bytes",
             "quantization_metadata_bytes", "checkpoint_storage_bytes",

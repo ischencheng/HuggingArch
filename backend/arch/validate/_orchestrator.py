@@ -47,7 +47,7 @@ from ._attention_masks import run_attention_mask_check
 from ._cross_layer_channels import cross_layer_anchor_notes, run_cross_layer_checks
 from ._schedule_exhaustiveness import run_layer_schedule_check
 from ._ablation import parse_disabled, lever_disabled, SOURCE_DIFF_KINDS
-from backend.arch.checkpoint_unread import UnreadSplit
+from backend.arch.checkpoint_unread import UnreadSplit, undeclared_sidecars
 from backend.arch.eval.checkpoint import Reconciliation
 from backend.arch.eval.dim import value_of
 from backend.arch.eval.program import Program
@@ -838,7 +838,8 @@ def _evaluate_spec(model_id, spec_name, config, overlay_dir, hf_data, _off,
         # modules it declares unread are split off and reported.
         unread = _run_stage("coverage", spec, lambda: UnreadSplit.of(
             hf_data.get("header"), resolved.spec.checkpoint_unread))
-        hf_data = unread.read_part(hf_data)
+        hf_data = unread.read_part(hf_data, sidecars=undeclared_sidecars(
+            model_result.analysis, hf_data.get("quant_scheme")))
 
         matched, unmatched_spec_nodes, unmatched_hf = _run_stage(
             "coverage", spec,

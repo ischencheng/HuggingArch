@@ -505,6 +505,50 @@ def _dm_declared_rows(node, r_in0, rout) -> List[DimSource]:
     ][:rout]
 
 
+def _dm_tile_pool(node, r_in0, rout) -> List[DimSource]:
+    # [B, H, S, D] → [B, H, tiles, D]; a row's tile comes from the request.
+    del r_in0
+    return [
+        DimSource("from", ((0, 0),)),
+        DimSource("from", ((0, 1),)),
+        DimSource("new", dim_key="tiles"),
+        DimSource("from", ((0, 3),)),
+    ][:rout]
+
+
+def _dm_tile_score(node, r_in0, rout) -> List[DimSource]:
+    # [B, H, tiles, D] · [B, H, tiles, D]ᵀ → [B, H, tiles, tiles].
+    del r_in0
+    return [
+        DimSource("from", ((0, 0), (1, 0))),
+        DimSource("from", ((0, 1), (1, 1))),
+        DimSource("new", dim_key="tiles"),
+        DimSource("new", dim_key="tiles"),
+    ][:rout]
+
+
+def _dm_tile_compress(node, r_in0, rout) -> List[DimSource]:
+    # [B, H, tiles, tiles] · [B, H, tiles, D] → [B, H, tiles, D].
+    del r_in0
+    return [
+        DimSource("from", ((0, 0), (1, 0))),
+        DimSource("from", ((0, 1), (1, 1))),
+        DimSource("from", ((0, 2),)),
+        DimSource("from", ((1, 3),)),
+    ][:rout]
+
+
+def _dm_tile_unpool(node, r_in0, rout) -> List[DimSource]:
+    # [B, H, tiles, D] → [B, H, S, D]: each row reads its tile.
+    del r_in0
+    return [
+        DimSource("from", ((0, 0),)),
+        DimSource("from", ((0, 1),)),
+        DimSource("new", dim_key="s_query"),
+        DimSource("from", ((0, 3),)),
+    ][:rout]
+
+
 def _dm_group_items(node, r_in0, rout) -> List[DimSource]:
     # [M·k, R, D] → [M, k·R, D]; M is declared (`groups`), so k = 0 holds.
     del r_in0
@@ -801,6 +845,10 @@ _EXPLICIT_DM = op_keyed({
     "append_tokens": _dm_append_tokens,
     "tile_video": _dm_declared_rows,
     "untile_video": _dm_declared_rows,
+    "tile_pool": _dm_tile_pool,
+    "tile_score": _dm_tile_score,
+    "tile_compress": _dm_tile_compress,
+    "tile_unpool": _dm_tile_unpool,
 })
 
 
@@ -879,6 +927,11 @@ _EXPLICIT_RANK = op_keyed({
     # become items, pixels and channels.
     "tile_video": lambda ir, node: 3 if ir and ir[0] == 5 else None,
     "untile_video": lambda ir, node: 3 if ir else None,
+    # Rows and tiles swap places; the head and width axes stay.
+    "tile_pool": lambda ir, node: ir[0] if ir else None,
+    "tile_score": lambda ir, node: ir[0] if ir else None,
+    "tile_compress": lambda ir, node: ir[1] if len(ir) > 1 else None,
+    "tile_unpool": lambda ir, node: ir[0] if ir else None,
 })
 
 

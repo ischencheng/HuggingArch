@@ -119,6 +119,74 @@ has to be written by hand in `tests/golden/pins/tp_split_decisions.json`. The
 keyed pins (P1, P2, P3, P7, P11) are withheld until then, so H3 stays in the
 overlay: a model in the corpus without its pins turns the corpus tests red.
 
+## FastH3 V2 NVFP4 Consumer
+
+`overlays/fasth3_v2_nvfp4/` holds FastVideo's 8-step FastH3 for one Blackwell
+GPU (`FastVideo/FastVideo-FastH3-8-Step-V2-NVFP4-Consumer`, revision `9d0d0d3`),
+read as FastVideo loads it at commit `ce970eb`. It is a second overlay beside
+the base H3; both stay out of the shared corpus.
+
+```bash
+.venv/bin/python -m backend.arch.validate FastVideo/FastVideo-FastH3-8-Step-V2-NVFP4-Consumer --overlay-dir overlays/fasth3_v2_nvfp4
+HA_SPEC_OVERLAY_DIR=$PWD/overlays/fasth3_v2_nvfp4 .venv/bin/python -m backend.api --host 127.0.0.1 --port 8058
+```
+
+The checker is valid: weights 54,088,201,236 bytes and scales 2,851,138,684
+bytes, spec = file (the read part), every tensor matched. Bytes per stage,
+summed from the safetensors headers:
+
+| stage | bytes | format |
+|---|---:|---|
+| DiT (`transformer/`, shards + `nvfp4_weights.safetensors`) | 39,632,637,892 | NVFP4 attention, FFN and gates; the rest BF16 |
+| text encoder (layers 0-49 and embedding) | 15,270,283,640 | NVFP4 linears, BF16 norms and embedding |
+| video decoder (26 layers of 32×64) | 1,776,660,976 | INT8 linears, F32 the rest, F16 `post_quant_conv` |
+| audio decoder | 259,757,412 | F32 |
+
+Declared unread: the text encoder's final norm and vision tower, both VAEs'
+encoders, the audio posterior heads, and the dense F16 video decoder the INT8
+export overwrites.
+
+### What the repo needed from the reader and the checker
+
+| addition | where | what it says |
+|---|---|---|
+| sidecar safetensors | `hf/pipeline.py` | a file in a component's folder beside the checkpoint its library loads is read too: new names join the component, a file restating a name keeps its own space under its stem |
+| three quant schemes | `quant_schemes/` | `nvfp4-packed` (text encoder), `nvfp4-fastvideo-export` (`<module>::_nvfp4_weight`), `int8-convrot` (`.weight`, per-channel scale, JSON marker) |
+| sidecars the config names no scheme for | `checkpoint_unread.undeclared_sidecars` | a pipeline's composed config names no scheme, so the spec's declared scales are filed as scales when the header is summed |
+| `global_scale`, `marker` sibling kinds | `quant_schemes` | one scale per tensor; a stored format tag |
+| `checkpoint_unread` on a bare parameter | `schema/model.py` | an entry may name one tensor, not only a module |
+| `attention_refiner`, `ffn_refiner` roles | `roles.yaml` | H3's token refiner stays BF16 beside a quantised text encoder in one stage |
+
+### Sparse attention
+
+`fasth3_vsa_attention` follows `vsa_fp4_attention`: pool Q and K over 64-token
+tiles, score every tile pair, keep each video query tile's non-video keys and
+its top 20% of video keys, run the attention on the kept tiles
+(`block_sparse_attention`, one kernel), and add the gated tile-level
+compression back. It is priced on `s_pairs_kept`, the (query row, key row)
+pairs the selection keeps: 0.228 of the dense matrix at 1344x768, 124 frames.
+The DiT's sparse attention is 9.5 TFLOP per block there, against 41.7 dense.
+
+### What the overlay does not represent
+
+* **The kernel's block granularity.** FastVideo computes on 128x128 blocks with
+  per-quadrant masks, so at 0.8 sparsity it touches more than it keeps (0.434
+  of the matrix against 0.222 selected, at 243 frames); warp-level skipping wins
+  part of that back. The FLOPs here count kept pairs, not touched ones.
+* **The clip is pinned.** `s_vsa_*` and the tile counts are the default view,
+  with a 256-row prompt assumed. The kept pairs follow the packed rows the
+  step binds; tile pooling and scoring do not.
+* **Activation quantization and the ConvRot rotation.** FastVideo quantises
+  each linear's activation to FP4, and rotates the VAE's by a 256-point
+  Hadamard before INT8. Those passes have no node; the linears are priced as
+  plain matmuls. The FP8 prefix path and two-level P are not modelled.
+* **The optional AdaLN table** (`transformer/adaln_tables.pt`, read only when
+  `FASTVIDEO_H3_ADALN_TABLE` is set). The spec runs the AdaLN projections.
+* **Parallel layouts.** The tile ops are laid out whole, so only a single rank
+  is meaningful, which is how the checkpoint is meant to run.
+* The snapshot's forward source is the diffusers and transformers modules the
+  index names, not FastVideo's; the `source_anchor`s cite FastVideo's files.
+
 ## Known gaps
 
 * `proj_in`, `audio_proj_in`, `context_embedder` and `token_refiner` run inside

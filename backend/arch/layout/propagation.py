@@ -1351,6 +1351,12 @@ _HANDLERS = {
     "conv_transpose1d": _pipeline.whole,
     "conv_transpose1d_weight_norm": _pipeline.whole,
     "snake_beta": _pipeline.whole,
+    "tile_pool": _pipeline.whole,
+    "tile_score": _pipeline.whole,
+    "tile_topk_mask": _pipeline.whole,
+    "block_sparse_attention": _pipeline.whole,
+    "tile_compress": _pipeline.whole,
+    "tile_unpool": _pipeline.whole,
 }
 
 

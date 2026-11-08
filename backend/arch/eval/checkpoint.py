@@ -69,7 +69,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Tuple
 
-from ..checkpoint_unread import UnreadSplit
+from ..checkpoint_unread import UnreadSplit, undeclared_sidecars
 from ..dtypes import UnknownDtype, dtype_bytes
 
 
@@ -208,7 +208,9 @@ class Reconciliation:
         """
         metadata = UnreadSplit.of(
             metadata.get("header"),
-            analysis.program.spec.checkpoint_unread).read_part(metadata)
+            analysis.program.spec.checkpoint_unread).read_part(
+                metadata, sidecars=undeclared_sidecars(
+                    analysis, metadata.get("quant_scheme")))
         weight = 0.0
         meta = 0.0
         buffers = 0.0

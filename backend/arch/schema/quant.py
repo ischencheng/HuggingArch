@@ -399,7 +399,7 @@ class QuantContext(BaseModel):
         The one normalization, so the quant badge and the precision
         label cannot disagree on what a per_role row says.
         """
-        for entry in (self.per_role or {}).values():
+        for entry in (*(self.per_role or {}).values(), *(self.overrides or ())):
             method = (entry.method or "").strip().lower()
             if not method or method == "none":
                 continue

@@ -98,6 +98,15 @@ roles:
       KDA layers beside part-FP8 MLA layers). Same family as `attention` in
       every accounting sense.
 
+  attention_refiner:
+    weight_class: true
+    ffn_gate: false
+    kind: attention
+    refines: attention
+    meaning: >-
+      A text refiner's attention inside a diffusion transformer (MiniMax-H3's
+      token refiner). Finer than `attention` because it keeps its own
+      precision beside a quantised text encoder in the same stage.
   attention_output:
     weight_class: true
     ffn_gate: false
@@ -155,6 +164,15 @@ roles:
     kind: ffn
     label: Dense FFN
     meaning: A dense feed-forward network — every token through every weight.
+
+  ffn_refiner:
+    weight_class: true
+    ffn_gate: true
+    kind: ffn
+    refines: ffn_dense
+    meaning: >-
+      A text refiner's FFN inside a diffusion transformer (MiniMax-H3's token
+      refiner), at its own precision beside a quantised text encoder.
 
   ffn_moe:
     weight_class: true

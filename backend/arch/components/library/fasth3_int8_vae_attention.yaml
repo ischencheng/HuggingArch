@@ -1,0 +1,37 @@
+# The light H3 video decoder's attention, as its INT8 export stores it
+# (`vae/minimax_h3_video_vae_int8_convrot.safetensors`): the same forward as
+# `minimax_h3_vae_attention`, with Q/K/V held in one fused linear whose output
+# is per head [q | k | v]. FastVideo splits it into three INT8 linears at load
+# (`_split_qkv`), which costs the same multiply-adds as this one matrix.
+#
+# Required dims: d_model, n_heads, d_head, d_rope, d_nope
+
+role: attention
+description: "Light video decoder attention (INT8 export): fused Q/K/V linear, unscaled per-head RMSNorm, partial 3-D RoPE, full attention over one tile."
+cache:
+  family: ViT
+  entries: []
+graph:
+  to_qkv:
+    op: linear
+    in: x
+    dims: { in: d_model, out: "3 * n_heads * d_head", bias: "1" }
+    weight_axes: [{ world: attention, parts: n_heads, fit: replica_cells }, { replicated: true }]
+  qkv_split_heads: { op: head_split, in: to_qkv, dims: { n_heads: n_heads, d_head: "3 * d_head" } }
+  q_slice:       { op: slice, in: qkv_split_heads, dims: { in: "3 * d_head", out: d_head } }
+  k_slice:       { op: slice, in: qkv_split_heads, dims: { in: "3 * d_head", out: d_head, start: d_head } }
+  v_slice:       { op: slice, in: qkv_split_heads, dims: { in: "3 * d_head", out: d_head, start: "2 * d_head" } }
+  norm_q:        { op: rmsnorm_unscaled, in: q_slice, dim: d_head }
+  norm_k:        { op: rmsnorm_unscaled, in: k_slice, dim: d_head }
+  q_rope:        { op: partial_rope_3d, in: norm_q, module: null, dims: { d_head: d_head, d_rope: d_rope, d_nope: d_nope } }
+  k_rope:        { op: partial_rope_3d, in: norm_k, module: null, dims: { d_head: d_head, d_rope: d_rope, d_nope: d_nope } }
+  qk_score:      { op: attention_score, in: [q_rope, k_rope], dims: { is_causal: "0", n_heads: n_heads, d_head: d_head } }
+  softmax:       { op: softmax, in: qk_score, dims: { is_causal: "0", n_heads: n_heads } }
+  attn_apply:    { op: attention_apply, in: [softmax, v_slice], dims: { is_causal: "0", n_heads: n_heads, d_head: d_head } }
+  o_merge_heads: { op: head_merge, in: attn_apply, dims: { n_heads: n_heads, d_head: d_head } }
+  to_out:
+    op: linear
+    in: o_merge_heads
+    dims: { in: "n_heads * d_head", out: d_model, bias: "1" }
+    weight_axes: [{ replicated: true }, { world: attention, parts: n_heads, fit: replica_cells }]
+outputs: [to_out]

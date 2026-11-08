@@ -1,0 +1,38 @@
+# NVFP4 as FastVideo's text-encoder converter writes it: E2M1 packed two per
+# byte under `.weight_packed`, the per-16 E4M3 scales as raw bytes under
+# `.weight_scale`, one F32 global scale. Same numbers as `nvfp4.yaml`, another
+# on-disk layout, so another scheme (`mxfp4-pack-quantized.yaml` is the same
+# split for MXFP4). Known client: FastH3's NVFP4 Qwen3-VL
+# (`text_encoder/config.json`: `quant_method: nvfp4`, `group_size: 16`).
+description: "NVFP4 packed: `.weight_packed` E2M1 (2 per U8), `.weight_scale` per-16 E4M3 bytes, `.weight_global_scale` F32."
+
+num_bits:
+  fixed: 4
+badge: NVFP4
+
+format_variants:
+  default:
+    packing_factor: 2
+    storage_dtype: U8
+    weight_storage_suffix: ".weight_packed"
+
+numeric_format: [fp_e2m1]
+numeric_format_resolver:
+  - { when: "true", format: fp_e2m1 }
+
+scale_strategy: [group]
+
+metadata_siblings:
+  - suffix: ".weight_scale"
+    kind: scale
+    shape_per_strategy:
+      group: ["out", "(in + group_size - 1) // group_size"]
+    dtype: U8
+    logical_dtype: F8_E4M3
+  - suffix: ".weight_global_scale"
+    kind: global_scale
+    shape: ["1"]
+    dtype: F32
+
+required_fields: [group_size]
+valid_status: [compressed, frozen]

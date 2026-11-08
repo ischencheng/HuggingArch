@@ -22,6 +22,17 @@ tower and language model as one:
 
 The prefix is the folder name, so two components can never write the same
 tensor name, and the file's byte total is the sum of the components' own.
+
+A component folder may hold safetensors beyond the checkpoint its library
+loads, for a runtime that reads them itself (FastVideo's FastH3 exports keep
+packed NVFP4 linears in `transformer/nvfp4_weights.safetensors`, and INT8
+decoder weights beside the VAE's own checkpoint). Such a file is read too,
+so the header holds every tensor the repo ships. One whose names are all new
+adds to the component (`<component>.<name>`); one that stores a name the
+component already holds is another copy of those tensors, not more of them,
+and keeps its own space under the file's stem
+(`<component>.<stem>.<name>`). The spec says which of the two it runs, and
+what is left over is held to `checkpoint_unread`.
 """
 from __future__ import annotations
 
@@ -79,6 +90,17 @@ def weight_files(files: Iterable[str], component: str
     return None
 
 
+def sidecar_files(files: Iterable[str], component: str,
+                  checkpoint: Iterable[str]) -> Tuple[str, ...]:
+    """The other safetensors directly in `component`'s folder, beside the
+    `checkpoint` shards its library loads."""
+    loaded = set(checkpoint)
+    return tuple(sorted(
+        f for f in files
+        if f.startswith(f"{component}/") and f.endswith(".safetensors")
+        and f.count("/") == 1 and f not in loaded))
+
+
 def compose_config(index: Mapping[str, Any],
                    component_configs: Mapping[str, Mapping[str, Any]]
                    ) -> Dict[str, Any]:
@@ -129,7 +151,25 @@ def read_pipeline_header(model_id: str, revision: Optional[str] = None):
     with open(hf_hub_download(model_id, PIPELINE_INDEX, revision=info.sha),
               encoding="utf-8") as f:
         index = json.load(f)
+    def shard_tensors(shard: str) -> Mapping[str, Any]:
+        last_err: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                return api.parse_safetensors_file_metadata(
+                    model_id, shard, revision=info.sha).tensors
+            except (OSError, ValueError, *HUB_UNREACHABLE) as e:
+                last_err = e
+                time.sleep(0.4 * (attempt + 1))
+        raise OSError(
+            f"{model_id}: shard {shard} header unreadable: {last_err}")
+
     read = ReadTensors()
+
+    def add(prefix: str, tensors: Mapping[str, Any], shard: str) -> None:
+        for name, t in tensors.items():
+            read.add(f"{prefix}.{name}", str(t.dtype), t.shape,
+                     int(t.data_offsets[1] - t.data_offsets[0]), shard=shard)
+
     for component in sorted(components(index)):
         found = weight_files(files, component)
         if found is None:
@@ -144,25 +184,19 @@ def read_pipeline_header(model_id: str, revision: Optional[str] = None):
             weight_map, shards = None, [single]
         names = set()
         for shard in shards:
-            last_err: Optional[Exception] = None
-            for attempt in range(3):
-                try:
-                    meta = api.parse_safetensors_file_metadata(
-                        model_id, shard, revision=info.sha)
-                    break
-                except (OSError, ValueError, *HUB_UNREACHABLE) as e:
-                    last_err = e
-                    time.sleep(0.4 * (attempt + 1))
-            else:
-                raise OSError(
-                    f"{model_id}: shard {shard} header unreadable: {last_err}")
-            for name, t in meta.tensors.items():
-                names.add(name)
-                read.add(f"{component}.{name}", str(t.dtype), t.shape,
-                         int(t.data_offsets[1] - t.data_offsets[0]),
-                         shard=shard)
+            tensors = shard_tensors(shard)
+            names.update(tensors)
+            add(component, tensors, shard)
         if weight_map is not None and set(weight_map) != names:
             raise ValueError(
                 f"{model_id}: {component}'s index and its shard headers name "
                 f"different tensors ({len(set(weight_map) ^ names)} differ)")
+        for sidecar in sidecar_files(files, component, shards):
+            tensors = shard_tensors(sidecar)
+            if names.isdisjoint(tensors):
+                names.update(tensors)
+                add(component, tensors, sidecar)
+            else:
+                stem = sidecar.rsplit("/", 1)[1].removesuffix(".safetensors")
+                add(f"{component}.{stem}", tensors, sidecar)
     return read.header(revision=info.sha)

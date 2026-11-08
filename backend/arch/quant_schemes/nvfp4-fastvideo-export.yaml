@@ -1,0 +1,52 @@
+# NVFP4 as FastVideo's packed DiT export stores it
+# (`transformer/nvfp4_weights.safetensors`, fastvideo
+# `layers/quantization/nvfp4_config.py`): each linear is a `<module>::<buffer>`
+# group, no `.weight`. E2M1 packed two per byte, per-16 E4M3 scales as raw
+# bytes, then the three scalars the kernel call reads. `calibrated` marks the
+# linears that also carry a static activation scale (the FFN's, from
+# ModelOpt; the attention projections quantize activations dynamically).
+description: "FastVideo NVFP4 export: `::_nvfp4_weight` E2M1 (2 per U8), `::_nvfp4_weight_scale` per-16 E4M3 bytes, scalar alpha and global scales."
+
+num_bits:
+  fixed: 4
+badge: NVFP4
+
+format_variants:
+  default:
+    packing_factor: 2
+    storage_dtype: U8
+    weight_storage_suffix: "::_nvfp4_weight"
+
+numeric_format: [fp_e2m1]
+numeric_format_resolver:
+  - { when: "true", format: fp_e2m1 }
+
+scale_strategy: [group]
+
+metadata_siblings:
+  - suffix: "::_nvfp4_weight_scale"
+    kind: scale
+    shape_per_strategy:
+      group: ["out", "(in + group_size - 1) // group_size"]
+    dtype: U8
+    logical_dtype: F8_E4M3
+  - suffix: "::_nvfp4_alpha"
+    kind: global_scale
+    shape: ["1"]
+    dtype: F32
+  - suffix: "::_weight_global_sf"
+    kind: global_scale
+    shape: ["1"]
+    dtype: BF16
+  - suffix: "::_nvfp4_input_global_sf"
+    kind: activation_scale
+    when: "calibrated == true"
+    shape: ["1"]
+    dtype: F32
+
+required_fields: [group_size]
+optional_fields: [calibrated]
+valid_status: [compressed, frozen]
+
+default_fields:
+  calibrated: false

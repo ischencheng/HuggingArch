@@ -69,7 +69,7 @@ HuggingArch is an analytical planner, not a profiler or a runtime.
 |---|---|
 | **Model types** | Text-generation LLMs and image-to-text (vision-language) models. Other modalities — image or audio generation, speech, embedding-only models — are out of scope. |
 | **Models** | 51 architecture families; **58 verified model ids** across 18 orgs — DeepSeek, Kimi, Qwen, Llama, Mistral, Gemma, GLM, MiMo, gpt-oss, Step, LongCat, Nemotron, … An unlisted id gets an agent-drafted spec that must pass validation before it is served. |
-| **Attention** | MHA, GQA, MLA, sparse (DSA), sliding window, linear attention and SSM hybrids — 196 reusable component DAGs. |
+| **Attention** | MHA, GQA, MLA, sparse (DSA), sliding window, linear attention and SSM hybrids — 202 reusable component DAGs. |
 | **Quantization** | FP8, FP4 / MXFP4 / NVFP4, AWQ, GPTQ, ModelOpt, compressed-tensors. |
 | **GPUs** | 15 SKUs: A100 through GB300. |
 | **Frameworks** | vLLM, sglang, and DeepInfer fusion bindings (91 fusion plans). |

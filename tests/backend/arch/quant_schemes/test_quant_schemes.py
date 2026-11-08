@@ -23,6 +23,22 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
+def test_fastvideo_nvfp4_formats_name_their_tensors():
+    from backend.arch.quant_schemes import QUANT_SCHEMES
+    export = QUANT_SCHEMES["nvfp4-fastvideo-export"]
+    assert export.format_variants["default"].weight_storage_suffix == "::_nvfp4_weight"
+    assert {s.suffix: s.kind for s in export.metadata_siblings} == {
+        "::_nvfp4_weight_scale": "scale",
+        "::_nvfp4_alpha": "global_scale",
+        "::_weight_global_sf": "global_scale",
+        "::_nvfp4_input_global_sf": "activation_scale",
+    }
+    packed = QUANT_SCHEMES["nvfp4-packed"]
+    assert packed.format_variants["default"].weight_storage_suffix == ".weight_packed"
+    int8 = QUANT_SCHEMES["int8-convrot"]
+    assert int8.format_variants["default"].storage_dtype == "I8"
+
+
 def _try_load_with_yaml(yaml_text: str):
     """Write yaml to a temp `arch/quant_schemes/` dir, redirect
     the loader at it, attempt load. Returns the resulting dict or
@@ -67,7 +83,8 @@ class TestSchemeRegistryLoad(unittest.TestCase):
     EXPECTED_SCHEMES = frozenset({"awq", "compressed-tensors", "fp4", "fp8", "fp8_ue8m0",
                                   "gptq", "modelopt", "mxfp4",
                                   "mxfp4-dot-suffix", "mxfp4-pack-quantized",
-                                  "nvfp4"})
+                                  "nvfp4", "nvfp4-packed", "nvfp4-fastvideo-export",
+                                  "int8-convrot"})
 
     def setUp(self):
         from backend.arch.quant_schemes import QUANT_SCHEMES

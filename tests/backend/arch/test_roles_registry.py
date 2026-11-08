@@ -101,7 +101,8 @@ class TestRoleRegistryCoverage(unittest.TestCase):
                           "attention_linear", "attention_output",
                           "attention_kv_up", "attention_compressor",
                           "attention_position_embedding",
-                          "attention_short_conv",
+                          "attention_short_conv", "attention_refiner",
+                          "ffn_refiner",
                           "ffn_dense", "ffn_moe", "ffn_moe_shared",
                           "ffn_moe_latent"})
         self.assertNotIn("router", roles.weight_classes())

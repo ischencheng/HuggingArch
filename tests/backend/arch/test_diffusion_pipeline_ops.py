@@ -10,7 +10,9 @@ from backend.arch.ops import OP_REGISTRY
 NEW_OPS = ("zeros", "zero_rows", "sinusoidal_embedding", "view_rows",
            "row_gather", "rope_3d", "conv1d_weight_norm", "conv_transpose1d",
            "conv_transpose1d_weight_norm", "filter_buffer", "snake_beta",
-           "append_tokens", "tile_video", "untile_video")
+           "append_tokens", "tile_video", "untile_video", "tile_pool", "tile_score",
+           "tile_topk_mask", "block_sparse_attention", "tile_compress",
+           "tile_unpool")
 
 
 def test_every_new_op_has_a_layout_law_and_its_axis_use():
@@ -18,6 +20,24 @@ def test_every_new_op_has_a_layout_law_and_its_axis_use():
             if layout_handler(op, OP_REGISTRY[op]) is None] == []
     assert [v for v in registry_violations(OP_REGISTRY)
             if v.split(":")[0] in NEW_OPS] == []
+
+
+def test_sparse_attention_is_priced_on_the_pairs_it_keeps():
+    dims = {"B": 1, "n_heads": 56, "d_head": 128, "s_query": 1000,
+            "tiles": 20, "s_pairs_kept": 250_000}
+    op = OP_REGISTRY["block_sparse_attention"]
+    # score, softmax and apply over the kept pairs, not 1000 × 1000 of them
+    assert op.flops_fn(dims) == (4 * 128 + 5) * 56 * 250_000
+    q = (1, 56, 1000, 128)
+    assert compute_shape_out("block_sparse_attention",
+                             [q, q, q, (1, 56, 20, 20)], dims) == q
+    assert compute_shape_out("tile_pool", [q], dims) == (1, 56, 20, 128)
+    tiles = (1, 56, 20, 128)
+    assert compute_shape_out("tile_score", [tiles, tiles], dims) == (
+        1, 56, 20, 20)
+    assert compute_shape_out("tile_compress", [(1, 56, 20, 20), tiles],
+                             dims) == tiles
+    assert compute_shape_out("tile_unpool", [tiles], dims) == q
 
 
 def test_a_transposed_conv_upsamples_rows_by_its_stride():

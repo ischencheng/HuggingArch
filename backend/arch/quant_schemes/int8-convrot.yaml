@@ -1,0 +1,37 @@
+# ComfyUI `int8_tensorwise` with ConvRot (fastvideo
+# `models/vaes/minimax_h3_int8_convrot.py`): an I8 `.weight`, one F32 scale
+# per output channel, and a 72-byte JSON marker. The weight was rotated by a
+# 256-point regular Hadamard before quantisation; the forward rotates each
+# activation with the same matrix, quantises it per row and runs an INT8 GEMM.
+# Known client: the light video decoder FastH3 ships.
+description: "INT8 + ConvRot: `.weight` I8, `.weight_scale` F32 per output channel, `.comfy_quant` JSON marker."
+
+num_bits:
+  fixed: 8
+badge: INT8
+
+format_variants:
+  default:
+    packing_factor: 1
+    storage_dtype: I8
+    weight_storage_suffix: ".weight"
+
+numeric_format: [int_sym]
+numeric_format_resolver:
+  - { when: "true", format: int_sym }
+
+scale_strategy: [channel]
+
+metadata_siblings:
+  - suffix: ".weight_scale"
+    kind: scale
+    shape_per_strategy:
+      channel: ["out", "1"]
+    dtype: F32
+  - suffix: ".comfy_quant"
+    kind: marker
+    shape: ["72"]
+    dtype: U8
+
+required_fields: []
+valid_status: [compressed, frozen]

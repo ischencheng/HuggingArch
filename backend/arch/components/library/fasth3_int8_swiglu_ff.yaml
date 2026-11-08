@@ -1,0 +1,29 @@
+# The light H3 video decoder's SwiGLU, as its INT8 export names it: `w1` to
+# 2·d_ffn and `w2` back down, both biased. The export stores `w1` gate rows
+# first; FastVideo swaps the halves at load (`_swap_swiglu_halves`), so at
+# run time it is value first, gate second, as every other H3 SwiGLU.
+#
+# Required dims: d_model, d_ffn
+
+role: ffn_dense
+description: "Light video decoder SwiGLU (INT8 export): w1 → (value | gate) → value · silu(gate) → w2."
+graph:
+  w1:
+    op: linear
+    in: x
+    dims: { in: d_model, out: "2 * d_ffn", bias: "1" }
+    weight_axes:
+      - segments:
+          - { segment: value, extent: d_ffn, placement_by_symbol: { d_ffn: { world: dense_ffn, parts: d_ffn, fit: exact }, d_vae_ffn: { world: dense_ffn, parts: d_ffn, fit: exact } } }
+          - { segment: gate, extent: d_ffn, placement_by_symbol: { d_ffn: { world: dense_ffn, parts: d_ffn, fit: exact }, d_vae_ffn: { world: dense_ffn, parts: d_ffn, fit: exact } } }
+      - { replicated: true }
+  value_slice: { op: slice, in: w1, dims: { in: "2 * d_ffn", out: d_ffn } }
+  gate_slice:  { op: slice, in: w1, dims: { in: "2 * d_ffn", out: d_ffn, start: d_ffn } }
+  silu:        { op: silu, in: gate_slice, dim: d_ffn }
+  gate_mul:    { op: mul, in: [value_slice, silu], dim: d_ffn }
+  w2:
+    op: linear
+    in: gate_mul
+    dims: { in: d_ffn, out: d_model, bias: "1" }
+    weight_axes: [{ replicated: true }, { placement_by_symbol: { d_ffn: { world: dense_ffn, parts: d_ffn, fit: exact }, d_vae_ffn: { world: dense_ffn, parts: d_ffn, fit: exact } } }]
+outputs: [w2]

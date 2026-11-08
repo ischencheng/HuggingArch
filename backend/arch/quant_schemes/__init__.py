@@ -375,9 +375,11 @@ def _parse_format_variants(raw: Dict[str, Any], scheme_name: str) -> Dict[str, F
 #: What a metadata sibling can be. `scale` and `zero_point` dequantize the
 #: weight; `index` is GPTQ's act-order permutation; `shape` is the packed
 #: weight's logical shape written beside it; `activation_scale` is a static
-#: input scale, quantization metadata that is not about the weight.
+#: input scale, quantization metadata that is not about the weight;
+#: `global_scale` is one scale for the whole tensor; `marker` is a stored format
+#: tag with no numeric role.
 SIBLING_KINDS: Tuple[str, ...] = (
-    "scale", "zero_point", "index", "shape", "activation_scale")
+    "scale", "zero_point", "index", "shape", "activation_scale", "global_scale", "marker")
 
 
 def _parse_metadata_siblings(raw: Any, scheme_name: str) -> Tuple[MetadataSibling, ...]:

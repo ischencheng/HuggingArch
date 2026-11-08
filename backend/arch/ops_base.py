@@ -438,7 +438,7 @@ _CANONICAL_DIMS: Dict[str, Any] = {
         # Phase binding sets all three; pure-prefill keeps s_query=s_kv=s_ctx.
         # `s_pairs` is the live (query, key) pairs of the matrix a node
         # scores, which the QKᵀ / AV / softmax counts are written in.
-        "B", "s_ctx", "s_query", "s_kv", "s_past", "n_verify", "s_pairs",
+        "B", "s_ctx", "s_query", "s_kv", "s_past", "n_verify", "s_pairs", "s_pairs_kept",
         # Linear in/out
         "in", "out",
         # Standard model dims (size + flag)

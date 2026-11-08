@@ -262,6 +262,11 @@ AXIS_USE = {
     "mrope": {"dim": _w("pairing dim/2")},
     "rope_2d": {"dim": _w("pairing dim/2")},
     "rope_3d": {"dim": _w("pairing dim/2")},
+    "tile_pool": {"s_query": _c("sum", "the rows of one tile")},
+    "tile_score": {"tiles": _PAIR, "d_head": _c("sum")},
+    "tile_topk_mask": {"tiles": _n("topk", "over a tile row's scores")},
+    "block_sparse_attention": {"s_query": _PAIR, "d_head": _c("sum")},
+    "tile_compress": {"tiles": _c("sum"), "d_head": _c("sum")},
     "xdrope": {"dim": _w("pairing dim/2")},
     # ---- recurrent family ---------------------------------------------------
     "mamba2_scan": {"s_ctx": AxisUse(RECURRENT, "d_ssm_state"),

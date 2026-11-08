@@ -4,7 +4,7 @@ tensor under its component's folder."""
 from __future__ import annotations
 
 from backend.hf.pipeline import (compose_config, components,
-                                 is_pipeline_repo, weight_files)
+                                 is_pipeline_repo, sidecar_files, weight_files)
 
 INDEX = {
     "_class_name": "MiniMaxH3ModularPipeline",
@@ -50,6 +50,17 @@ def test_a_component_stores_weights_sharded_single_or_not_at_all():
         None, "transformer/diffusion_pytorch_model.safetensors")
     assert weight_files(FILES, "tokenizer") is None
     assert weight_files(FILES, "scheduler") is None
+
+
+def test_a_component_folder_can_hold_files_its_library_does_not_load():
+    files = FILES | {"transformer/nvfp4_weights.safetensors",
+                     "transformer/sub/other.safetensors",
+                     "transformer/adaln_tables.pt"}
+    assert sidecar_files(
+        files, "transformer",
+        ["transformer/diffusion_pytorch_model.safetensors"]) == (
+            "transformer/nvfp4_weights.safetensors",)
+    assert sidecar_files(FILES, "tokenizer", []) == ()
 
 
 def test_the_config_holds_each_component_config_under_its_name():

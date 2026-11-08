@@ -1,0 +1,83 @@
+# FastH3's joint attention (FastVideo `MiniMaxH3Attention` with
+# `VIDEO_SPARSE_ATTN_H3`, `models/dits/minimax_h3_vsa_fp4.py`
+# `vsa_fp4_attention`): the H3 attention of `minimax_h3_attention`, sparse.
+#
+#   q, k, v = to_q/k/v(x); per-head RMSNorm and 3-D RoPE on Q and K
+#   pool Q and K over 64-token tiles, score the tile pairs, keep per video query
+#   tile every non-video tile and its top (1 - sparsity) of the video tiles
+#   (non-video query tiles keep all): the block-sparse attention reads only those
+#   out += gate(x) · (softmax(tile scores) @ v pooled)[tile of each row]
+#
+# `to_gate_compress` is the trained compression gate VSA-distilled students
+# ship: it sees the attention's input, projects like Q/K/V, and scales the
+# tile-level compression branch per row and channel.
+#
+# `s_pairs` of the sparse read is stated, in rows: every row reads the
+# non-video rows, a non-video row reads everything, a video row keeps the kept
+# fraction of the video rows. It is `selected` in FastVideo's density table
+# (0.222 at 1344x768, 243 frames); the kernel computes on 128x128 blocks
+# with per-quadrant masks, so it touches more than it keeps (0.434 at that
+# size), which a per-pair count does not carry.
+#
+# Required dims: d_model, n_heads, d_head, d_rope, d_nope, n_vsa_tile,
+#                n_vsa_tiles, s_vsa_prefix, n_vsa_sparsity_pct
+
+role: attention
+description: "FastH3 sparse joint attention (VSA): tile pooling, top-k tile selection, block-sparse attention over the kept tiles, gated tile-level compression."
+params:
+  rope: { kind: component, default: partial_rope_3d }
+cache:
+  family: DiT
+  entries: []
+graph:
+  to_q:
+    op: linear
+    in: x
+    dims: { in: d_model, out: "n_heads * d_head" }
+    weight_axes: [{ world: attention, parts: n_heads, fit: replica_cells }, { replicated: true }]
+  to_k:
+    op: linear
+    in: x
+    dims: { in: d_model, out: "n_heads * d_head" }
+    weight_axes: [{ world: attention, parts: n_heads, fit: replica_cells }, { replicated: true }]
+  to_v:
+    op: linear
+    in: x
+    dims: { in: d_model, out: "n_heads * d_head" }
+    weight_axes: [{ world: attention, parts: n_heads, fit: replica_cells }, { replicated: true }]
+  to_gate_compress:
+    op: linear
+    in: x
+    dims: { in: d_model, out: "n_heads * d_head" }
+    weight_axes: [{ world: attention, parts: n_heads, fit: replica_cells }, { replicated: true }]
+  q_split_heads: { op: head_split, in: to_q, dims: { n_heads: n_heads, d_head: d_head } }
+  k_split_heads: { op: head_split, in: to_k, dims: { n_heads: n_heads, d_head: d_head } }
+  v_split_heads: { op: head_split, in: to_v, dims: { n_heads: n_heads, d_head: d_head } }
+  gate_split_heads: { op: head_split, in: to_gate_compress, dims: { n_heads: n_heads, d_head: d_head } }
+  norm_q:        { op: rmsnorm, in: q_split_heads, dim: d_head, weight_axes: [{ replicated: true }] }
+  norm_k:        { op: rmsnorm, in: k_split_heads, dim: d_head, weight_axes: [{ replicated: true }] }
+  q_rope:        { op: <rope>, in: norm_q, module: null, dims: { d_head: d_head, d_rope: d_rope, d_nope: d_nope } }
+  k_rope:        { op: <rope>, in: norm_k, module: null, dims: { d_head: d_head, d_rope: d_rope, d_nope: d_nope } }
+  q_tiles:       { op: tile_pool, in: q_rope, dims: { n_heads: n_heads, d_head: d_head, tiles: n_vsa_tiles } }
+  k_tiles:       { op: tile_pool, in: k_rope, dims: { n_heads: n_heads, d_head: d_head, tiles: n_vsa_tiles } }
+  v_tiles:       { op: tile_pool, in: v_split_heads, dims: { n_heads: n_heads, d_head: d_head, tiles: n_vsa_tiles } }
+  tile_score:    { op: tile_score, in: [q_tiles, k_tiles], dims: { n_heads: n_heads, d_head: d_head, tiles: n_vsa_tiles } }
+  tile_mask:     { op: tile_topk_mask, in: tile_score, dims: { n_heads: n_heads, tiles: n_vsa_tiles } }
+  block_sparse:
+    op: block_sparse_attention
+    in: [q_rope, k_rope, v_split_heads, tile_mask]
+    dims:
+      n_heads: n_heads
+      d_head: d_head
+      s_pairs_kept: "s_query * s_vsa_prefix + (s_query - s_vsa_prefix) * (s_vsa_prefix + ceiling((100 - n_vsa_sparsity_pct) * (s_query - s_vsa_prefix) / 100))"
+  tile_compress: { op: tile_compress, in: [tile_score, v_tiles], dims: { n_heads: n_heads, d_head: d_head, tiles: n_vsa_tiles } }
+  tile_rows:     { op: tile_unpool, in: tile_compress, dims: { n_heads: n_heads, d_head: d_head } }
+  gated:         { op: mul, in: [gate_split_heads, tile_rows], dim: d_head }
+  combined:      { op: add, in: [block_sparse, gated], dim: d_head }
+  o_merge_heads: { op: head_merge, in: combined, dims: { n_heads: n_heads, d_head: d_head } }
+  to_out:
+    op: linear
+    in: o_merge_heads
+    dims: { in: "n_heads * d_head", out: d_model }
+    weight_axes: [{ replicated: true }, { world: attention, parts: n_heads, fit: replica_cells }]
+outputs: [to_out]

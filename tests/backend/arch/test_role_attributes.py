@@ -30,11 +30,12 @@ class TestAttributesAreColumns(unittest.TestCase):
                           "attention_linear", "attention_output",
                           "attention_kv_up", "attention_compressor",
                           "attention_position_embedding",
-                          "attention_short_conv",
+                          "attention_short_conv", "attention_refiner",
                           "ffn_dense", "ffn_moe", "ffn_moe_shared",
-                          "ffn_moe_latent"})
+                          "ffn_moe_latent", "ffn_refiner"})
         self.assertEqual(roles.ffn_gate_roles(),
-                         {"ffn_dense", "ffn_moe", "ffn_moe_shared"})
+                         {"ffn_dense", "ffn_moe", "ffn_moe_shared",
+                          "ffn_refiner"})
         for name in roles.weight_classes() | roles.ffn_gate_roles():
             self.assertTrue(roles.is_registered(name))
 

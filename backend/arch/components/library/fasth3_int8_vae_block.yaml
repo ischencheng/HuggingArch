@@ -1,0 +1,20 @@
+# The light H3 video decoder block, as its INT8 export stores it: the block of
+# `minimax_h3_vae_block` (diffusers
+# `MiniMaxH3VideoTransformerBlock`): pre-norm attention and SwiGLU FFN, each
+# residual branch scaled by a learned per-channel `scale` (LayerScale).
+#
+#   x = x + attn(norm1(x)) * scale1;  x = x + ff(norm2(x)) * scale2
+role: block
+description: "Light video decoder block (INT8 export): pre-RMSNorm attention and biased SwiGLU FFN, each branch LayerScaled."
+graph:
+  norm1:         { op: rmsnorm, in: x, dim: d_model, weight_axes: [{ replicated: true }] }
+  attn:          { op: fasth3_int8_vae_attention, in: norm1 }
+  scale1:        { op: parameter_vector, dim: d_model, weight_axes: [{ replicated: true }] }
+  attn_scaled:   { op: mul, in: [attn, scale1], dim: d_model }
+  attn_residual: { op: add, in: [x, attn_scaled], dim: d_model }
+  norm2:         { op: rmsnorm, in: attn_residual, dim: d_model, weight_axes: [{ replicated: true }] }
+  ff:            { op: fasth3_int8_swiglu_ff, in: norm2 }
+  scale2:        { op: parameter_vector, dim: d_model, weight_axes: [{ replicated: true }] }
+  ff_scaled:     { op: mul, in: [ff, scale2], dim: d_model }
+  out:           { op: add, in: [attn_residual, ff_scaled], dim: d_model }
+outputs: [out]

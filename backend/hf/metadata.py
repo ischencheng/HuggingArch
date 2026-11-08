@@ -19,7 +19,7 @@ local-repo header readers, the record a snapshot stores (`metadata_record`), tot
 """
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 
 from backend.custom_id import is_custom_id, model_path, strip_prefix
@@ -41,7 +41,8 @@ logger = logging.getLogger(__name__)
 
 def summarize(header: SafetensorsHeader, *, scheme: QuantScheme,
               num_bits: int,
-              unknown_method: Optional[str] = None) -> Dict[str, Any]:
+              unknown_method: Optional[str] = None,
+              sidecars: Tuple[str, ...] = ()) -> Dict[str, Any]:
     """The header with the totals it implies: parameters and bytes, split
     into quant-metadata sidecars and the rest.
 
@@ -49,7 +50,9 @@ def summarize(header: SafetensorsHeader, *, scheme: QuantScheme,
     scheme's suffixes (its config's `also_stores` layouts included), and
     only those; everything else — weights and any buffer the file serialises —
     is the rest. Which of the rest is a buffer is the spec's declaration,
-    joined by name in `validate`, not a fact the header carries.
+    joined by name in `validate`, not a fact the header carries. `sidecars`
+    are further tail suffixes to file as quant sidecars: the ones a spec
+    declares where the config names no scheme for them.
     """
     total_params = 0
     quantization_metadata_params = 0
@@ -61,7 +64,7 @@ def summarize(header: SafetensorsHeader, *, scheme: QuantScheme,
         # A dtype not in the table raises rather than being priced at BF16:
         # see `arch.dtypes` for what a silent default once cost.
         width = _dtype_bytes(dtype)
-        if is_quantization_metadata(name, scheme):
+        if is_quantization_metadata(name, scheme) or name.endswith(sidecars):
             quantization_metadata_params += elements
             quantization_metadata_bytes += elements * width
             continue

@@ -7,9 +7,9 @@ role: block
 description: "MiniMax-H3 token-refiner block: pre-norm full attention (no RoPE) and SwiGLU FFN over the text rows."
 graph:
   norm1:         { op: rmsnorm, in: x, dim: d_model, weight_axes: [{ replicated: true }] }
-  attn:          { op: minimax_h3_attention, in: norm1, params: { rope: identity_rope } }
+  attn:          { op: minimax_h3_attention, in: norm1, role: attention_refiner, params: { rope: identity_rope } }
   attn_residual: { op: add, in: [x, attn], dim: d_model }
   norm2:         { op: rmsnorm, in: attn_residual, dim: d_model, weight_axes: [{ replicated: true }] }
-  ff:            { op: diffusers_swiglu_ff, in: norm2, dims: { Fb: "0" } }
+  ff:            { op: diffusers_swiglu_ff, in: norm2, role: ffn_refiner, dims: { Fb: "0" } }
   out:           { op: add, in: [attn_residual, ff], dim: d_model }
 outputs: [out]
