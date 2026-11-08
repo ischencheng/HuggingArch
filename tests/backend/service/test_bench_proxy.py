@@ -109,7 +109,8 @@ def test_bad_credentials_never_reach_the_service(client, recorded):
     assert r.status_code == 401 and recorded == []
 
 
-def test_a_token_is_accepted_on_upload_only(client, recorded, monkeypatch):
+def test_a_token_is_accepted_for_the_measurement_pipeline_only(
+        client, recorded, monkeypatch):
     from backend.service import personal_tokens
     monkeypatch.setattr(personal_tokens, "looks_like_pat", lambda t: t.startswith("hapat_"))
     monkeypatch.setattr(personal_tokens, "verify", lambda t: ALICE if t == "hapat_ok" else None)
@@ -117,10 +118,14 @@ def test_a_token_is_accepted_on_upload_only(client, recorded, monkeypatch):
     pat = {"Authorization": "Bearer hapat_ok"}
     assert client.post("/api/bench/upload", headers=pat, json={"csv_text": "x"}).status_code == 200
     assert recorded[-1].headers["x-ha-user"] == ALICE
+    assert client.post("/api/bench/run/run-1/contribute", headers=pat).status_code == 200
+    assert client.post("/api/bench/promote", headers=pat, json={"sets": []}).status_code == 200
     assert client.post("/api/bench/upload", headers={"Authorization": "Bearer hapat_no"},
                        json={"csv_text": "x"}).status_code == 401
-    # Elsewhere a token is not a session.
+    # Other Kernel Bench reads and everywhere else: a long-lived pipeline
+    # token is not a session.
     assert client.get("/api/bench/list", headers=pat).status_code == 401
+    assert client.get("/api/account/tokens", headers=pat).status_code == 401
 
 
 def test_the_services_statuses_pass_through(client, service, httpx_mock):
@@ -192,8 +197,6 @@ def test_an_unmigrated_lake_is_degraded_at_the_api_level(client, route_to):
     detail = client.get("/health").json()["detail"]["kernel_bench"]
     assert detail["state"] == "degraded"
     assert detail["lake"]["data_rules"]["state"] == "behind"
-
-
 def test_the_response_headers_are_the_services_own(client, route_to):
     def handler(request):
         return httpx.Response(200, content=b"a,b\n1,2\n", headers={

@@ -539,9 +539,9 @@ The service authenticates no one. Its trust boundary is:
   empty for an anonymous caller) and `X-HA-Admin` (`1` for an admin) on a
   request that passed the secret check (`identity.py`).
 - **The HA API's proxy** (`backend/service/bench_proxy.py`) authenticates
-  the browser — a session (bearer JWT or access cookie), or on
-  `POST /api/bench/upload` also a personal access token (`hbench upload`) —
-  and forwards `/api/bench/*` with headers built fresh: the body's
+  the browser — a session (bearer JWT or access cookie), with a personal access
+  token accepted only on the measurement pipeline's upload, nominate and promote
+  routes — and forwards `/api/bench/*` with headers built fresh: the body's
   `Content-Type` and the three `X-HA-*` headers it alone sets. No browser
   header, cookie or `X-HA-*` header crosses. Bodies stream both ways.
   Timeouts: reads 30 s, writes 120 s, connect 2 s; a client disconnect
@@ -675,6 +675,13 @@ batches has.
 An admin may also publish an upload directly as shared (`hbench upload
 --public`). The owner may delete a run, an upload or selected rows at any
 status; deleting a shared row removes it from the shared corpus.
+
+The H100 and RTX-4090 harvesters use the same public review flow
+(`tools/upload_to_authoritative_lake.py`): a personal access token of the
+contributor/admin account, upload private, nominate `within_peak`, promote.
+The loopback service on port 8100 is not an upload target; a local lake is a
+restore of the authoritative backup. The queue may still ask that local copy
+the read-only coverage question while it plans work.
 
 ### 6.3 How private and shared rows merge
 
