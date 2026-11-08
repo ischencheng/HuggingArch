@@ -486,6 +486,7 @@ CI_ONLY_CHECKS: Tuple[CiOnlyCheck, ...] = tuple(
         'tests/backend/arch/test_moe_unbound_defaults.py',
         'tests/backend/arch/test_media_processor.py',
         'tests/backend/arch/test_mtp_entry.py',
+        'tests/backend/arch/test_minimax_h3_spec.py',
         'tests/backend/arch/test_mtp_logits.py',
         'tests/backend/arch/test_roles_registry.py',
         'tests/backend/arch/test_spec_id_compose.py',

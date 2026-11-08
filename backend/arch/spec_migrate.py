@@ -1933,8 +1933,12 @@ def _stamp_aux_checkpoint(layers: list, notes: list[str]) -> None:
 def _stamp_input_embedding(layers: list, notes: list[str],
                            blockers: list[str]) -> None:
     top = [layer for layer in layers if isinstance(layer, dict)]
-    declared = [layer for layer in top
-                if layer.get("boundary_role") == "input_embedding"]
+    # The document's rule (`SpecDocument._nonempty_model`): exactly one
+    # input embedding, at the top level or — a pipeline whose tokens enter
+    # its text encoder — inside a group.
+    declared = [layer for layer in _walk_layers(top)
+                if isinstance(layer, dict)
+                and layer.get("boundary_role") == "input_embedding"]
     embeddings = [layer for layer in top if layer.get("op") == "embedding"]
     target: Optional[dict] = None
     if len(declared) == 1:

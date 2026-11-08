@@ -111,12 +111,18 @@ def _cache_budget_terms(
     A request's cache is `growth × L + floor` past every window. Either term
     may be zero: a cache that is all floor (every layer windowed, or a pure
     recurrent state) holds a fixed amount per request however long it runs.
-    Only a cache with neither term is no cache to budget.
+    Only a cache with neither term is no cache to budget. A model whose
+    attentions declare none (a diffusion transformer: the reader has no
+    entry) holds nothing per request; its terms are all zero.
 
     `shard_divisor` is the whole-to-local ratio of that law as `L` grows —
     of the growth when there is growth, of the floor when the cache is all
     floor. It is one ratio, the long-context one, read off the leading term.
     """
+    if not reader.entries:
+        return _CacheBudgetTerms(
+            reader=reader, static=0.0, constant_state=0.0, per_token=0.0,
+            shard_divisor=1.0, replication_factor=1.0)
     per_token, constant_state = reader.growth_and_floor()
     static = reader.static_scale_bytes()
     if per_token <= 0 and constant_state <= 0:
@@ -2636,34 +2642,6 @@ def capacity_ceilings(
     # already, before dividing.
     per_request_kv_bytes = _reader.storage_bytes_at(request_tokens)
     kv_per_class_breakdown = _reader.storage_breakdown(request_tokens)
-    max_batch = (
-        int(usable_for_tokens // per_request_kv_bytes)
-        if (fits and per_request_kv_bytes > 0) else 0
-    )
-
-    # Honest infeasibility note. `batch == 0` reaches phases.estimate_phase
-    # for two structurally distinct reasons; the canned "weights exceed
-    # budget" string used to fire on both, misleading users in the second
-    # case. Disambiguate here, where fits / max_tokens / per-request are
-    # still in scope, and let the phase function consume the precomposed
-    # string.
-    if max_batch > 0:
-        infeasibility_reason: Optional[str] = None
-    elif not fits:
-        infeasibility_reason = _weight_overflow_reason(
-            gpu=gpu, weight_bytes=weight_bytes_per_rank,
-            usable_bytes=usable_bytes, static_bytes=kv_static_per_rank,
-            constant_state_bytes=kv_constant_state_per_rank)
-    else:
-        infeasibility_reason = (
-            f"KV budget ({usable_for_tokens / _GB:.2f} GiB) is too small for "
-            f"one request at seq={request_tokens:,} "
-            f"(needs {per_request_kv_bytes / _GB:.2f} GiB). "
-            f"Use a shorter seq or raise TP_attention."
-        )
-
-    max_batch_total = max_batch * unique_tokens_multiplier
-
     # Scaled KV block surfaced for the UI (reflects per-rank values).
     # Built from the reader's entries — the labels come from the same
     # component declarations the attention badge resolver reads, so the
@@ -2839,6 +2817,38 @@ def capacity_ceilings(
     else:
         max_prefill_batch = 0 if not fits else 1
     max_prefill_batch_total = max_prefill_batch * unique_tokens_multiplier
+
+    # A model that keeps no cache holds nothing per request between forwards:
+    # its one footprint is the forward's activations, so that budget is the
+    # one its batch divides.
+    max_batch = (
+        max_prefill_batch if fits and not _reader.entries
+        else int(usable_for_tokens // per_request_kv_bytes)
+        if (fits and per_request_kv_bytes > 0) else 0
+    )
+
+    # Honest infeasibility note. `batch == 0` reaches phases.estimate_phase
+    # for two structurally distinct reasons; the canned "weights exceed
+    # budget" string used to fire on both, misleading users in the second
+    # case. Disambiguate here, where fits / max_tokens / per-request are
+    # still in scope, and let the phase function consume the precomposed
+    # string.
+    if max_batch > 0:
+        infeasibility_reason: Optional[str] = None
+    elif not fits:
+        infeasibility_reason = _weight_overflow_reason(
+            gpu=gpu, weight_bytes=weight_bytes_per_rank,
+            usable_bytes=usable_bytes, static_bytes=kv_static_per_rank,
+            constant_state_bytes=kv_constant_state_per_rank)
+    else:
+        infeasibility_reason = (
+            f"KV budget ({usable_for_tokens / _GB:.2f} GiB) is too small for "
+            f"one request at seq={request_tokens:,} "
+            f"(needs {per_request_kv_bytes / _GB:.2f} GiB). "
+            f"Use a shorter seq or raise TP_attention."
+        )
+
+    max_batch_total = max_batch * unique_tokens_multiplier
 
     return CapacityCeilings(
         request_tokens=request_tokens,

@@ -20,6 +20,7 @@ import time
 
 from backend.arch.quant_schemes import resolve_scheme
 from backend.hf.metadata import HUB_UNREACHABLE, metadata_record
+from backend.hf.pipeline import is_pipeline_repo, pipeline_config
 
 # Ensure project root is on sys.path (mirrors other tools).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -29,7 +30,9 @@ def fetch_config_raw(model_id: str) -> dict:
     """Raw HF fetch — bypasses the snapshot lookup in `hf.metadata.fetch_config`
     (otherwise refreshing a snapshot would read from itself). The spec-gen
     side's one config read, beside `fetch_metadata_raw`."""
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import HfApi, hf_hub_download
+    if is_pipeline_repo(HfApi().list_repo_files(model_id)):
+        return pipeline_config(model_id)
     p = hf_hub_download(repo_id=model_id, filename="config.json")
     with open(p, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -54,6 +57,7 @@ def _fetch_forward_source_raw(model_id: str, config: dict) -> dict:
     from backend.hf.forward_source import (
         _try_custom_model, _try_local_transformers,
         _try_model_info_cache, _try_hf_modeling_files,
+        _try_pipeline_sources,
     )
     # Lightweight shim mimicking ResolvedSpec.config access
     class _ResolvedShim:
@@ -64,6 +68,10 @@ def _fetch_forward_source_raw(model_id: str, config: dict) -> dict:
     # for its model_type stands in only when the repo ships none.
     for label, fn in (
         ("custom_model", lambda: _try_custom_model(model_id)),
+        # A pipeline's components each name their library's module; the
+        # repo's own `.py` files (H3 ships its VAEs' reference code under
+        # workflow folders) are not the pipeline the index loads.
+        ("pipeline_components", lambda: _try_pipeline_sources(model_id, shim)),
         ("hf_modeling_files", lambda: _try_hf_modeling_files(model_id, shim)),
         ("local_transformers", lambda: _try_local_transformers(model_id, shim)),
         ("model_info_cache", lambda: _try_model_info_cache(model_id)),
@@ -149,7 +157,11 @@ def snapshot_one(model_id: str, *, skip_if_exists: bool = False) -> str:
         return f"FAIL processor: {model_id}  ({e.__class__.__name__}: {str(e)[:120]})"
 
     model_str = ""
+    # A pipeline has no one module to print: its components are separate
+    # models, and the skeleton loader builds a transformers causal LM.
     try:
+        if "_components" in cfg:
+            raise LookupError("pipeline: no single skeleton")
         from backend.hf.model_info import extract_model_info
         info = extract_model_info(model_id)
         model_str = info.get("model_str", "") or ""

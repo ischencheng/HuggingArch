@@ -2,7 +2,7 @@
 
 `CacheSpec.family` was free text. This is the registry the loader checks it
 against, and the one place a family's `kind` (full / windowed / recurrent /
-vision) is declared; the validator's sliding-window contract asks
+vision / none) is declared; the validator's sliding-window contract asks
 `of_kind("windowed")` instead of keeping its own `{"SWA"}`.
 
 The same file holds the cache SLOT kinds (`slot_kinds:`): what each
@@ -24,7 +24,7 @@ from backend.code_trace.memo import memoize
 
 _REGISTRY_PATH = Path(__file__).parent / "cache_families.yaml"
 
-KINDS: FrozenSet[str] = frozenset({"full", "windowed", "recurrent", "vision"})
+KINDS: FrozenSet[str] = frozenset({"full", "windowed", "recurrent", "vision", "none"})
 
 
 @dataclass(frozen=True)

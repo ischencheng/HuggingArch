@@ -78,11 +78,6 @@ def _ops_for(rotation: Tuple[str, int]) -> List[str]:
                   and spec.rotary_sections_key == key)
 
 
-#: The most position streams an encoder rotation reads: an image grid's h and
-#: w (`rope_2d`).
-_ENCODER_AXES = 2
-
-
 def _rotation(op: str) -> Optional[Tuple[str, int]]:
     spec = OP_REGISTRY.get(op)
     if spec is None or not spec.rotary_position_axes:
@@ -100,6 +95,14 @@ def run_rotary_position_check(resolved: Any, config: Any) -> List[Finding]:
     without a section list asks nothing of the text path."""
     want = config_rotation(language_config(resolved.spec.dims, config)[1])
     program = Program.of(resolved)
+    # The most position streams an encoder rotation reads: one per axis of
+    # an item of what it encodes — a video's (t, h, w), an image's (h, w),
+    # one position per token of a clip or a prompt.
+    grid_axes: dict = {}
+    for entry in program.model_inputs.values():
+        if entry.stack is not None:
+            grid_axes[entry.stack] = max(grid_axes.get(entry.stack, 1),
+                                         len(entry.axes) - 1)
     out: List[Finding] = []
     seen = set()
     for node in program.nodes():
@@ -107,8 +110,9 @@ def run_rotary_position_check(resolved: Any, config: Any) -> List[Finding]:
             continue
         got = _rotation(node.op)
         encoder = node.uid in program.encoder_uids
+        most = grid_axes.get(program.stack_of(node), 2) if encoder else None
         if got is None or (
-                (got[1] <= _ENCODER_AXES and not got[0]) if encoder
+                (got[1] <= most and not got[0]) if encoder
                 else (got == want or not want[0])):
             continue
         where = node.display_path or node.name
@@ -119,8 +123,9 @@ def run_rotary_position_check(resolved: Any, config: Any) -> List[Finding]:
             detail = (
                 f"{where} is an encoder rotation written `op: {node.op}` "
                 f"({got[1]} position streams). An encoder rotates by its own "
-                f"input's positions: write `op: rope_2d` for an image grid's "
-                f"(h, w) rotation, or `op: rope` for one position per token.")
+                f"input's positions: write `op: rope_3d` for a video grid's "
+                f"(t, h, w) rotation, `op: rope_2d` for an image grid's "
+                f"(h, w), or `op: rope` for one position per token.")
         else:
             ops = _ops_for(want)
             detail = (

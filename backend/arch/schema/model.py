@@ -502,6 +502,127 @@ class CheckpointCopySpec(BaseModel):
         return value
 
 
+class DenoiseLatent(BaseModel):
+    """One latent a denoise loop steps (`DenoiseLoop.latents`): the model
+    input it starts from, the backbone layer whose prediction each step
+    applies to it, and the model input that holds it once the loop ends."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    start: str
+    update: str
+    end: str
+
+
+class DenoiseLoop(BaseModel):
+    """A diffusion pipeline's denoise loop (`denoise_loop:`): the language
+    model's step is one forward of the transformer, and the pipeline runs it
+    `steps` times per request, its scheduler applying the predictions to the
+    latents between forwards (`x ← x + (σ' − σ) · v`, outside every
+    forward). A decoder reads each latent where the loop leaves it (`end`), a
+    tensor of its own because nothing in the graph turns `start` into it.
+
+    `steps` is a dim expression; `source_anchor` cites the loop."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    steps: str
+    latents: List[DenoiseLatent]
+    source_anchor: str
+
+    @field_validator("steps", mode="before")
+    @classmethod
+    def _steps_as_expression(cls, value: Any) -> Any:
+        return str(value)
+
+    @field_validator("latents")
+    @classmethod
+    def _some_latent(cls, value: List[DenoiseLatent]) -> List[DenoiseLatent]:
+        if not value:
+            raise ValueError("denoise_loop.latents names no latent it steps")
+        return value
+
+
+class UnreadCheckpointModule(BaseModel):
+    """A module the checkpoint stores and the modelled forward never runs
+    (`checkpoint_unread:`), with every tensor under it.
+
+    The spec describes what one path through the checkpoint computes; a
+    checkpoint can hold more. A diffusion pipeline's repo serves several
+    workflows from one set of components: text-to-video never runs the
+    video encoder that image-to-video encodes its keyframe with, and no
+    workflow runs the text encoder's last layers or its LM head. Those
+    tensors are the file's, not the graph's: no node stores them, and the
+    validator holds the declaration to the header instead — each entry
+    selects at least one tensor, two entries select none in common, and a
+    tensor a node stores is never one of them. They count where the FILE is
+    the subject (the checkpoint's byte total) and nowhere a deployment is.
+
+    `module` is the dotted path every selected tensor sits under. `layers`
+    narrows an indexed stack at that path to the indices it lists (`50-63`),
+    the segment right after `module`. `kind` is why nothing runs it:
+    `load_skipped`, the serving loader drops it (vLLM-Omni's MiniMax-H3 text
+    encoder keeps layers 0-49), or `other_workflow`, another workflow of the
+    same pipeline runs it and this one leaves it unread. `reason` says it in
+    words; `source_anchor` cites the source (file:line) that shows it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    module: str
+    layers: Optional[str] = Field(default=None, exclude_if=lambda v: v is None)
+    kind: Literal["load_skipped", "other_workflow"]
+    reason: str
+    source_anchor: str
+
+    @field_validator("module")
+    @classmethod
+    def _valid_module(cls, value: str) -> str:
+        return _dotted_path(value, empty_ok=False)
+
+    @field_validator("layers", mode="before")
+    @classmethod
+    def _valid_layers(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not re.fullmatch(r"\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*", text):
+            raise ValueError(
+                f"checkpoint_unread.layers {value!r} is an index set like "
+                f"`50-63` or `0,2-4`")
+        return text
+
+    @field_validator("reason", "source_anchor")
+    @classmethod
+    def _stated(cls, value: str, info: Any) -> str:
+        if not str(value).strip():
+            raise ValueError(
+                f"`checkpoint_unread.{info.field_name}` is empty: say why "
+                f"the forward never runs the module (`reason`) and cite the "
+                f"source that shows it (`source_anchor`, file:line)")
+        return str(value).strip()
+
+    def indices(self) -> Optional[frozenset]:
+        """The stack indices `layers` lists, or None for the whole module."""
+        if self.layers is None:
+            return None
+        out = set()
+        for part in self.layers.split(","):
+            lo, _, hi = part.partition("-")
+            out.update(range(int(lo), int(hi or lo) + 1))
+        return frozenset(out)
+
+    def selects(self, name: str) -> bool:
+        """Whether a tensor named `name` sits under this module."""
+        if not name.startswith(self.module + "."):
+            return False
+        indices = self.indices()
+        if indices is None:
+            return True
+        head = name[len(self.module) + 1:].split(".", 1)[0]
+        return head.isdigit() and int(head) in indices
+
+
 class TiedWeightSpec(BaseModel):
     """A weight alias: the earlier model layer it reuses and its condition."""
 
@@ -597,10 +718,12 @@ class StreamSlice(BaseModel):
         return value
 
 
-#: What a model input is: token ids, an image, a video, or an audio clip.
-#: The token ids are read by the language model; a media input is read by an
-#: encoder group (`ArchSpec.encoder_groups`), and only there.
-ModelInputKind = Literal["tokens", "image", "video", "audio"]
+#: What a model input is: token ids, an image, a video, an audio clip, or a
+#: text prompt an encoder embeds (a diffusion pipeline's prompt, read by its
+#: text encoder rather than by the transformer it conditions). The token ids
+#: are read by the language model; a media input is read by an encoder group
+#: (`ArchSpec.encoder_groups`), and only there.
+ModelInputKind = Literal["tokens", "image", "video", "audio", "text"]
 
 class ModelInputSpec(BaseModel):
     """One tensor the model receives from outside its graph (`model_inputs:`).
@@ -681,7 +804,8 @@ class ModelInputSpec(BaseModel):
         # The item count per request, then one item's own axes.
         form = {"image": ("items", "height", "width"),
                 "video": ("items", "frames", "height", "width"),
-                "audio": ("items", "length")}[self.kind]
+                "audio": ("items", "length"),
+                "text": ("items", "length")}[self.kind]
         if len(self.axes) != len(form):
             raise ValueError(
                 f"a `kind: {self.kind}` input declares `axes:` "
@@ -695,6 +819,11 @@ class ModelInputSpec(BaseModel):
                 f"an {self.kind} input declares no `width`: its pixel "
                 f"channels are part of the patch width its `patchify` reader "
                 f"declares")
+        if self.kind == "text" and self.width is not None:
+            raise ValueError(
+                "a `kind: text` input is the prompt's token ids, "
+                "[items, length], read by its encoder's embedding: it "
+                "declares no `width`")
         if self.unmodeled is not None and (
                 self.per_item_of is None or not self.unmodeled.strip()):
             raise ValueError(
@@ -1279,7 +1408,11 @@ class ModelLayer(BaseModel):
     # layer: `speculative` means a non-MTP draft/verification stack; MTP always
     # declares `mtp`. Set on every `group: true` layer so no consumer
     # substring-matches the layer's name.
-    aux_kind: Optional[Literal["mtp", "vision", "audio", "speculative"]] = None
+    # `text` / `latent` / `decoder` are a diffusion pipeline's stages around
+    # its transformer: the text encoder, the latents' input projections, and
+    # the autoencoders' decoders.
+    aux_kind: Optional[Literal["mtp", "vision", "audio", "speculative",
+                               "text", "latent", "decoder"]] = None
     #: On a layer that reads an encoder's output from outside the encoder:
     #: the prompt positions it fills (`PromptSlots`). A layer reading several
     #: encoder outputs (one masked scatter writing every media input's rows,

@@ -159,6 +159,11 @@ class TestFieldContracts(unittest.TestCase):
         self.assertIn("attention_missing_kv_cached", _kinds(
             check_field_contracts(_make_resolved(vit_on_decode))))
 
+    def test_a_family_that_keeps_no_cache_owes_no_entries(self):
+        comps = {"dit": _attn(family="DiT", entries=[])}
+        self.assertNotIn("attention_missing_kv_cached", _kinds(
+            check_field_contracts(_make_resolved(comps))))
+
     def test_non_attention_ignored(self):
         comps = {"moe": _attn(role="ffn_moe")}
         # ffn_moe isn't an attention component — no kv_* contracts apply.

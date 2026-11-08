@@ -22,12 +22,13 @@ from backend.hf import task_gate
 # transformersInfo, config (architectures / model_type / auto_map), siblings.
 # `corpus` holds every curated snapshot id; `outside` holds repos the gate
 # must refuse (with their file listings); `own_forward` holds repos admitted
-# only for the forward source they ship.
+# only for the forward source they ship; `pipelines` holds diffusers
+# pipeline repos, admitted by their `model_index.json`.
 _RECORDED = json.loads(
     (Path(__file__).parent / "fixtures" / "model_info_task_gate.json").read_text()
 )
 _RECORDS = {**_RECORDED["corpus"], **_RECORDED["outside"],
-            **_RECORDED["own_forward"]}
+            **_RECORDED["own_forward"], **_RECORDED["pipelines"]}
 
 
 def _hub_task(model_id):
@@ -132,11 +133,17 @@ class TestRecordedHubAnswers(unittest.TestCase):
         self.assertIn("Sentence-Similarity model", msg)
         self.assertIn("Feature-Extraction", msg)
 
-    def test_diffusion_pipeline_is_refused_naming_its_library(self):
-        msg = self._refusal("stabilityai/stable-diffusion-xl-base-1.0")
-        self.assertIn("Text-to-Image model", msg)
-        self.assertIn("diffusers", msg)
-        self.assertIn("text-generation and image-text-to-text models only", msg)
+    def test_diffusion_pipeline_is_admitted(self):
+        # library `diffusers`, no Transformers resolution, no config: a
+        # `model_index.json` naming its components is what admits it.
+        task = _hub_task("stabilityai/stable-diffusion-xl-base-1.0")
+        self.assertFalse(task.resolved)
+        self.assertIn("model_index.json", task.files)
+        self.assertIsNone(self._refusal("stabilityai/stable-diffusion-xl-base-1.0"))
+
+    def test_a_refusal_names_the_pipelines_in_scope(self):
+        msg = self._refusal("BAAI/bge-m3")
+        self.assertIn("diffusers pipelines", msg)
 
 
 class TestHubCannotAnswer(unittest.TestCase):

@@ -19,8 +19,11 @@ export type ArchGraphNode = {
 export type ArchGraphEdge = {
   from: string;
   to: string;
-  kind: "data" | "stream";
+  // `loop`: a denoise loop hands a latent from the head that updates it to
+  // whoever reads it once the loop ends (`label` says after how many steps).
+  kind: "data" | "stream" | "loop";
   streams?: string[];
+  label?: string;
 };
 
 type Laid = {
@@ -109,7 +112,7 @@ export function ArchGraph({ nodes, edges }: { nodes: ArchGraphNode[]; edges: Arc
           : {}),
       })),
       edges: edges.map((e, i): ElkExtendedEdge => {
-        const text = e.streams && e.streams.length ? streamLabel(e.streams) : "";
+        const text = e.streams && e.streams.length ? streamLabel(e.streams) : (e.label || "");
         return {
           id: `e${i}`,
           sources: [e.from],
@@ -171,16 +174,19 @@ export function ArchGraph({ nodes, edges }: { nodes: ArchGraphNode[]; edges: Arc
               <marker id="arch-arrow-stream" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
                 <path d="M0,0 L10,5 L0,10 z" fill="#d97706" />
               </marker>
+              <marker id="arch-arrow-loop" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M0,0 L10,5 L0,10 z" fill="#7c3aed" />
+              </marker>
             </defs>
             {laid.edges.map((e) => (
               <g key={e.key} data-arch-edge={e.kind} data-from={e.from} data-to={e.to}>
                 <path
                   d={e.d}
                   fill="none"
-                  stroke={e.kind === "stream" ? "#d97706" : "#94a3b8"}
+                  stroke={e.kind === "stream" ? "#d97706" : e.kind === "loop" ? "#7c3aed" : "#94a3b8"}
                   strokeWidth={e.kind === "stream" ? 1.25 : 1.75}
-                  strokeDasharray={e.kind === "stream" ? "5 4" : undefined}
-                  markerEnd={`url(#arch-arrow-${e.kind === "stream" ? "stream" : "data"})`}
+                  strokeDasharray={e.kind === "stream" ? "5 4" : e.kind === "loop" ? "2 3" : undefined}
+                  markerEnd={`url(#arch-arrow-${e.kind})`}
                 />
                 {e.label ? (
                   <text x={e.label.x} y={e.label.y} className="arch-edge-label">{e.label.text}</text>

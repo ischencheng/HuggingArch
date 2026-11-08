@@ -40,6 +40,9 @@ def _estimate(tp: int, input_tokens: int) -> dict:
 
 
 class _View(SimpleNamespace):
+    #: The cache this view reads; a model that declares none has no entry.
+    entries = ("declared",)
+
     def growth_and_floor(self):
         return self.growth, self.floor
 
@@ -66,10 +69,18 @@ class TestBudgetTermsWithoutGrowth(unittest.TestCase):
             local, whole, ParallelConfig(tp_attention=2, tp_dense_ffn=2))
         self.assertEqual(terms.shard_divisor, 2.0)
 
-    def test_no_cache_at_all_is_refused(self):
+    def test_a_declared_cache_that_holds_nothing_is_refused(self):
         empty = _View(growth=0.0, floor=0.0)
         with self.assertRaises(ValueError):
             _cache_budget_terms(empty, empty, ParallelConfig())
+
+    def test_a_model_that_declares_no_cache_holds_nothing(self):
+        none = _View(growth=0.0, floor=0.0, entries=())
+        terms = _cache_budget_terms(none, none, ParallelConfig())
+        self.assertEqual((terms.per_token, terms.constant_state, terms.static),
+                         (0.0, 0.0, 0.0))
+        self.assertEqual((terms.shard_divisor, terms.replication_factor),
+                         (1.0, 1.0))
 
 
 class TestAllWindowModelEstimates(unittest.TestCase):

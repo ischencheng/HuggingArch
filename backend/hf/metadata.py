@@ -12,8 +12,7 @@ Sub-modules:
                     shard is the same tensor, counted once)
   _cache.py         on-disk JSON cache (model_id → fetched record)
 
-This module owns: `HUB_UNREACHABLE` (what "the Hub could not be read"
-means, for every Hub reader), the public `fetch_config` / `fetch_metadata`
+This module owns: the public `fetch_config` / `fetch_metadata`
 entries (a model's two serving inputs, read from one place in one order), the hub /
 local-repo header readers, the record a snapshot stores (`metadata_record`), totals
 (`summarize`), and `format_header` for prompt display.
@@ -22,12 +21,12 @@ import json
 import logging
 from typing import Any, Dict, Optional
 
-from huggingface_hub import errors as hf_errors
 
 from backend.custom_id import is_custom_id, model_path, strip_prefix
 
 from ._cache import cache_load_raw, cache_store
-from .header import ReadTensors, SafetensorsHeader
+from .header import HUB_UNREACHABLE, ReadTensors, SafetensorsHeader
+from .pipeline import is_pipeline_repo, pipeline_config, read_pipeline_header
 from backend.arch.quant_schemes import (
     SCHEME_NONE,
     QuantScheme,
@@ -38,17 +37,6 @@ from backend.arch.quant_schemes import (
 from backend.arch.dtypes import dtype_bytes as _dtype_bytes
 
 logger = logging.getLogger(__name__)
-
-# The Hub could not be read: offline mode, or a failure of the hub's own HTTP
-# client (DNS, connect, timeout, proxy, a dropped stream). That client is
-# httpx2, whose errors are neither `httpx.HTTPError` nor `OSError`; a status
-# answer (`HfHubHTTPError`, incl. not-found / gated) subclasses
-# `hf_errors.HTTPError` too, so a caller that tells a status apart catches it
-# first. The one definition every Hub reader in `backend/` catches.
-HUB_UNREACHABLE = (
-    hf_errors.OfflineModeIsEnabled,     # HF_HUB_OFFLINE
-    hf_errors.HTTPError,                # the hub's HTTP client, any failure
-)
 
 
 def summarize(header: SafetensorsHeader, *, scheme: QuantScheme,
@@ -240,7 +228,12 @@ def fetch_config(model_id: str, overlay_dir: Optional[str] = None
         # rather than an OSError. Name both explicitly or a bad repo id
         # escapes as a 500 instead of reaching the classifier.
         from huggingface_hub.errors import EntryNotFoundError, HFValidationError
-        config_path = hf_hub_download(repo_id=model_id, filename="config.json")
+        try:
+            config_path = hf_hub_download(repo_id=model_id, filename="config.json")
+        except EntryNotFoundError:
+            # A diffusers pipeline has no root config: its config is the
+            # index with each component's own (`pipeline.compose_config`).
+            return pipeline_config(model_id)
         with open(config_path, "r", encoding="utf-8") as f:
             return json.load(f)
     except (OSError, EntryNotFoundError, HFValidationError,
@@ -306,6 +299,10 @@ def read_header_hf(model_id: str, revision: Optional[str] = None, *,
     api = HfApi()
     info = api.model_info(model_id, revision=revision, files_metadata=True)
     files = {s.rfilename: s for s in info.siblings}
+    if is_pipeline_repo(files) and not read_from:
+        # Several checkpoints, one per component folder; each tensor named
+        # under its component (`pipeline` module doc).
+        return read_pipeline_header(model_id, revision=info.sha)
     source, source_rev = model_id, info.sha
     if read_from:
         mirror = api.model_info(read_from, files_metadata=True)

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 from typing import List
 
+import backend.arch.cache_families as cache_families
 import backend.arch.roles as roles
 from backend.arch.eval.program import Program
 from backend.arch.spec_parsing import RETIRED_KV_REPLACEMENTS
@@ -100,7 +101,12 @@ def check_field_contracts(resolved) -> List[dict]:
         # SSM). Empty of BOTH means the engine guesses the KV shape from dims.
         # Asked of decode-path attention only: an encoder's attention caches
         # nothing by construction.
-        if name in decode_path and not kv_cached and not bg.kv_states:
+        # A family of kind `none` caches nothing by declaration (a
+        # diffusion transformer's joint attention, recomputed every step).
+        caches_nothing = (cache_families.is_registered(kv_label or "")
+                          and cache_families.kind_of(kv_label) == "none")
+        if (name in decode_path and not kv_cached and not bg.kv_states
+                and not caches_nothing):
             out.append(Finding(
                 kind="attention_missing_kv_cached",
                 template=name,

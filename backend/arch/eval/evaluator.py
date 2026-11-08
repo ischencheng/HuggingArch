@@ -37,8 +37,8 @@ import backend.arch.dims as dim_registry
 from .refusal import SpecRefusal, node_context
 from .analysis import Analysis, OwnCopies
 from .binding import Binding
-from .dim import (Dim, Domain, ReadTracking, algebra, apply, assuming, eval_dim_expr,
-                  expr_of, ratio, require, same_law,
+from .dim import (Dim, Domain, ReadTracking, algebra, apply, assuming, equal,
+                  eval_dim_expr, expr_of, ratio, require, same_law,
                   minimum, names_of, value_of)
 from . import formats as formats_mod
 from .precision import AS_SHIPPED, ResolvedPrecision
@@ -48,6 +48,7 @@ from .flops import (bind_labels, flops_over_operands,
 
 
 from ..ops import DISPATCH_OP
+from ..ops_base import mask_flags
 from .layer import Layer
 from .node import Evaluable
 from .occurrence import Occurrence, Reference, ReferenceTable, Source
@@ -1764,6 +1765,15 @@ class Evaluator:
             walk.node_dims[node.uid]["s_pairs"] = s_pairs
             walk.node_rebinds[node.uid] = {"s_kv": dims["s_kv"],
                                            "s_pairs": pairs}
+        # A causal encoder (a pipeline's text encoder: a decoder-only LM run
+        # once over its prompt, keeping no cache) scores the lower triangle
+        # of its own rows — the step law with nothing past — and no phase
+        # binds it.
+        if (encoding and "s_pairs" not in dims and "s_query" in dims
+                and not equal(mask_flags(dims)[0], 0)):
+            rows = dims["s_query"]
+            dims = {**dims, "s_pairs": rows * (rows + 1) * sp.Rational(1, 2)}
+            walk.node_dims[node.uid]["s_pairs"] = dims["s_pairs"]
         s_kv_law = _narrowed_s_kv(positions, op)
         if s_kv_law is not None:
             walk.node_rebinds.setdefault(node.uid, {})["s_kv"] = s_kv_law

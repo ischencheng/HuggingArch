@@ -47,6 +47,7 @@ from ._attention_masks import run_attention_mask_check
 from ._cross_layer_channels import cross_layer_anchor_notes, run_cross_layer_checks
 from ._schedule_exhaustiveness import run_layer_schedule_check
 from ._ablation import parse_disabled, lever_disabled, SOURCE_DIFF_KINDS
+from backend.arch.checkpoint_unread import UnreadSplit
 from backend.arch.eval.checkpoint import Reconciliation
 from backend.arch.eval.dim import value_of
 from backend.arch.eval.program import Program
@@ -833,6 +834,12 @@ def _evaluate_spec(model_id, spec_name, config, overlay_dir, hf_data, _off,
         whole_stream_pairings = _run_stage(
             "projection", spec, lambda: _whole_stream_pairings(resolved))
 
+        # The spec is held to the part of the file its path reads; the
+        # modules it declares unread are split off and reported.
+        unread = _run_stage("coverage", spec, lambda: UnreadSplit.of(
+            hf_data.get("header"), resolved.spec.checkpoint_unread))
+        hf_data = unread.read_part(hf_data)
+
         matched, unmatched_spec_nodes, unmatched_hf = _run_stage(
             "coverage", spec,
             lambda: _storage_coverage(model_result, hf_data),
@@ -847,6 +854,8 @@ def _evaluate_spec(model_id, spec_name, config, overlay_dir, hf_data, _off,
 
         errors = _gating_errors(checks, hf_data, model_result, unmatched_hf_list,
                                 param_mismatches, _off)
+        if not _off("weight"):
+            errors.extend(unread.errors)
         unmatched_hf_list, unmatched_hf_total, unmatched_spec_nodes, param_mismatches = (
             _ablate_warnings(
                 checks,
@@ -883,6 +892,9 @@ def _evaluate_spec(model_id, spec_name, config, overlay_dir, hf_data, _off,
             # Who reads a stream whole or its prefix, as a history or
             # joined (`read: all`, `read: concat`, a model-level op).
             "whole_stream_pairings": whole_stream_pairings,
+            # The modules the spec declares the checkpoint stores and its
+            # path never runs, each with its tensors' count and bytes.
+            "checkpoint_unread": [part.as_dict() for part in unread.parts],
             "unmatched_hf_tensors": unmatched_hf_list,
             "unmatched_hf_params": unmatched_hf_total,
             "unmatched_spec_nodes": unmatched_spec_nodes,

@@ -1,0 +1,17 @@
+# Three-axis rotary embedding over the first `d_rope` channels of a head, the
+# rest passed through (diffusers `transformer_minimax_h3._apply_rotary_emb`:
+# `hidden_states[..., :rotary_dim]` rotated, `[..., rotary_dim:]` kept, then
+# concatenated). The (t, h, w) angle blocks share one frequency list; which
+# axis a channel reads is the op's (`rope_3d`), the split is this graph's.
+# Used by: MiniMax-H3's transformer (96 of 128 channels) and its video ViT
+# decoder (48 of 64).
+#
+# Required dims: d_head, d_rope, d_nope (d_rope + d_nope == d_head)
+
+description: "Partial 3-D RoPE: rotate the first d_rope channels of each head by their (t, h, w) position, pass the rest."
+graph:
+  rot:     { op: slice, in: x, dims: { in: d_head, out: d_rope } }
+  pass:    { op: slice, in: x, dims: { in: d_head, out: d_nope, start: d_rope } }
+  rope:    { op: rope_3d, in: rot, dim: d_rope }
+  concat:  { op: concat, in: [rope, pass], dims: { in_a: d_rope, in_b: d_nope, out: d_head } }
+outputs: [concat]

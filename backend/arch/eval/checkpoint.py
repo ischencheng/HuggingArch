@@ -69,6 +69,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Tuple
 
+from ..checkpoint_unread import UnreadSplit
 from ..dtypes import UnknownDtype, dtype_bytes
 
 
@@ -200,7 +201,14 @@ class Reconciliation:
         is in HBM and changes nothing about the file, so consulting the resident
         format here would make the invariant fail for a correct spec the moment
         somebody chose to serve it differently.
+
+        The modules the spec declares unread (`checkpoint_unread:`) are split
+        off first, as the validator and the analyzer split them: the spec
+        says what one path through the file holds.
         """
+        metadata = UnreadSplit.of(
+            metadata.get("header"),
+            analysis.program.spec.checkpoint_unread).read_part(metadata)
         weight = 0.0
         meta = 0.0
         buffers = 0.0

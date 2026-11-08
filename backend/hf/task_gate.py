@@ -2,9 +2,11 @@
 
 HuggingArch derives architecture from a Transformers ``config.json``, so it
 answers only for models that load as a text-generation or
-image-text-to-text Transformers model. A repo outside that set (a diffusion
-pipeline, an embedding encoder) used to fail downstream with a vague "no
-config.json" or "No spec matches" — ``unsupported_task_refusal`` asks the
+image-text-to-text Transformers model — and for diffusers pipelines, whose
+``model_index.json`` names the components it reads together
+(``hf.pipeline``). A repo outside that set (an audio model, an embedding
+encoder) used to fail downstream with a vague "no config.json" or "No spec
+matches" — ``unsupported_task_refusal`` asks the
 model-info API and turns every out-of-scope answer into a precise refusal
 at the boundary instead.
 
@@ -38,6 +40,7 @@ from backend.custom_id import is_custom_id
 from backend.hf.metadata import HUB_UNREACHABLE
 from backend.hf.forward_source import own_forward_files
 from backend.hf.model_info import SKELETON_AUTO_CLASS, causal_lm_heads
+from backend.hf.pipeline import is_pipeline_repo
 
 
 logger = logging.getLogger(__name__)
@@ -65,7 +68,8 @@ _HUB_NO_SUCH_REPO = (
 # Connector words HF keeps lowercase in its model-page task labels.
 _TASK_SMALL_WORDS = frozenset({"to", "and", "of", "with", "for"})
 
-_SCOPE = "HuggingArch supports text-generation and image-text-to-text models only."
+_SCOPE = ("HuggingArch supports diffusers pipelines and text-generation and "
+          "image-text-to-text models only.")
 
 
 def prettify_task(tag: str) -> str:
@@ -111,6 +115,14 @@ class HubTask:
         """Precise "not supported" message, or None when the repo is in
         scope. Every hub answer settles the question one way or the other."""
         if self.resolved_pipeline in SUPPORTED_PIPELINES:
+            return None
+        if is_pipeline_repo(self.files):
+            # A diffusers pipeline (`model_index.json`, one folder per
+            # component): read as one model, its components' configs and
+            # checkpoints together (`hf.pipeline`). Its page task
+            # (text-to-video, image-text-to-video) says what the pipeline
+            # makes, not which Transformers head it loads as — it loads as
+            # none.
             return None
         if SKELETON_AUTO_CLASS in self.registered:
             # The repo registers its remote code under the class skeleton

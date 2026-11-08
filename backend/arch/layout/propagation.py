@@ -1231,6 +1231,7 @@ from . import attention as _attention
 from . import geometry as _geometry
 from . import linear as _linear
 from . import moe as _moe
+from . import pipeline as _pipeline
 from . import recurrent as _recurrent
 
 #: op -> transition handler for REGISTERED ops. Components are not in this
@@ -1336,6 +1337,20 @@ _HANDLERS = {
     "rotary_inv_freq_buffer": _linear.buffer,
     "parameter_vector": _linear.buffer,
     "parameter_tensor": _linear.buffer,
+    "filter_buffer": _pipeline.built,
+    "rope_3d": _linear.rope,
+    "conv1d_weight_norm": _recurrent.conv1d,
+    "zeros": _pipeline.step_rows,
+    "zero_rows": _pipeline.built,
+    "sinusoidal_embedding": _pipeline.built,
+    "view_rows": _pipeline.whole,
+    "row_gather": _pipeline.whole,
+    "append_tokens": _pipeline.whole,
+    "tile_video": _pipeline.whole,
+    "untile_video": _pipeline.whole,
+    "conv_transpose1d": _pipeline.whole,
+    "conv_transpose1d_weight_norm": _pipeline.whole,
+    "snake_beta": _pipeline.whole,
 }
 
 

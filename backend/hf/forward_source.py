@@ -369,6 +369,42 @@ def _try_local_transformers(model_id: str, resolved_spec: Any) -> List[Dict[str,
     return []
 
 
+def _try_pipeline_sources(model_id: str, resolved_spec: Any) -> List[Dict[str, str]]:
+    """A diffusers pipeline's forward: each component's module from the
+    library its index names (`pipeline.compose_config` keeps the pair under
+    `_components`) — a transformers component's modeling module by its
+    config's `model_type`, a diffusers component's by the file of the
+    installed `diffusers` package that defines its class. The diffusers files
+    are read as text and never imported. Empty for a non-pipeline config."""
+    config = _resolved_config(resolved_spec)
+    named = config.get("_components") if isinstance(config, dict) else None
+    if not isinstance(named, dict):
+        return []
+    out: List[Dict[str, str]] = []
+    diffusers_root: Optional[Path] = None
+    spec = importlib.util.find_spec("diffusers")
+    if spec is not None and spec.submodule_search_locations:
+        diffusers_root = Path(next(iter(spec.submodule_search_locations)))
+    for name, pair in sorted(named.items()):
+        library, cls = [*pair, None, None][:2]
+        component = config.get(name)
+        if library == "transformers" and isinstance(component, dict):
+            out.extend(_try_local_transformers(
+                model_id, type("_Shim", (), {"config": component})()))
+        elif library == "diffusers" and diffusers_root is not None and cls:
+            pattern = re.compile(rf"^class {re.escape(cls)}\b", re.MULTILINE)
+            for path in sorted((diffusers_root / "models").rglob("*.py")):
+                text = path.read_text(encoding="utf-8")
+                if pattern.search(text):
+                    rel = PurePosixPath("site-packages", "diffusers",
+                                        path.relative_to(diffusers_root).as_posix())
+                    out.append({"path": str(rel), "text": text})
+                    break
+    # One file per module, however many components it serves.
+    seen: set = set()
+    return [f for f in out if not (f["path"] in seen or seen.add(f["path"]))]
+
+
 def _try_model_info_cache(model_id: str) -> List[Dict[str, str]]:
     path = model_info_cache_path(model_id)
     if not path.exists():

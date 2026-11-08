@@ -451,6 +451,60 @@ def _dm_patchify(node, r_in0, rout) -> List[DimSource]:
     ][:rout]
 
 
+def _dm_row_gather(node, r_in0, rout) -> List[DimSource]:
+    # table [B, rows, dim] picked by ids [B, s] → [B, s, dim]: the ids'
+    # axes, then the table's width.
+    del r_in0
+    return [
+        DimSource("from", ((1, 0),)),
+        DimSource("from", ((1, 1),)),
+        DimSource("from", ((0, 2),)),
+    ][:rout]
+
+
+def _dm_view_rows(node, r_in0, rout) -> List[DimSource]:
+    # [B, R, rows·w] → [B, R·rows, w].
+    del r_in0
+    return [
+        DimSource("from", ((0, 0),)),
+        DimSource("mul", ((0, 1),), part=1, dim_key="rows"),
+        DimSource("div", ((0, 2),), part=1, dim_key="rows"),
+    ][:rout]
+
+
+def _dm_conv_transpose1d(node, r_in0, rout) -> List[DimSource]:
+    # [B, S, C_in] → [B, S·stride, C_out].
+    del r_in0
+    return [
+        DimSource("from", ((0, 0),)),
+        DimSource("mul", ((0, 1),), part=1, dim_key="stride"),
+        DimSource("new", dim_key="C_out"),
+    ][:rout]
+
+
+def _dm_append_tokens(node, r_in0, rout) -> List[DimSource]:
+    # [M, R, D] + [1, k₁, D] + … → [M, R + k₁ + …, D].
+    del r_in0
+    return [
+        DimSource("from", ((0, 0),)),
+        DimSource("concat", ((0, 1),)),
+        DimSource("from", ((0, 2),)),
+    ][:rout]
+
+
+def _dm_declared_rows(node, r_in0, rout) -> List[DimSource]:
+    # A re-tiling whose three output axes the call site declares (`tiles` /
+    # `items`, `rows`, `channels`): the tiles overlap, so no output axis is
+    # one of the input's.
+    del r_in0
+    lead = "tiles" if node.op == "tile_video" else "items"
+    return [
+        DimSource("new", dim_key=lead),
+        DimSource("new", dim_key="rows"),
+        DimSource("new", dim_key="channels"),
+    ][:rout]
+
+
 def _dm_group_items(node, r_in0, rout) -> List[DimSource]:
     # [M·k, R, D] → [M, k·R, D]; M is declared (`groups`), so k = 0 holds.
     del r_in0
@@ -739,6 +793,14 @@ _EXPLICIT_DM = op_keyed({
     "stack_init": _dm_stack_init,
     "stack_append": _dm_stack_append,
     "slice": _dm_slice,
+    "row_gather": _dm_row_gather,
+    "view_rows": _dm_view_rows,
+    "conv_transpose1d": _dm_conv_transpose1d,
+    "conv_transpose1d_weight_norm": _dm_conv_transpose1d,
+    "snake_beta": _dm_preserve_in0,
+    "append_tokens": _dm_append_tokens,
+    "tile_video": _dm_declared_rows,
+    "untile_video": _dm_declared_rows,
 })
 
 
@@ -806,6 +868,17 @@ _EXPLICIT_RANK = op_keyed({
     # A history axis appears before the feature axis, or grows.
     "stack_init": lambda ir, node: ir[0] + 1 if ir else None,
     "stack_append": lambda ir, node: ir[0] if ir else None,
+    # A picked table row per id: the ids' axes and the row's width.
+    "row_gather": lambda ir, node: ir[1] + 1 if len(ir) > 1 else None,
+    "view_rows": lambda ir, node: ir[0] if ir else None,
+    "conv_transpose1d": lambda ir, node: ir[0] if ir else None,
+    "conv_transpose1d_weight_norm": lambda ir, node: ir[0] if ir else None,
+    "snake_beta": lambda ir, node: ir[0] if ir else None,
+    "append_tokens": lambda ir, node: ir[0] if ir else None,
+    # A latent video's five axes become tiles, rows and channels; tiles
+    # become items, pixels and channels.
+    "tile_video": lambda ir, node: 3 if ir and ir[0] == 5 else None,
+    "untile_video": lambda ir, node: 3 if ir else None,
 })
 
 

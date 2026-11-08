@@ -1411,6 +1411,8 @@ class SpecLoader:
             custom_ops=merged_custom_ops,
             quant_context=document.quant_context,
             validation_exemptions=document.validation_exemptions,
+            checkpoint_unread=document.checkpoint_unread,
+            denoise_loop=document.denoise_loop,
         )
 
 

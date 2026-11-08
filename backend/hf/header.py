@@ -28,6 +28,19 @@ from math import prod
 from typing import (Any, Dict, Iterable, Iterator, List, Mapping, Optional,
                     Sequence, Tuple)
 
+from huggingface_hub import errors as hf_errors
+
+# The Hub could not be read: offline mode, or a failure of the hub's own HTTP
+# client (DNS, connect, timeout, proxy, a dropped stream). That client is
+# httpx2, whose errors are neither `httpx.HTTPError` nor `OSError`; a status
+# answer (`HfHubHTTPError`, incl. not-found / gated) subclasses
+# `hf_errors.HTTPError` too, so a caller that tells a status apart catches it
+# first. The one definition every Hub reader in `backend/` catches.
+HUB_UNREACHABLE = (
+    hf_errors.OfflineModeIsEnabled,     # HF_HUB_OFFLINE
+    hf_errors.HTTPError,                # the hub's HTTP client, any failure
+)
+
 #: the index placeholder a spec-composed name writes at a declared index
 INDEX = "X"
 _SLOT = "{}"

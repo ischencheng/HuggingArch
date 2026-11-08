@@ -34,6 +34,8 @@ from backend.arch.schema import (
     ModelInputSpec,
     ModelLayer,
     QuantContext,
+    DenoiseLoop,
+    UnreadCheckpointModule,
     ValidationExemptions,
 )
 
@@ -410,6 +412,13 @@ class SpecDocument(BaseModel):
     validation_exemptions: ValidationExemptions = Field(
         default_factory=ValidationExemptions)
 
+    #: Modules the checkpoint stores and the modelled path never runs, each
+    #: with why (`UnreadCheckpointModule`).
+    checkpoint_unread: List[UnreadCheckpointModule] = Field(default_factory=list)
+
+    #: The denoise loop the language model's step runs in (`DenoiseLoop`).
+    denoise_loop: Optional[DenoiseLoop] = None
+
     @field_validator("dims", mode="before")
     @classmethod
     def _normalize_dim_bindings(cls, values: Any) -> Any:
@@ -427,19 +436,30 @@ class SpecDocument(BaseModel):
         if duplicates:
             raise ValueError(
                 f"top-level model layer names must be unique: {duplicates}")
+        def every(entries):
+            for layer in entries:
+                yield layer
+                yield from every(layer.layers or ())
+
         input_boundaries = [
-            layer.name for layer in layers
+            layer.name for layer in every(layers)
             if layer.boundary_role == "input_embedding"
         ]
         if len(input_boundaries) != 1:
             raise ValueError(
-                "an authored model must declare exactly one top-level "
+                "an authored model must declare exactly one "
                 f"`boundary_role: input_embedding`; got {input_boundaries}")
+        # A language model reads its tokens at the top level and emits
+        # logits there. A diffusion transformer reads none: the pipeline's
+        # tokens enter its text encoder (a group), and its output
+        # projections run on every row, so none is a sampled logits head.
+        reads_tokens = any(layer.boundary_role == "input_embedding"
+                           for layer in layers)
         output_boundaries = [
             layer.name for layer in layers
             if layer.boundary_role == "output_head"
         ]
-        if not output_boundaries:
+        if reads_tokens and not output_boundaries:
             raise ValueError(
                 "an authored model must declare at least one top-level "
                 "`boundary_role: output_head`")

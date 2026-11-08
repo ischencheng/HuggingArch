@@ -46,7 +46,8 @@ def _aux_kind_badges() -> Dict[str, str]:
     recovers.
     """
     text = {"mtp": "MTP", "vision": "Vision", "audio": "Audio",
-            "speculative": "Speculative"}
+            "speculative": "Speculative", "text": "Text encoder",
+            "latent": "Latent input", "decoder": "Decoder"}
     declared = {k for k in get_args(get_args(
         ModelLayer.model_fields["aux_kind"].annotation)[0]) if isinstance(k, str)}
     missing = sorted(declared - set(text))

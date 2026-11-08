@@ -1,0 +1,32 @@
+# diffusers `FeedForward(activation_fn="swiglu")` (models/attention.py:
+# `SwiGLU.forward`: `hidden_states, gate = self.proj(hidden_states).chunk(2,
+# dim=-1); return hidden_states * self.activation(gate)`): one projection to
+# 2·d_ffn, VALUE first and gate second, then `net.2` back down. `net.1` is a
+# dropout and stores nothing.
+# Used by: MiniMax-H3's transformer, token refiner and video ViT decoder.
+#
+# Required dims: d_model, d_ffn
+# Optional dims: Fb (bias on both projections, default 0)
+
+role: ffn_dense
+description: "diffusers SwiGLU FeedForward: net.0.proj → (value | gate) → value · silu(gate) → net.2."
+graph:
+  net.0.proj:
+    op: linear
+    in: x
+    dims: { in: d_model, out: "2 * d_ffn", bias: Fb }
+    weight_axes:
+      - segments:
+          - { segment: value, extent: d_ffn, placement_by_symbol: { d_ffn: { world: dense_ffn, parts: d_ffn, fit: exact }, d_vae_ffn: { world: dense_ffn, parts: d_ffn, fit: exact } } }
+          - { segment: gate, extent: d_ffn, placement_by_symbol: { d_ffn: { world: dense_ffn, parts: d_ffn, fit: exact }, d_vae_ffn: { world: dense_ffn, parts: d_ffn, fit: exact } } }
+      - { replicated: true }
+  value_slice: { op: slice, in: net.0.proj, dims: { in: "2 * d_ffn", out: d_ffn } }
+  gate_slice:  { op: slice, in: net.0.proj, dims: { in: "2 * d_ffn", out: d_ffn, start: d_ffn } }
+  silu:        { op: silu, in: gate_slice, dim: d_ffn }
+  gate_mul:    { op: mul, in: [value_slice, silu], dim: d_ffn }
+  net.2:
+    op: linear
+    in: gate_mul
+    dims: { in: d_ffn, out: d_model, bias: Fb }
+    weight_axes: [{ replicated: true }, { placement_by_symbol: { d_ffn: { world: dense_ffn, parts: d_ffn, fit: exact }, d_vae_ffn: { world: dense_ffn, parts: d_ffn, fit: exact } } }]
+outputs: [net.2]

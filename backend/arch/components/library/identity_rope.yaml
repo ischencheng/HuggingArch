@@ -1,0 +1,8 @@
+# The rotation slot of an attention that rotates nothing: the heads pass
+# through unchanged. MiniMax-H3's token refiner runs `MiniMaxH3Attention`
+# with `rotary_emb=None` (diffusers `MiniMaxH3TokenRefinerBlock.forward`).
+
+description: "No rotary embedding: Q / K heads pass through."
+graph:
+  out: { op: identity, in: x, dims: { in: d_head } }
+outputs: [out]

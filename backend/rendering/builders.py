@@ -368,9 +368,11 @@ def build_architecture_view(summary, layer_groups, resolved_spec, format_params,
     subtitle_parts = [f"{format_params(total)} total"]
     if active < total:
         subtitle_parts.append(f"{format_params(active)} active")
-    subtitle = " · ".join(subtitle_parts)
-
     program = Program.of(resolved_spec) if resolved_spec else None
+    if program is not None and program.denoise_steps is not None:
+        subtitle_parts.append(
+            f"one forward per denoise step, ×{program.denoise_steps} per request")
+    subtitle = " · ".join(subtitle_parts)
     by_tmpl = {}
     if program is not None:
         for template in program.blocks:
@@ -851,14 +853,35 @@ def _view_edges(program, cards_at, passthrough, across=(),
         entry = card_of(reader, last=False)
         if entry is None:
             continue
+        # An operand folds into the card that reads it; when operands are
+        # all a card reads (a diffusion transformer's timestep features),
+        # the graph starts there, and the operand is drawn as its input.
+        starts = not any(origins(read) for read in reads)
         for read in reads:
             dsts = (formal_readers or {}).get((reader, read.name), [entry])
-            for src, stream in origins(read):
+            found = [(f"in:{read.name}", read.stream)] if starts else origins(read)
+            for src, stream in found:
                 for dst in dsts:
                     add(src, dst, stream)
     out = list(edges.values())
+    # A denoise loop (`denoise_loop:`) hands each latent from the head that
+    # updates it, `steps` forwards later, to whoever reads it at the end.
+    loop = program.spec.denoise_loop
+    if loop is not None:
+        for latent in loop.latents:
+            at = program.spec.layer_position([latent.update])
+            src = card_of(at, last=True) if at is not None else None
+            if src is None:
+                continue
+            label = f"after {program.denoise_steps} steps"
+            out.extend([{"from": src, "to": edge["to"], "kind": "loop",
+                         "label": label}
+                        for edge in list(out)
+                        if edge["from"] == f"in:{latent.end}"])
+    declared = list(program.model_inputs)
     named = sorted({e["from"][3:] for e in out if e["from"].startswith("in:")},
-                   key=list(program.model_inputs).index)
+                   key=lambda name: (declared.index(name) if name in declared
+                                     else len(declared), name))
     return out, [{"id": f"in:{name}", "name": name} for name in named]
 
 
@@ -886,7 +909,10 @@ def _section_name(program, name: str) -> str:
     what = []
     kind = stack.aux_kind if stack.aux_kind not in (None, name) else None
     if stack.is_encoder:
-        what.append(f"{kind} encoder" if kind else "encoder")
+        # A pipeline's stages around its transformer run in the encode phase
+        # too; the latents' projections and the decoders encode nothing.
+        what.append({"latent": "latent input", "decoder": "decoder"}.get(
+            kind, f"{kind} encoder") if kind else "encoder")
     elif kind:
         what.append(kind)
     if stack.reruns:

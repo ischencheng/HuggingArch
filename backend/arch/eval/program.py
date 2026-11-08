@@ -1263,7 +1263,7 @@ class Program:
                           if group is not None and group.name in encoders),
                          None)
             least: Dict[str, Any] = {}
-            if entry.kind == "audio":
+            if entry.kind in ("audio", "text"):
                 least = {entry.axes[1]: 1}
             align = self._cut_align(name)
             if align is not None:
@@ -2591,6 +2591,14 @@ class Program:
                     f"{names[key]!r} cover its iterations 0..{depth - 1} "
                     f"with {found}; each iteration runs exactly one template")
         return out
+
+    @memo_property
+    def denoise_steps(self) -> Optional[Any]:
+        """The forwards one request runs (`denoise_loop.steps`), as the tree
+        bound it; None for a model with no denoise loop."""
+        loop = self.spec.denoise_loop
+        return (None if loop is None
+                else eval_dim_expr(loop.steps, self.resolved.dim_values))
 
     @memo_property
     def layer_reads(self) -> Tuple[LayerRead, ...]:

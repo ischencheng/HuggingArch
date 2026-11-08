@@ -12,6 +12,7 @@
 #   recurrent  — a fixed-size state carried across steps, not a per-position
 #                cache
 #   vision     — an encoder tower with no decode-time cache
+#   none       — a backbone attention that keeps nothing between forwards
 #
 # `kind` is NOT how "hybrid attention" is decided: that reads the growth
 # formula's leaf sums (`eval.cache_view`), because two families can share a
@@ -36,6 +37,11 @@ families:
   ViT:
     kind: vision
     meaning: A vision encoder tower; no decode-time cache.
+  DiT:
+    kind: none
+    meaning: >-
+      A diffusion transformer's joint attention: recomputed over the whole
+      packed request at every denoise step; no cache.
   GLA-Linear:
     kind: recurrent
     meaning: Gated linear attention; a fixed-size recurrent state per head.

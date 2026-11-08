@@ -220,6 +220,12 @@ AXIS_USE = {
     # ---- window family ----------------------------------------------------
     "conv1d": {"C_in": _c("sum"), "s_ctx": _w("kernel_size-1 halo")},
     "conv2d": {"C_in": _c("sum"), "s_ctx": _w("kernel window halo")},
+    "conv1d_weight_norm": {"C_in": _c("sum"), "s_ctx": _w("kernel_size-1 halo")},
+    "conv_transpose1d": {"C_in": _c("sum"), "s_ctx": _w("kernel_size taps "
+                                                         "scattered per input row")},
+    "conv_transpose1d_weight_norm": {"C_in": _c("sum"),
+                                     "s_ctx": _w("kernel_size taps scattered "
+                                                 "per input row")},
     "swa_attention_score": {"d_head": _c("sum"), "s_kv": _w("s_window"),
                             "s_query": _PAIR},
     "swa_attention_apply": {
@@ -255,6 +261,7 @@ AXIS_USE = {
     "rope_emb_inverse": {"dim": _w("pairing dim/2")},
     "mrope": {"dim": _w("pairing dim/2")},
     "rope_2d": {"dim": _w("pairing dim/2")},
+    "rope_3d": {"dim": _w("pairing dim/2")},
     "xdrope": {"dim": _w("pairing dim/2")},
     # ---- recurrent family ---------------------------------------------------
     "mamba2_scan": {"s_ctx": AxisUse(RECURRENT, "d_ssm_state"),

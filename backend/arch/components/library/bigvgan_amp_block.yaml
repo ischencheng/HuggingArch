@@ -1,0 +1,43 @@
+# BigVGAN anti-aliased multi-periodicity block (`AMPBlock1`; diffusers
+# `MiniMaxH3AudioAMPBlock`): for each dilation d of (1, 3, 5), an alias-free
+# SnakeBeta, a dilated weight-normed conv of `kernel_size`, a second
+# SnakeBeta, an undilated conv, and a residual add.
+#
+#   for conv1, conv2, act1, act2 in zip(convs1, convs2, acts[::2], acts[1::2]):
+#       x = conv2(act2(conv1(act1(x)))) + x
+#
+# `activations.<j>` alternate: even j precede `convs1`, odd j `convs2`. Each
+# holds its SnakeBeta's alpha / beta and its two resampling filters.
+#
+# Required dims: d_model (channels), kernel_size, n_aa_taps
+role: block
+description: "BigVGAN AMPBlock1: three dilations (1, 3, 5) of SnakeBeta → dilated conv → SnakeBeta → conv, each a residual."
+graph:
+  activations.0.upsample:          { op: filter_buffer, dims: { kernel_size: n_aa_taps }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  activations.0.downsample.lowpass: { op: filter_buffer, dims: { kernel_size: n_aa_taps }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  activations.0:  { op: snake_beta, in: [x, activations.0.upsample, activations.0.downsample.lowpass], dims: { dim: d_model, kernel_size: n_aa_taps }, weight_axes: [{ replicated: true }] }
+  convs1.0:       { op: conv1d_weight_norm, in: activations.0, dims: { C_in: d_model, C_out: d_model, groups: "1", kernel_size: kernel_size, dilation: "1", bias: "1" }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  activations.1.upsample:          { op: filter_buffer, dims: { kernel_size: n_aa_taps }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  activations.1.downsample.lowpass: { op: filter_buffer, dims: { kernel_size: n_aa_taps }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  activations.1:  { op: snake_beta, in: [convs1.0, activations.1.upsample, activations.1.downsample.lowpass], dims: { dim: d_model, kernel_size: n_aa_taps }, weight_axes: [{ replicated: true }] }
+  convs2.0:       { op: conv1d_weight_norm, in: activations.1, dims: { C_in: d_model, C_out: d_model, groups: "1", kernel_size: kernel_size, dilation: "1", bias: "1" }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  residual0:      { op: add, in: [x, convs2.0], dim: d_model }
+  activations.2.upsample:          { op: filter_buffer, dims: { kernel_size: n_aa_taps }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  activations.2.downsample.lowpass: { op: filter_buffer, dims: { kernel_size: n_aa_taps }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  activations.2:  { op: snake_beta, in: [residual0, activations.2.upsample, activations.2.downsample.lowpass], dims: { dim: d_model, kernel_size: n_aa_taps }, weight_axes: [{ replicated: true }] }
+  convs1.1:       { op: conv1d_weight_norm, in: activations.2, dims: { C_in: d_model, C_out: d_model, groups: "1", kernel_size: kernel_size, dilation: "3", bias: "1" }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  activations.3.upsample:          { op: filter_buffer, dims: { kernel_size: n_aa_taps }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  activations.3.downsample.lowpass: { op: filter_buffer, dims: { kernel_size: n_aa_taps }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  activations.3:  { op: snake_beta, in: [convs1.1, activations.3.upsample, activations.3.downsample.lowpass], dims: { dim: d_model, kernel_size: n_aa_taps }, weight_axes: [{ replicated: true }] }
+  convs2.1:       { op: conv1d_weight_norm, in: activations.3, dims: { C_in: d_model, C_out: d_model, groups: "1", kernel_size: kernel_size, dilation: "1", bias: "1" }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  residual1:      { op: add, in: [residual0, convs2.1], dim: d_model }
+  activations.4.upsample:          { op: filter_buffer, dims: { kernel_size: n_aa_taps }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  activations.4.downsample.lowpass: { op: filter_buffer, dims: { kernel_size: n_aa_taps }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  activations.4:  { op: snake_beta, in: [residual1, activations.4.upsample, activations.4.downsample.lowpass], dims: { dim: d_model, kernel_size: n_aa_taps }, weight_axes: [{ replicated: true }] }
+  convs1.2:       { op: conv1d_weight_norm, in: activations.4, dims: { C_in: d_model, C_out: d_model, groups: "1", kernel_size: kernel_size, dilation: "5", bias: "1" }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  activations.5.upsample:          { op: filter_buffer, dims: { kernel_size: n_aa_taps }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  activations.5.downsample.lowpass: { op: filter_buffer, dims: { kernel_size: n_aa_taps }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  activations.5:  { op: snake_beta, in: [convs1.2, activations.5.upsample, activations.5.downsample.lowpass], dims: { dim: d_model, kernel_size: n_aa_taps }, weight_axes: [{ replicated: true }] }
+  convs2.2:       { op: conv1d_weight_norm, in: activations.5, dims: { C_in: d_model, C_out: d_model, groups: "1", kernel_size: kernel_size, dilation: "1", bias: "1" }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  out:            { op: add, in: [residual1, convs2.2], dim: d_model }
+outputs: [out]

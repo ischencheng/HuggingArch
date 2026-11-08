@@ -144,7 +144,11 @@ def replicated_encoders(program: Any, parallel: Any, phase: str
     keeps its declared placement.
     """
     degree = parallel.degree_of_world("tp_attention", phase=phase)
-    heads: Dict[str, Any] = {}
+    # A stack is split or replicated as one: every head count its scores
+    # declare must take the degree, or the whole stack runs replicated (a
+    # pipeline's text encoder and the transformer's token refiner it feeds
+    # are one stack with two counts).
+    heads: Dict[str, List[Any]] = {}
     for uid in program.encoder_uids:
         node = program.by_uid(uid)
         if node.op not in ATTENTION_SCORE_OPS:
@@ -155,13 +159,10 @@ def replicated_encoders(program: Any, parallel: Any, phase: str
             raise ValueError(
                 f"{node.display_path}: an encoder attention score whose "
                 "frame binds no `n_heads`")
-        if not equal(heads.setdefault(stack, count), count):
-            raise ValueError(
-                f"encoder stack {stack!r} scores attention over "
-                f"{heads[stack]} and {count} query heads; a stack is split "
-                "or replicated as one, so its query heads must be one count")
-    return frozenset(stack for stack, count in heads.items()
-                     if not equal(common_divisor(count, degree), degree))
+        heads.setdefault(stack, []).append(count)
+    return frozenset(stack for stack, counts in heads.items()
+                     if any(not equal(common_divisor(count, degree), degree)
+                            for count in counts))
 
 
 def head_repartition_constraints(analysis: Any, parallel: Any

@@ -3313,6 +3313,9 @@ const AUX_LABELS: Record<string, string> = {
   audio: "Audio Tower",
   mtp: "MTP / Speculative Head",
   speculative: "MTP / Speculative Head",
+  text: "Text Encoder",
+  latent: "Latent Input Projections",
+  decoder: "Decoder",
 };
 
 /** One composition figure, or a dash for a role the row does not have. */

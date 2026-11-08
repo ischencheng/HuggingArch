@@ -81,15 +81,17 @@ class TestDeclaredOpNames(unittest.TestCase):
         a `name:` key for a while after that key was retired, so it was empty,
         and the two byte-walkers that ask it stopped crossing a head reshape
         with nothing said. Name what it must contain: the three head reshapes,
-        and CSA2's three slot fillers that hand on what an earlier layer
-        published (a shared latent, its compressed rows, a shared top-k)."""
+        CSA2's three slot fillers that hand on what an earlier layer
+        published (a shared latent, its compressed rows, a shared top-k), and
+        the rotation slot that rotates nothing."""
         from backend.arch.op_names import view_only_components
 
         self.assertEqual(view_only_components(),
                          frozenset({"head_split", "head_merge",
                                     "head_broadcast", "csa2_shared_latent",
                                     "csa2_compress_borrowed",
-                                    "csa2_shared_selection"}))
+                                    "csa2_shared_selection",
+                                    "identity_rope"}))
 
     def test_is_view_name_reads_the_registry_not_a_second_table(self):
         from backend.arch.op_names import is_view_name

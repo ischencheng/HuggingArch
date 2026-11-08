@@ -17,7 +17,7 @@ reads, and the bytes one cached encoder-output token holds
 The references are the workload's, written here and nowhere in the
 production path: `one` is one item per media input, `two` two items. An
 image side is a whole number of the processor's resize factor the spec
-declares on its `patchify` (`align`): `one` is `7·align` square, `two`
+declares on its cut (`align`): `one` is `7·align` square, `two`
 `14·align` high and `7·align` wide; a side the config fixes stays fixed.
 An audio clip is 125 frames in `one` and 750 in `two`; a video 4 sampled
 frames `7·align` square in `one` and 5 frames (an odd count: the last frame
@@ -53,17 +53,9 @@ def tp_config(degree: int) -> Any:
 
 def reference_media(program: Any, reference: str) -> Dict[str, Any]:
     """The reference's media for every media input `program` declares,
-    each image side a multiple of its own `patchify`'s `align`."""
-    from backend.arch.eval.dim import eval_dim_expr, value_of
+    each image side a multiple of the `align` of the processor's cut that
+    reads it (`ModelInput.least`)."""
     ref = REFERENCES[reference]
-    dims = dict(program.resolved.dim_values)
-    align: Dict[str, int] = {}
-    for layer_path, layer in program.spec.layer_paths():
-        del layer_path
-        if layer.op == "patchify":
-            (source,) = layer.inputs
-            align[source] = int(value_of(eval_dim_expr(
-                str(layer.dims["align"]), dims)))
     media: Dict[str, Any] = {}
     for name, entry in program.model_inputs.items():
         if entry.kind == "tokens":
@@ -81,7 +73,7 @@ def reference_media(program: Any, reference: str) -> Dict[str, Any]:
                         else ref["sides"])
             for axis, units in zip(sides, units_of, strict=True):
                 if axis not in fixed:
-                    axes[axis] = units * align[name]
+                    axes[axis] = units * int(entry.least[axis])
             if entry.kind == "video":
                 axes[entry.axes[1]] = ref["video_frames"]
         else:

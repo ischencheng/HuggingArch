@@ -43,7 +43,8 @@ class TestTensorSources(unittest.TestCase):
         identity = {o for o in OP_REGISTRY if is_identity_source(o)}
         sources = {o for o in OP_REGISTRY if is_tensor_source(o)}
         self.assertTrue(identity <= sources)
-        self.assertEqual(sorted(sources - identity), ["rotary_inv_freq_buffer"])
+        self.assertEqual(sorted(sources - identity),
+                         ["filter_buffer", "rotary_inv_freq_buffer"])
 
 
 class TestStoredTensorsAreOneDeclaration(unittest.TestCase):

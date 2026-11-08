@@ -1,0 +1,55 @@
+# MiniMax-H3 joint attention (diffusers `MiniMaxH3Attention` +
+# `MiniMaxH3AttnProcessor`): Q/K/V project the 5376 stream to 56 heads of
+# 128 — 7168 channels, wider than the stream — with no bias; per-head
+# RMSNorm on Q and K; the 3-D RoPE on the first 96 channels; then full
+# attention over the one packed request (`is_causal=False`, no mask: "MiniMax-H3
+# packs one request into a single attention document"). There is no
+# cross-attention: text, video and audio rows attend to each other in the one
+# sequence. `to_out.1` is a dropout. Recomputed every denoise step: no cache.
+#
+# `rope` is the rotation: `partial_rope_3d` in the transformer blocks; the
+# token refiner, which rotates nothing, binds `identity_rope`.
+#
+# Required dims: d_model, n_heads, d_head, d_rope, d_nope
+
+role: attention
+description: "MiniMax-H3 joint attention: no-bias Q/K/V to n_heads·d_head, per-head RMSNorm, 3-D RoPE on d_rope channels, full attention over the packed request."
+params:
+  rope: { kind: component, default: partial_rope_3d }
+cache:
+  family: DiT
+  entries: []
+graph:
+  to_q:
+    op: linear
+    in: x
+    dims: { in: d_model, out: "n_heads * d_head" }
+    weight_axes: [{ world: attention, parts: n_heads, fit: replica_cells }, { replicated: true }]
+  to_k:
+    op: linear
+    in: x
+    dims: { in: d_model, out: "n_heads * d_head" }
+    weight_axes: [{ world: attention, parts: n_heads, fit: replica_cells }, { replicated: true }]
+  to_v:
+    op: linear
+    in: x
+    dims: { in: d_model, out: "n_heads * d_head" }
+    weight_axes: [{ world: attention, parts: n_heads, fit: replica_cells }, { replicated: true }]
+  q_split_heads: { op: head_split, in: to_q, dims: { n_heads: n_heads, d_head: d_head } }
+  k_split_heads: { op: head_split, in: to_k, dims: { n_heads: n_heads, d_head: d_head } }
+  v_split_heads: { op: head_split, in: to_v, dims: { n_heads: n_heads, d_head: d_head } }
+  norm_q:        { op: rmsnorm, in: q_split_heads, dim: d_head, weight_axes: [{ replicated: true }] }
+  norm_k:        { op: rmsnorm, in: k_split_heads, dim: d_head, weight_axes: [{ replicated: true }] }
+  q_rope:        { op: <rope>, in: norm_q, module: null, dims: { d_head: d_head, d_rope: d_rope, d_nope: d_nope } }
+  k_rope:        { op: <rope>, in: norm_k, module: null, dims: { d_head: d_head, d_rope: d_rope, d_nope: d_nope } }
+  # One attention document per request: every row sees every row.
+  qk_score:      { op: attention_score, in: [q_rope, k_rope], dims: { is_causal: "0", n_heads: n_heads, d_head: d_head } }
+  softmax:       { op: softmax, in: qk_score, dims: { is_causal: "0", n_heads: n_heads } }
+  attn_apply:    { op: attention_apply, in: [softmax, v_split_heads], dims: { is_causal: "0", n_heads: n_heads, d_head: d_head } }
+  o_merge_heads: { op: head_merge, in: attn_apply, dims: { n_heads: n_heads, d_head: d_head } }
+  to_out.0:
+    op: linear
+    in: o_merge_heads
+    dims: { in: "n_heads * d_head", out: d_model }
+    weight_axes: [{ replicated: true }, { world: attention, parts: n_heads, fit: replica_cells }]
+outputs: [to_out.0]

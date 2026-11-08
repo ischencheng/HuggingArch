@@ -93,6 +93,10 @@ def _get_safetensors_data(model_id: str, overlay_dir=None) -> dict:
         # The checkpoint's `quant_method` when no registered scheme is named
         # for it (`hf.metadata`); the spec's quant_context must describe it.
         "quant_method_unknown": meta.get("quant_method_unknown"),
+        # The scheme the totals were summed under, so a part of the header
+        # (`_checkpoint_unread`) is summed the same way.
+        "quant_scheme": meta.get("quant_scheme"),
+        "num_bits": meta.get("num_bits", 0),
     }
 
 

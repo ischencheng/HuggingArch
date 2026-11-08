@@ -3340,6 +3340,300 @@ register_op(OpSpec("send_recv",
 ))
 
 
+# --- Diffusion pipelines ----------------------------------------------------
+# A diffusion transformer runs one forward per denoise step over a packed
+# sequence it builds itself: the rows of each modality written into a zeroed
+# buffer, AdaLN modulation picked per row from a table computed off the
+# step's noise levels, and a rotary embedding over each row's (t, h, w)
+# position. Its autoencoders decode the final latents with 1-D (transposed)
+# convolutions and alias-free activations, a video one in overlapping tiles.
+# MiniMax-H3 (diffusers `transformer_minimax_h3.py`,
+# `autoencoder_kl_minimax_h3{,_audio}.py`) is the first model that runs them.
+
+register_op(OpSpec("zeros",
+    # Nothing is read, so no axis couples.
+    couples_on=(),
+    flops_fn=_zero,
+    params_fn=_zero,
+    shape_out=("B", "s_ctx", "dim"),
+    shape_kind="source",
+    formula="y = zeros(B, s_ctx, dim)",
+    description="A zeroed buffer of the step's rows, which row scatters then "
+                "fill (diffusers `new_zeros` before `index_copy`). Zero FLOPs; "
+                "one write of the output.",
+    required_dims=("dim",),
+))
+
+register_op(OpSpec("sinusoidal_embedding",
+    couples_on=(),
+    # One sin or cos per value: one transcendental each (`eval/flops.py`).
+    flops_fn=lambda d: d["B"] * d["rows"] * d["dim"],
+    params_fn=_zero,
+    shape_out=("B", "rows", "dim"),
+    shape_kind="source",
+    formula="y[r, i] = cos(t_r · f_i) | sin(t_r · f_i),  f_i = 10000^(-i / (dim/2))",
+    description="Sinusoidal features of `rows` scalars the step is given "
+                "(diffusers `Timesteps`: a denoise step's distinct noise "
+                "levels). The scalars are the pipeline's, not a tensor the "
+                "graph models; only their count shapes the output.",
+    required_dims=("rows", "dim"),
+))
+
+register_op(OpSpec("view_rows",
+    couples_on=(),
+    flops_fn=_zero,
+    params_fn=_zero,
+    shape_in=("B", "s_ctx", "in"),
+    shape_out=("B", "s_out", "out"),
+    shape_kind="explicit",
+    formula="y = x.view(B, s_ctx · rows, in / rows)",
+    description="View-op: each row's features read as `rows` rows of "
+                "`in / rows` (torch `view(-1, w)` on a row-major tensor). "
+                "Zero FLOPs / zero HBM.",
+    required_dims=("rows",),
+    is_view_op=True,
+))
+
+register_op(OpSpec("row_gather",
+    couples_on=(),
+    flops_fn=_zero,
+    params_fn=_zero,
+    # A table computed this step, then one id per row of the step.
+    shape_in=(("B", "rows", "dim"), ("B", "s_ctx")),
+    shape_out=("B", "s_ctx", "dim"),
+    shape_kind="explicit",
+    input_rank_is_exact=True,
+    # Each written value is one picked table value.
+    gather_source=0,
+    formula="y[b, s] = table[b, ids[b, s]]",
+    description="Pick one row of a computed table per row of the step "
+                "(diffusers `index_select(0, adaln_indices)`: MiniMax-H3's "
+                "AdaLN modulation, one table row per (timestep, modality)). "
+                "Zero FLOPs.",
+    required_dims=("dim",),
+))
+
+register_op(dataclasses.replace(OP_REGISTRY["rope"],
+    name="rope_3d",
+    label="3-D RoPE",
+    rotary_position_axes=3,
+    formula=("(x_i, x_j) ← rotation by θ_k · pos_a(k)   "
+             "(channel third k reads position stream a ∈ {t, h, w})"),
+    description=(
+        "Three-axis rotary position embedding over a video's (t, h, w) "
+        "grid: one shared frequency list per axis, the three angle blocks "
+        "concatenated, over `dim` channels of each head. 4-D `(B, n_heads, "
+        "s_ctx, dim)`, one node per tensor. Same per-element work as `rope`."),
+))
+
+
+def _conv_weight_elements(template):
+    def elements(d):
+        shape = resolve_shape_template(template, d)
+        n = 1
+        for extent in shape or (0,):
+            n = n * extent
+        return n
+    return elements
+
+
+def _weight_norm_conv(name: str, base: str, g_axis: str,
+                      description: str) -> None:
+    """`base` with its weight stored as `torch.nn.utils.weight_norm` stores
+    it: a direction `.weight_v` (the weight's shape) and a magnitude
+    `.weight_g` (one per slice along dim 0, `[g_axis, 1, 1]`). The forward
+    runs `base` on `g · v / ‖v‖`; the norm is recomputed per call (a
+    pre-forward hook) and counted with it."""
+    spec = OP_REGISTRY[base]
+    v_shape = spec.weight_shape
+    v = _conv_weight_elements(v_shape)
+    register_op(dataclasses.replace(spec,
+        name=name,
+        flops_fn=lambda d: spec.flops_fn(d) + 3 * v(d),
+        params_fn=lambda d: v(d) + d[g_axis] + d["C_out"] * _flag(d, "bias"),
+        weight_shape=v_shape,
+        weight_tensor_suffix=".weight_v",
+        # The direction first: it is the weight's shape (`weight_shape`).
+        tensors=(
+            TensorDecl(".weight_v", v_shape),
+            # Stored `[g_axis, 1, 1]`: one magnitude per slice along the
+            # direction's first axis, declared by those values.
+            TensorDecl(".weight_g", (g_axis,), kind="vector", axis_refs=(0,)),
+            # The bias follows the output channels: the direction's
+            # `C_out` axis, wherever the base op puts it.
+            TensorDecl(".bias", ("C_out",), when="bias", kind="vector",
+                       axis_refs=(v_shape.index(next(
+                           a for a in v_shape if a.startswith("C_out"))),)),
+        ),
+        formula=f"{spec.formula}   with w = g · v / ‖v‖",
+        description=description,
+    ))
+
+
+register_op(OpSpec("conv_transpose1d",
+    couples_on=("C_in", "s_ctx"),
+    # Each input sample scatters `kernel_size` taps into every output
+    # channel of its group: 2 · s_in · C_in · (C_out/groups) · k.
+    flops_fn=lambda d: 2 * d["B"] * d["s_ctx"] * _conv_weight_elements(
+                           OP_REGISTRY["conv_transpose1d"].weight_shape)(d)
+                       + d["B"] * d["s_ctx"] * d["stride"] * d["C_out"] * _flag(d, "bias"),
+    params_fn=lambda d: _conv_weight_elements(
+                            OP_REGISTRY["conv_transpose1d"].weight_shape)(d)
+                        + d["C_out"] * _flag(d, "bias"),
+    shape_in=("B", "s_ctx", "C_in"),
+    shape_out=("B", "s_out", "C_out"),
+    shape_kind="explicit",
+    formula="y[b, o, s·stride + k − pad] += Σ_i w[i, o, k] · x[b, i, s]",
+    description="1D transposed convolution: upsamples the row axis by "
+                "`stride` (`padding = (kernel_size − stride) / 2`, as BigVGAN "
+                "writes it, so the output is exactly `stride` rows per input "
+                "row). Feature-last `[B, S, C]`, as `conv1d`.",
+    weight_shape=("C_in", "C_out // groups", "kernel_size"),
+    tensors=(
+        TensorDecl(".weight", ("C_in", "C_out // groups", "kernel_size")),
+        # A transposed conv's weight is `[C_in, C_out/groups, k]`: the bias
+        # follows its second axis.
+        TensorDecl(".bias", ("C_out",), when="bias", kind="vector", axis_refs=(1,)),
+    ),
+    required_dims=("C_in", "C_out", "groups", "kernel_size", "stride"),
+))
+
+_weight_norm_conv(
+    "conv1d_weight_norm", "conv1d", "C_out",
+    "`conv1d` whose weight `torch.nn.utils.weight_norm` stores as `.weight_g` "
+    "[C_out, 1, 1] and `.weight_v` (DAC / BigVGAN audio codecs).")
+_weight_norm_conv(
+    "conv_transpose1d_weight_norm", "conv_transpose1d", "C_in",
+    "`conv_transpose1d` whose weight `torch.nn.utils.weight_norm` stores as "
+    "`.weight_g` [C_in, 1, 1] (dim 0 of a transposed conv's weight) and "
+    "`.weight_v`.")
+
+register_op(OpSpec("filter_buffer",
+    is_side_buffer=True,
+    couples_on=(),
+    flops_fn=_zero,
+    params_fn=lambda d: d["kernel_size"],
+    # Stored, not learned: a fixed low-pass kernel the checkpoint serialises
+    # beside the weights (`register_buffer`, persistent).
+    is_buffer=True,
+    # Stored `[1, 1, kernel_size]` (a depthwise conv kernel expanded over
+    # the channels at each call); the taps are what flows.
+    weight_shape=("1", "1", "kernel_size"),
+    weight_tensor_suffix=".filter",
+    shape_out=("kernel_size",),
+    shape_kind="source",
+    formula="h[k] = sinc(2·f_c·(k − K/2)) · kaiser(k)",
+    description="A precomputed FIR filter buffer (BigVGAN's Kaiser-windowed "
+                "sinc low-pass), one per resampler.",
+    required_dims=("kernel_size",),
+))
+
+register_op(OpSpec("snake_beta",
+    couples_on=(),
+    # Alias-free: upsample 2x (a depthwise transposed FIR of `kernel_size`
+    # taps, polyphase: kernel_size / 2 MACs per output), the activation on
+    # the 2x rows (`exp` of the two per-channel logs is per channel, then
+    # sin, square, scale, add: 5 per value), downsample 2x (a depthwise FIR
+    # of `kernel_size` taps per output).
+    flops_fn=lambda d: d["B"] * d["s_ctx"] * d["dim"] * (
+        2 * 2 * (d["kernel_size"] / 2) + 2 * 5 + 2 * d["kernel_size"]),
+    params_fn=lambda d: 2 * d["dim"],
+    shape_in=(("B", "s_ctx", "dim"), ("kernel_size",), ("kernel_size",)),
+    shape_out=("B", "s_ctx", "dim"),
+    shape_kind="explicit",
+    formula="y = down₂(u + e^(−β) · sin²(e^α · u)),  u = up₂(x)",
+    description="BigVGAN's anti-aliased SnakeBeta activation "
+                "(`Activation1d(SnakeBeta)`): upsample 2x by its `upsample` "
+                "filter, SnakeBeta with per-channel log-scale α (frequency) "
+                "and β (magnitude), low-pass and downsample 2x by its "
+                "`downsample` filter. Reads x and the two filter buffers.",
+    weight_shape=("dim",),
+    tensors=(
+        TensorDecl(".act.alpha", ("dim",), kind="vector"),
+        TensorDecl(".act.beta", ("dim",), kind="vector", axis_refs=(0,)),
+    ),
+    required_dims=("dim", "kernel_size"),
+))
+
+register_op(OpSpec("zero_rows",
+    couples_on=(),
+    flops_fn=_zero,
+    params_fn=_zero,
+    shape_out=("B", "rows", "dim"),
+    shape_kind="source",
+    formula="y = zeros(B, rows, dim)",
+    description="`rows` zero tokens, built in the forward and stored nowhere "
+                "(a ViT decoder's all-zero token, `zeros_like(x[:, :1])`).",
+    required_dims=("rows", "dim"),
+))
+
+register_op(OpSpec("append_tokens",
+    couples_on=(),
+    flops_fn=_zero,
+    params_fn=_zero,
+    # Every segment's rows, then each extra input's rows, shared by all.
+    shape_in=(("B", "s_ctx", "dim"), ("1", "rows", "dim")),
+    shape_out=("B", "s_out", "dim"),
+    shape_kind="explicit",
+    repeats_last_input=True,
+    formula="y[m] = concat(x[m], t₁[0], t₂[0], …)",
+    description="Append the same tokens — learned registers, a zero token — "
+                "to every segment's rows (`torch.cat([x, registers.expand(M, "
+                "...), zero], dim=1)`), as a ViT with registers does before "
+                "its blocks. Zero FLOPs.",
+    required_dims=("dim",),
+))
+
+
+def _tile_contract(shapes: Sequence[Sequence[Any]],
+                   dims: Dict[str, Any]) -> Optional[str]:
+    if len(shapes) != 1 or len(shapes[0]) != 5:
+        return ("tile_video reads one latent video [N, n, T, H, W], got ranks "
+                f"{[len(shape) for shape in shapes]}")
+    return None
+
+
+register_op(OpSpec("tile_video",
+    # The tiles overlap, so no axis of the video maps onto one of the tiles.
+    couples_on=(),
+    flops_fn=_zero,
+    params_fn=_zero,
+    shape_in=(),
+    shape_out=(),
+    shape_kind="explicit",
+    input_rank_is_exact=True,
+    input_contract=_tile_contract,
+    formula="y[c] = x[n, t₀(c) : t₀+tile_t, h₀(c) : h₀+tile_h, w₀(c) : w₀+tile_w]",
+    description="View-op: cut each latent video into the overlapping tiles "
+                "its decoder runs on, one segment per tile — [N, n, T, H, W] "
+                "-> [tiles, tile_t·tile_h·tile_w, channels], `tiles` the "
+                "call's count (chunks × rows × columns per video, × N·n). An "
+                "overlap is decoded in every tile that holds it. Zero FLOPs.",
+    # `align`: the side factor every cut of one input states alike
+    # (`Program._cut_align`), the multiple the item's sides come in.
+    required_dims=("tiles", "rows", "channels", "align"),
+    is_view_op=True,
+    processor_step=ProcessorStep.CUT,
+))
+
+register_op(OpSpec("untile_video",
+    couples_on=(),
+    # The overlaps are cross-faded (3 FLOPs per overlapped value); counted
+    # as none, the share they are of the frame is the tiling's choice.
+    flops_fn=_zero,
+    params_fn=_zero,
+    shape_in=(("B", "s_ctx", "dim"),),
+    shape_out=("items", "rows", "channels"),
+    shape_kind="explicit",
+    formula="frames = blend(unpatchify(tiles))",
+    description="View-op: each tile's rows unpatchified into pixels and the "
+                "tiles' overlaps blended back into whole frames — [tiles, "
+                "rows, patch] -> [items, frames·height·width, channels].",
+    required_dims=("items", "rows", "channels"),
+    is_view_op=True,
+))
+
+
 # --- Guard-ablation experiment hook: HA_STRIP_OPS ---------------------------
 # Comma-separated op names to remove from OP_REGISTRY at import, so the spec-gen
 # agent's `validate` subprocess (a fresh import) cannot use a model-specific

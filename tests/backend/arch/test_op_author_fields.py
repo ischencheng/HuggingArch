@@ -31,9 +31,11 @@ def test_the_lookup_table_is_the_embedding():
 def test_tp_axis_placement_is_the_six_weight_ops_the_demotion_covered():
     # The extension of the name list `sharding.leaf_class` used to consult:
     # the vocab-parallel table and the bare parameters stay out. `conv2d`
-    # joins as the vision downsampler's weight-bearing op (like conv1d).
+    # joins as the vision downsampler's weight-bearing op (like conv1d), and
+    # `conv1d_weight_norm` as conv1d with its weight stored weight-normed.
     assert _ops_where(lambda s: s.tp_axis_placement) == {
-        "linear", "rmsnorm", "layernorm", "conv1d", "conv2d", "per_head_linear"}
+        "linear", "rmsnorm", "layernorm", "conv1d", "conv2d", "per_head_linear",
+        "conv1d_weight_norm"}
     assert all(OP_REGISTRY[n].has_weight() for n in _ops_where(lambda s: s.tp_axis_placement))
 
 
@@ -58,7 +60,7 @@ def test_labels_cover_what_the_render_table_used_to_spell():
     labels = op_labels()
     assert labels["rmsnorm"] == "RMSNorm" and labels["attention_score"] == "Q @ K^T"
     assert set(labels) == {"rmsnorm", "layernorm", "embedding", "linear", "add", "mul", "rope",
-                           "rope_emb", "rope_emb_inverse", "mrope", "rope_2d", "xdrope", "hash_embedding", "softmax", "attention_score", "attention_apply",
+                           "rope_emb", "rope_emb_inverse", "mrope", "rope_2d", "rope_3d", "xdrope", "hash_embedding", "softmax", "attention_score", "attention_apply",
                            "hadamard_transform", "indexer_logits", "dsa_topk_mask",
                            "dsa_attention_score",
                            "dsa_attention_apply", "dsa_softmax"}
@@ -70,12 +72,13 @@ def test_the_rotations_and_their_position_streams():
     """`rotary_position_axes` replaced the rotation names spelled in the
     structural diff and the view-absorb hosts: one stream for RoPE and its
     inverse, two for a vision tower's (h, w) rotation, three for multimodal
-    RoPE, four for XD-RoPE — and the two sectioned ones name the rope
-    parameter their kernel is built from."""
+    RoPE and for a video grid's (t, h, w) rotation, four for XD-RoPE — and
+    the two sectioned ones name the rope parameter their kernel is built
+    from."""
     assert {n: s.rotary_position_axes for n, s in OP_REGISTRY.items()
             if s.rotary_position_axes} == {
         "rope": 1, "rope_emb": 1, "rope_emb_inverse": 1, "rope_2d": 2,
-        "mrope": 3, "xdrope": 4}
+        "mrope": 3, "rope_3d": 3, "xdrope": 4}
     assert {n: s.rotary_sections_key for n, s in OP_REGISTRY.items()
             if s.rotary_sections_key} == {
         "mrope": "mrope_section", "xdrope": "xdrope_section"}

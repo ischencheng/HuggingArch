@@ -1,0 +1,73 @@
+# MiniMax-H3 audio decoder (diffusers `MiniMaxH3AudioBigVGANDecoder`):
+# BigVGAN with seven upsampling stages. `conv_pre` (weight-normed, kernel 7)
+# narrows the latent_dim lift to `decoder_dim`; stage i upsamples by
+# `decoder_rates[i]` with a weight-normed transposed conv that halves the
+# channels (`ups.<i>.0`), then averages three AMP blocks of kernels
+# `resblock_kernel_sizes` (`resblocks.<3i + j>`):
+#
+#   x = self.ups[i][0](x)
+#   x = sum(self.resblocks[i * 3 + j](x) for j in range(3)) / 3
+#
+# then the alias-free SnakeBeta `activation_post` and the weight-normed,
+# bias-free `conv_post` to one channel. prod(decoder_rates) = 800 samples per
+# latent frame: 40 latent frames per second at 32 kHz.
+#
+# Required dims: d_audio_latent, d_audio_dec, n_aa_taps, s_up_<i>, k_up_<i>, k_res_<j>
+role: block
+description: "MiniMax-H3 BigVGAN audio decoder: conv_pre, seven (transposed conv + 3 averaged AMP blocks) stages, SnakeBeta, conv_post."
+graph:
+  conv_pre: { op: conv1d_weight_norm, in: x, dims: { C_in: d_audio_latent, C_out: d_audio_dec, groups: "1", kernel_size: "7", dilation: "1", bias: "1" }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  ups.0.0: { op: conv_transpose1d_weight_norm, in: conv_pre, dims: { C_in: d_audio_dec, C_out: "d_audio_dec // 2", groups: "1", kernel_size: k_up_0, stride: s_up_0, bias: "1" }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  resblocks.0: { op: bigvgan_amp_block, in: ups.0.0, dims: { d_model: "d_audio_dec // 2", kernel_size: k_res_0, n_aa_taps: n_aa_taps } }
+  resblocks.1: { op: bigvgan_amp_block, in: ups.0.0, dims: { d_model: "d_audio_dec // 2", kernel_size: k_res_1, n_aa_taps: n_aa_taps } }
+  resblocks.2: { op: bigvgan_amp_block, in: ups.0.0, dims: { d_model: "d_audio_dec // 2", kernel_size: k_res_2, n_aa_taps: n_aa_taps } }
+  stage0_sum: { op: add, in: [resblocks.0, resblocks.1], dim: "d_audio_dec // 2" }
+  stage0_sum2: { op: add, in: [stage0_sum, resblocks.2], dim: "d_audio_dec // 2" }
+  stage0_mean: { op: scale_const, in: stage0_sum2, dims: { in: "d_audio_dec // 2" } }
+  ups.1.0: { op: conv_transpose1d_weight_norm, in: stage0_mean, dims: { C_in: "d_audio_dec // 2", C_out: "d_audio_dec // 4", groups: "1", kernel_size: k_up_1, stride: s_up_1, bias: "1" }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  resblocks.3: { op: bigvgan_amp_block, in: ups.1.0, dims: { d_model: "d_audio_dec // 4", kernel_size: k_res_0, n_aa_taps: n_aa_taps } }
+  resblocks.4: { op: bigvgan_amp_block, in: ups.1.0, dims: { d_model: "d_audio_dec // 4", kernel_size: k_res_1, n_aa_taps: n_aa_taps } }
+  resblocks.5: { op: bigvgan_amp_block, in: ups.1.0, dims: { d_model: "d_audio_dec // 4", kernel_size: k_res_2, n_aa_taps: n_aa_taps } }
+  stage1_sum: { op: add, in: [resblocks.3, resblocks.4], dim: "d_audio_dec // 4" }
+  stage1_sum2: { op: add, in: [stage1_sum, resblocks.5], dim: "d_audio_dec // 4" }
+  stage1_mean: { op: scale_const, in: stage1_sum2, dims: { in: "d_audio_dec // 4" } }
+  ups.2.0: { op: conv_transpose1d_weight_norm, in: stage1_mean, dims: { C_in: "d_audio_dec // 4", C_out: "d_audio_dec // 8", groups: "1", kernel_size: k_up_2, stride: s_up_2, bias: "1" }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  resblocks.6: { op: bigvgan_amp_block, in: ups.2.0, dims: { d_model: "d_audio_dec // 8", kernel_size: k_res_0, n_aa_taps: n_aa_taps } }
+  resblocks.7: { op: bigvgan_amp_block, in: ups.2.0, dims: { d_model: "d_audio_dec // 8", kernel_size: k_res_1, n_aa_taps: n_aa_taps } }
+  resblocks.8: { op: bigvgan_amp_block, in: ups.2.0, dims: { d_model: "d_audio_dec // 8", kernel_size: k_res_2, n_aa_taps: n_aa_taps } }
+  stage2_sum: { op: add, in: [resblocks.6, resblocks.7], dim: "d_audio_dec // 8" }
+  stage2_sum2: { op: add, in: [stage2_sum, resblocks.8], dim: "d_audio_dec // 8" }
+  stage2_mean: { op: scale_const, in: stage2_sum2, dims: { in: "d_audio_dec // 8" } }
+  ups.3.0: { op: conv_transpose1d_weight_norm, in: stage2_mean, dims: { C_in: "d_audio_dec // 8", C_out: "d_audio_dec // 16", groups: "1", kernel_size: k_up_3, stride: s_up_3, bias: "1" }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  resblocks.9: { op: bigvgan_amp_block, in: ups.3.0, dims: { d_model: "d_audio_dec // 16", kernel_size: k_res_0, n_aa_taps: n_aa_taps } }
+  resblocks.10: { op: bigvgan_amp_block, in: ups.3.0, dims: { d_model: "d_audio_dec // 16", kernel_size: k_res_1, n_aa_taps: n_aa_taps } }
+  resblocks.11: { op: bigvgan_amp_block, in: ups.3.0, dims: { d_model: "d_audio_dec // 16", kernel_size: k_res_2, n_aa_taps: n_aa_taps } }
+  stage3_sum: { op: add, in: [resblocks.9, resblocks.10], dim: "d_audio_dec // 16" }
+  stage3_sum2: { op: add, in: [stage3_sum, resblocks.11], dim: "d_audio_dec // 16" }
+  stage3_mean: { op: scale_const, in: stage3_sum2, dims: { in: "d_audio_dec // 16" } }
+  ups.4.0: { op: conv_transpose1d_weight_norm, in: stage3_mean, dims: { C_in: "d_audio_dec // 16", C_out: "d_audio_dec // 32", groups: "1", kernel_size: k_up_4, stride: s_up_4, bias: "1" }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  resblocks.12: { op: bigvgan_amp_block, in: ups.4.0, dims: { d_model: "d_audio_dec // 32", kernel_size: k_res_0, n_aa_taps: n_aa_taps } }
+  resblocks.13: { op: bigvgan_amp_block, in: ups.4.0, dims: { d_model: "d_audio_dec // 32", kernel_size: k_res_1, n_aa_taps: n_aa_taps } }
+  resblocks.14: { op: bigvgan_amp_block, in: ups.4.0, dims: { d_model: "d_audio_dec // 32", kernel_size: k_res_2, n_aa_taps: n_aa_taps } }
+  stage4_sum: { op: add, in: [resblocks.12, resblocks.13], dim: "d_audio_dec // 32" }
+  stage4_sum2: { op: add, in: [stage4_sum, resblocks.14], dim: "d_audio_dec // 32" }
+  stage4_mean: { op: scale_const, in: stage4_sum2, dims: { in: "d_audio_dec // 32" } }
+  ups.5.0: { op: conv_transpose1d_weight_norm, in: stage4_mean, dims: { C_in: "d_audio_dec // 32", C_out: "d_audio_dec // 64", groups: "1", kernel_size: k_up_5, stride: s_up_5, bias: "1" }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  resblocks.15: { op: bigvgan_amp_block, in: ups.5.0, dims: { d_model: "d_audio_dec // 64", kernel_size: k_res_0, n_aa_taps: n_aa_taps } }
+  resblocks.16: { op: bigvgan_amp_block, in: ups.5.0, dims: { d_model: "d_audio_dec // 64", kernel_size: k_res_1, n_aa_taps: n_aa_taps } }
+  resblocks.17: { op: bigvgan_amp_block, in: ups.5.0, dims: { d_model: "d_audio_dec // 64", kernel_size: k_res_2, n_aa_taps: n_aa_taps } }
+  stage5_sum: { op: add, in: [resblocks.15, resblocks.16], dim: "d_audio_dec // 64" }
+  stage5_sum2: { op: add, in: [stage5_sum, resblocks.17], dim: "d_audio_dec // 64" }
+  stage5_mean: { op: scale_const, in: stage5_sum2, dims: { in: "d_audio_dec // 64" } }
+  ups.6.0: { op: conv_transpose1d_weight_norm, in: stage5_mean, dims: { C_in: "d_audio_dec // 64", C_out: "d_audio_dec // 128", groups: "1", kernel_size: k_up_6, stride: s_up_6, bias: "1" }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  resblocks.18: { op: bigvgan_amp_block, in: ups.6.0, dims: { d_model: "d_audio_dec // 128", kernel_size: k_res_0, n_aa_taps: n_aa_taps } }
+  resblocks.19: { op: bigvgan_amp_block, in: ups.6.0, dims: { d_model: "d_audio_dec // 128", kernel_size: k_res_1, n_aa_taps: n_aa_taps } }
+  resblocks.20: { op: bigvgan_amp_block, in: ups.6.0, dims: { d_model: "d_audio_dec // 128", kernel_size: k_res_2, n_aa_taps: n_aa_taps } }
+  stage6_sum: { op: add, in: [resblocks.18, resblocks.19], dim: "d_audio_dec // 128" }
+  stage6_sum2: { op: add, in: [stage6_sum, resblocks.20], dim: "d_audio_dec // 128" }
+  stage6_mean: { op: scale_const, in: stage6_sum2, dims: { in: "d_audio_dec // 128" } }
+  activation_post.upsample:          { op: filter_buffer, dims: { kernel_size: n_aa_taps }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  activation_post.downsample.lowpass: { op: filter_buffer, dims: { kernel_size: n_aa_taps }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+  activation_post: { op: snake_beta, in: [stage6_mean, activation_post.upsample, activation_post.downsample.lowpass], dims: { dim: "d_audio_dec // 128", kernel_size: n_aa_taps }, weight_axes: [{ replicated: true }] }
+  conv_post: { op: conv1d_weight_norm, in: activation_post, dims: { C_in: "d_audio_dec // 128", C_out: "1", groups: "1", kernel_size: "7", dilation: "1" }, weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+outputs: [conv_post]

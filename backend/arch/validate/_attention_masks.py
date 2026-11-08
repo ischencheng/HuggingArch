@@ -35,12 +35,22 @@ from backend.arch.ops_base import mask_flags
 
 from ._finding import Finding
 
+def _stated(node: Any) -> dict:
+    """The mask flags stated for the node: its own `dims:`, or the frame it
+    sits in — a call site or a block assignment that states the mask for a
+    library attention whose nodes leave it to the caller (a pipeline's text
+    encoder runs an LM attention causally inside an encoder stack)."""
+    raw = dict(node.dims_raw or {})
+    for key in ("is_causal", "is_chunked"):
+        if key not in raw and node.frame and node.frame.get(key) is not None:
+            raw[key] = value_of(node.frame.get(key))
+    return {k: raw[k] for k in ("is_causal", "is_chunked") if k in raw}
+
+
 def _mask(node: Any) -> Tuple[int, int]:
     """The node's `(is_causal, is_chunked)`, defaults filled as the cost
     reads them (`ops_base.mask_flags`)."""
-    raw = node.dims_raw or {}
-    return tuple(int(str(v).strip()) for v in mask_flags(
-        {k: raw[k] for k in ("is_causal", "is_chunked") if k in raw}))
+    return tuple(int(str(v).strip()) for v in mask_flags(_stated(node)))
 
 
 def run_attention_mask_check(resolved: Any) -> List[Finding]:
@@ -62,7 +72,7 @@ def run_attention_mask_check(resolved: Any) -> List[Finding]:
             continue
         mask = _mask(node)
         where = node.display_path or node.name
-        if node.uid in encoders and "is_causal" not in (node.dims_raw or {}):
+        if node.uid in encoders and "is_causal" not in _stated(node):
             add("encoder_mask_undeclared", node,
                 f"{where} (`op: {node.op}`) prices an attention matrix inside "
                 f"an encoder stack and does not state its mask. Encoder "

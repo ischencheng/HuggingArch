@@ -1,0 +1,53 @@
+# MiniMax-H3 transformer block (diffusers `MiniMaxH3TransformerBlock`):
+# pre-norm attention and SwiGLU FFN, each modulated by AdaLN parameters
+# picked per ROW of the packed sequence.
+#
+#   shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(temb)
+#   x = x + gate_msa[idx] * attn(norm1(x) * (1 + scale_msa[idx]) + shift_msa[idx])
+#   x = x + gate_mlp[idx] * ff(norm2(x) * (1 + scale_mlp[idx]) + shift_mlp[idx])
+#
+# `adaln_proj` (`MiniMaxH3AdaLayerNormModulation`) projects the step's
+# timestep embedding — one row per noise level, not per token — to
+# 6 · n_modalities · d_model, viewed as one table row of 6 · d_model per
+# (noise level, modality); `idx = timestep_indices · 3 + token_tags` picks
+# each row's. It holds 40% of the block's weights and runs on n_noise_levels
+# rows. The six chunks are picked in one gather (diffusers selects each of
+# the six; the same bytes) and sliced.
+#
+# Formals: the packed stream `x`, the timestep embedding `temb`
+# [B, n_noise_levels, d_temb], and the per-row AdaLN table ids.
+role: block
+inputs: [x, temb, adaln_indices]
+description: "MiniMax-H3 DiT block: AdaLN (per-row modulation from a (noise level, modality) table) around full joint attention and a SwiGLU FFN."
+graph:
+  adaln_proj.silu:   { op: silu, in: temb, dim: d_temb }
+  adaln_proj.linear:
+    op: linear
+    in: adaln_proj.silu
+    dims: { in: d_temb, out: "6 * n_modalities * d_model", bias: "1" }
+    weight_axes: [{ replicated: true }, { replicated: true }]
+  # `temb.view(-1, 6 * hidden_size)`: each noise level's row is n_modalities
+  # table rows.
+  adaln_proj.table:  { op: view_rows, in: adaln_proj.linear, dims: { in: "6 * n_modalities * d_model", rows: n_modalities, out: "6 * d_model" } }
+  adaln_rows:        { op: row_gather, in: [adaln_proj.table, adaln_indices], dims: { dim: "6 * d_model" } }
+  shift_msa:         { op: slice, in: adaln_rows, dims: { in: "6 * d_model", out: d_model } }
+  scale_msa:         { op: slice, in: adaln_rows, dims: { in: "6 * d_model", out: d_model, start: d_model } }
+  gate_msa:          { op: slice, in: adaln_rows, dims: { in: "6 * d_model", out: d_model, start: "2 * d_model" } }
+  shift_mlp:         { op: slice, in: adaln_rows, dims: { in: "6 * d_model", out: d_model, start: "3 * d_model" } }
+  scale_mlp:         { op: slice, in: adaln_rows, dims: { in: "6 * d_model", out: d_model, start: "4 * d_model" } }
+  gate_mlp:          { op: slice, in: adaln_rows, dims: { in: "6 * d_model", out: d_model, start: "5 * d_model" } }
+  norm1:             { op: rmsnorm, in: x, dim: d_model, weight_axes: [{ replicated: true }] }
+  scale1:            { op: add_const, in: scale_msa, dim: d_model }
+  modulated1:        { op: mul, in: [norm1, scale1], dim: d_model }
+  shifted1:          { op: add, in: [modulated1, shift_msa], dim: d_model }
+  attn:              { op: minimax_h3_attention, in: shifted1 }
+  gated1:            { op: mul, in: [gate_msa, attn], dim: d_model }
+  attn_residual:     { op: add, in: [x, gated1], dim: d_model }
+  norm2:             { op: rmsnorm, in: attn_residual, dim: d_model, weight_axes: [{ replicated: true }] }
+  scale2:            { op: add_const, in: scale_mlp, dim: d_model }
+  modulated2:        { op: mul, in: [norm2, scale2], dim: d_model }
+  shifted2:          { op: add, in: [modulated2, shift_mlp], dim: d_model }
+  ff:                { op: diffusers_swiglu_ff, in: shifted2, dims: { Fb: "0" } }
+  gated2:            { op: mul, in: [gate_mlp, ff], dim: d_model }
+  out:               { op: add, in: [attn_residual, gated2], dim: d_model }
+outputs: [out]

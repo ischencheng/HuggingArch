@@ -1,0 +1,15 @@
+# MiniMax-H3 token-refiner block (diffusers `MiniMaxH3TokenRefinerBlock`):
+# a plain pre-norm transformer block over the projected text rows — no AdaLN
+# and no rotary embedding — with the transformer's attention and FFN shapes.
+#
+#   x = x + attn(norm1(x)); x = x + ff(norm2(x))
+role: block
+description: "MiniMax-H3 token-refiner block: pre-norm full attention (no RoPE) and SwiGLU FFN over the text rows."
+graph:
+  norm1:         { op: rmsnorm, in: x, dim: d_model, weight_axes: [{ replicated: true }] }
+  attn:          { op: minimax_h3_attention, in: norm1, params: { rope: identity_rope } }
+  attn_residual: { op: add, in: [x, attn], dim: d_model }
+  norm2:         { op: rmsnorm, in: attn_residual, dim: d_model, weight_axes: [{ replicated: true }] }
+  ff:            { op: diffusers_swiglu_ff, in: norm2, dims: { Fb: "0" } }
+  out:           { op: add, in: [attn_residual, ff], dim: d_model }
+outputs: [out]

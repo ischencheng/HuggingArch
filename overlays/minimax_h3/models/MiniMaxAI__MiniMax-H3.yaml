@@ -1,0 +1,404 @@
+# MiniMax-H3, text to video and audio (T2VA), at revision 42ed227. A diffusers
+# pipeline (`model_index.json`): HuggingArch reads its components as one model
+# (`hf/pipeline.py`), every tensor named under its component's folder.
+#
+#   prompt ids ─ text_encoder: Qwen3-VL text model, the first 50 of its 64
+#                layers, then the transformer's `context_embedder` and
+#                `token_refiner` on the text rows
+#   latents ──── latent_embed: the transformer's `proj_in` (24-channel 1×2×2
+#                video patches) and `audio_proj_in` (32-channel audio frames)
+#   backbone ─── the transformer: text, video and audio rows packed into one
+#                sequence, 50 blocks of full joint attention with AdaLN
+#                modulation picked per row, `norm_out`, the two output heads.
+#                One forward is one denoise step; the scheduler runs it once
+#                per step (`denoise_steps`).
+#   final latents ─ video_decoder: the ViT decoder on overlapping 7×16×16
+#                   latent tiles; audio_decoder: BigVGAN, once per channel.
+#
+# The language model's step is the transformer's forward: `s_ctx` is the
+# packed sequence, every text, video and audio row of one request, and the
+# two per-row ids it reads are its `kind: tokens` inputs. The encoders and
+# decoders run in their own phase over the request's prompt and latents.
+#
+# Not run here, and declared in `checkpoint_unread` with the reason: text
+# layers 50-63, the final norm and the LM head (never run by any workflow),
+# the vision tower and both autoencoders' encoders (run only to encode image,
+# video or audio references), and the Ref2VA transformer.
+match:
+  model_id: [MiniMaxAI/MiniMax-H3]
+
+components:
+  block: minimax_h3_dit_block
+  attention: minimax_h3_attention
+  ffn_dense: diffusers_swiglu_ff
+  norm: rmsnorm
+
+dims:
+  # --- transformer (diffusers MiniMaxH3Transformer3DModel) ---
+  d_model: config.transformer.hidden_size
+  n_heads: config.transformer.num_attention_heads
+  d_head: config.transformer.attention_head_dim
+  d_ffn: config.transformer.ffn_dim
+  n_layers: config.transformer.num_layers
+  n_refiner_layers: config.transformer.num_refiner_layers
+  # `MiniMaxH3RotaryPosEmbed`: rope_freq_dim angles per axis, three axes,
+  # concatenated with themselves for rotate_half: 2 · 3 · 16 = 96 channels.
+  n_rope_freq: config.transformer.rope_freq_dim
+  d_rope: 6 * n_rope_freq
+  d_nope: d_head - d_rope
+  d_temb: config.transformer.time_embed_dim
+  d_temb_hidden: config.transformer.time_embed_hidden_dim
+  d_freq: config.transformer.freq_dim
+  d_text_cond: config.transformer.text_dim
+  n_latent_channels: config.transformer.in_channels
+  n_audio_channels: config.transformer.audio_in_channels
+  s_dit_patch_t: config.transformer.patch_size.0
+  s_dit_patch: config.transformer.patch_size.1
+  # transformer_minimax_h3.py:36 `MINIMAX_H3_MODALITY_NUM = 3` (video, text,
+  # audio); T2VA steps two schedules, video and audio, and the text rows take
+  # the video's level (modular_pipelines/minimax_h3/before_denoise.py
+  # `build_row_timesteps`), so a step's sequence holds two noise levels.
+  n_modalities: "3"
+  n_noise_levels: "2"
+  # Steps per request: the base checkpoint's default (vLLM-Omni
+  # minimax_h3/time_request.py:41 `num_steps: int = 50`); the request sets it.
+  n_denoise_steps: "50"
+  # The tokenizer's vocabulary: the pipeline's tokens enter the text encoder.
+  n_vocab: config.text_encoder.text_config.vocab_size
+  # --- text encoder (transformers Qwen3VLForConditionalGeneration) ---
+  d_te_model: config.text_encoder.text_config.hidden_size
+  n_te_heads: config.text_encoder.text_config.num_attention_heads
+  n_te_kv_heads: config.text_encoder.text_config.num_key_value_heads
+  d_te_ffn: config.text_encoder.text_config.intermediate_size
+  n_te_layers: config.text_encoder.text_config.num_hidden_layers
+  # modular_pipelines/minimax_h3/encoders.py:35,99
+  # `outputs.hidden_states[text_encoder_layer]`, text_encoder_layer = 50: the
+  # hidden state after decoder layer 49, before any norm.
+  n_te_used: "50"
+  # --- video autoencoder decoder (diffusers AutoencoderKLMiniMaxH3) ---
+  d_vae_head: config.vae.decoder_attention_head_dim
+  n_vae_heads: config.vae.decoder_num_attention_heads
+  d_vae: n_vae_heads * d_vae_head
+  n_vae_ffn_mult: config.vae.decoder_ffn_mult
+  d_vae_ffn: n_vae_ffn_mult * d_vae
+  n_vae_layers: config.vae.decoder_num_layers
+  n_vae_registers: config.vae.decoder_num_register_tokens
+  r_vae_rope: config.vae.decoder_rope_dim_ratio
+  # `int(attention_head_dim * rope_dim_ratio)` (MiniMaxH3VideoViTDecoder3d).
+  d_vae_rope: floor(r_vae_rope * d_vae_head)
+  d_vae_nope: d_vae_head - d_vae_rope
+  # autoencoder_kl_minimax_h3.py `MiniMaxH3VideoViTDecoder3d(patch_size=16,
+  # patch_size_t=4)`: one token expands to 3 · 4 · 16 · 16 pixel values.
+  n_vae_spatial: "16"
+  n_vae_temporal: "4"
+  n_vae_out_channels: config.vae.out_channels
+  d_vae_pixels: n_vae_out_channels * n_vae_temporal * n_vae_spatial * n_vae_spatial
+  # Tiled decoding as the pipeline ships it (`use_tiling = True`): 256-pixel
+  # tiles, at least 64 pixels of overlap; `clip_length` 17 frames per encoded
+  # chunk, so ceil(17 / 4) = 5 latent frames per chunk plus the
+  # (-token_drop) mod 5 = 2 the next chunk overlaps it by.
+  s_vae_tile: 256 / n_vae_spatial
+  s_vae_overlap: 64 / n_vae_spatial
+  n_vae_clip_length: config.vae.clip_length
+  n_vae_tokens_chunk: ceiling(n_vae_clip_length / n_vae_temporal)
+  n_vae_token_drop: config.vae.token_drop
+  s_vae_chunk: n_vae_tokens_chunk + Mod(-n_vae_token_drop, n_vae_tokens_chunk)
+  # --- audio autoencoder decoder (diffusers AutoencoderKLMiniMaxH3Audio) ---
+  d_audio_dec: config.audio_vae.decoder_dim
+  d_audio_latent: config.audio_vae.latent_dim
+  # BigVGAN `Activation1d(ratio=2, kernel_size=12)`: 12-tap resampling filters.
+  n_aa_taps: "12"
+  s_up_0: config.audio_vae.decoder_rates.0
+  s_up_1: config.audio_vae.decoder_rates.1
+  s_up_2: config.audio_vae.decoder_rates.2
+  s_up_3: config.audio_vae.decoder_rates.3
+  s_up_4: config.audio_vae.decoder_rates.4
+  s_up_5: config.audio_vae.decoder_rates.5
+  s_up_6: config.audio_vae.decoder_rates.6
+  k_up_0: config.audio_vae.decoder_kernel_sizes.0
+  k_up_1: config.audio_vae.decoder_kernel_sizes.1
+  k_up_2: config.audio_vae.decoder_kernel_sizes.2
+  k_up_3: config.audio_vae.decoder_kernel_sizes.3
+  k_up_4: config.audio_vae.decoder_kernel_sizes.4
+  k_up_5: config.audio_vae.decoder_kernel_sizes.5
+  k_up_6: config.audio_vae.decoder_kernel_sizes.6
+  k_res_0: config.audio_vae.resblock_kernel_sizes.0
+  k_res_1: config.audio_vae.resblock_kernel_sizes.1
+  k_res_2: config.audio_vae.resblock_kernel_sizes.2
+
+model_inputs:
+  # The prompt, tokenized by the pipeline's presentation phase.
+  prompt_ids: { kind: text, axes: [n_prompt, s_prompt] }
+  # The latents the denoise loop starts from and the decoders read at its
+  # end: [24, 5n+2, H/16, W/16] for 17n+5 frames of H×W video, and stereo
+  # audio at 40 latent frames per second, one item per channel
+  # (modular_blocks_minimax_h3.py: `(1, 24, num_latent_frames, latent_height,
+  # latent_width)`, `(2, 32, num_audio_latents)`).
+  video_latents: { kind: video, axes: [n_vlat, vlat_t, vlat_h, vlat_w] }
+  audio_latents: { kind: audio, axes: [n_alat, alat_t], width: n_audio_channels }
+  # What the decoders read: the same latents once the last step has updated
+  # them. A tensor of its own, because the denoise loop that turns one into
+  # the other is the scheduler's (`x ← x + (σ' − σ) · v`), outside every
+  # forward; a request gives both the same sizes.
+  denoised_video: { kind: video, axes: [n_vden, vden_t, vden_h, vden_w] }
+  denoised_audio: { kind: audio, axes: [n_aden, aden_t], width: n_audio_channels }
+  # Per packed row: its AdaLN table row, `timestep_indices · 3 + token_tags`
+  # (transformer_minimax_h3.py:637), and its noise level (`norm_out`).
+  adaln_indices: { kind: tokens }
+  timestep_indices: { kind: tokens }
+
+checkpoint: { root: transformer }
+
+model:
+  # ===================== text encoder: once per request =====================
+  - name: text_encoder
+    group: true
+    aux_kind: text
+    checkpoint: { root: text_encoder.model, prefix: text_encoder.model.language_model.layers, index: local }
+    layers:
+      - { name: language_model.embed_tokens, op: embedding, inputs: [prompt_ids], boundary_role: input_embedding,
+          dims: { n_vocab: n_vocab, d_model: d_te_model },
+          weight_axes: [{ world: attention, parts: n_vocab, fit: pad }, { replicated: true }] }
+      # Qwen3-VL text decoder layers, causal over the prompt. Qwen3-VL
+      # rotates by M-RoPE (`mrope_section` [24, 20, 20]); a text-only prompt's
+      # three position streams are one and the same positions, so the
+      # rotation is the 1-D RoPE (`rope`, the attention's default).
+      - name: language_model.layers
+        repeat: n_te_used
+        inputs: [language_model.embed_tokens]
+        streams: { hidden: { carries: true } }
+        per_layer:
+          assign:
+            - { type: text, rest: true }
+          map:
+            text: { template: pre_norm,
+                    params: { attn: gqa_qknorm_attention, ffn: swiglu_ffn, norm: rmsnorm },
+                    dims: { d_model: d_te_model, n_heads: n_te_heads, n_kv_heads: n_te_kv_heads, d_ffn: d_te_ffn, is_causal: "1" } }
+      # transformer_minimax_h3.py:615-616: `context_embedder` then
+      # `token_refiner` on the text rows. Both are the transformer's weights
+      # and run inside its forward at every step; they read only the prompt's
+      # states, so they are walked once here, beside the encoder.
+      - { name: context_embedder, op: linear, inputs: [language_model.layers], checkpoint: { path: transformer.context_embedder },
+          dims: { in: d_text_cond, out: d_model, bias: "1" },
+          weight_axes: [{ replicated: true }, { replicated: true }] }
+      - name: token_refiner.refiner_blocks
+        repeat: n_refiner_layers
+        template: minimax_h3_refiner_block
+        inputs: [context_embedder]
+        checkpoint: { prefix: transformer.token_refiner.refiner_blocks, index: local }
+        streams: { hidden: { carries: true } }
+      - { name: token_refiner.final_norm, op: rmsnorm, dim: d_model, inputs: [token_refiner.refiner_blocks],
+          checkpoint: { path: transformer.token_refiner.final_norm }, weight_axes: [{ replicated: true }] }
+
+  # ===================== latent rows: the transformer's input projections =====================
+  - name: latent_embed
+    group: true
+    aux_kind: latent
+    layers:
+      # The pipeline packs each latent frame into (H/2)·(W/2) rows of a
+      # 1×2×2 patch's 24·4 = 96 values (before_denoise.py packing); the
+      # whole video is one segment of the transformer's sequence.
+      - { name: video_patchify, op: patchify, inputs: [video_latents],
+          dims: { patch: s_dit_patch, temporal: s_dit_patch_t, channels: n_latent_channels, align: s_dit_patch },
+          segment: item,
+          source_anchor: "transformer_minimax_h3.py:520 video_patch_dim = in_channels * prod(patch_size); modular_pipelines/minimax_h3/before_denoise.py packs (t, h/2, w/2) rows" }
+      # `self.proj_in(hidden_states)` (transformer_minimax_h3.py:613), the
+      # rows of every step; a float32 module (`_keep_in_fp32_modules`).
+      - { name: proj_in, op: linear, inputs: [video_patchify], checkpoint: { path: transformer.proj_in },
+          dims: { in: "n_latent_channels * s_dit_patch_t * s_dit_patch * s_dit_patch", out: d_model, bias: "1" },
+          weight_axes: [{ replicated: true }, { replicated: true }] }
+      - { name: audio_proj_in, op: linear, inputs: [audio_latents], checkpoint: { path: transformer.audio_proj_in },
+          dims: { in: n_audio_channels, out: d_model, bias: "1" },
+          weight_axes: [{ replicated: true }, { replicated: true }] }
+
+  # ===================== the transformer: one forward per denoise step =====================
+  # `hidden_states = text_embeds.new_zeros(...)` then `index_copy` of the
+  # text, video and audio rows (transformer_minimax_h3.py:618-621): the rows
+  # of the three modalities fill the packed sequence, no padding.
+  - { name: packed, op: zeros, dim: d_model }
+  - name: pack
+    op: scatter_rows_replace
+    inputs: [packed, token_refiner.final_norm, proj_in, audio_proj_in]
+    dim: d_model
+    prompt_slots:
+      token_refiner.final_norm: { domain: prompt_ids, defines: true, source_anchor: "transformer_minimax_h3.py:619 index_copy(1, text_indices, text_embeds)" }
+      proj_in: { domain: video_latents, defines: true, source_anchor: "transformer_minimax_h3.py:620 index_copy(1, video_indices, video_embeds)" }
+      audio_proj_in: { domain: audio_latents, defines: true, source_anchor: "transformer_minimax_h3.py:621 index_copy(1, audio_indices, audio_embeds)" }
+  # `temb = self.time_embedder(self.time_proj(timestep))`: one embedding per
+  # distinct noise level, shared by every AdaLN projection; float32 modules.
+  - { name: time_proj, op: sinusoidal_embedding, dims: { rows: n_noise_levels, dim: d_freq } }
+  - { name: time_embedder.linear_1, op: linear, inputs: [time_proj], dims: { in: d_freq, out: d_temb_hidden, bias: "1" },
+      weight_axes: [{ replicated: true }, { replicated: true }] }
+  - { name: time_embedder.act, op: silu, inputs: [time_embedder.linear_1], dim: d_temb_hidden }
+  - { name: time_embedder.linear_2, op: linear, inputs: [time_embedder.act], dims: { in: d_temb_hidden, out: d_temb, bias: "1" },
+      weight_axes: [{ replicated: true }, { replicated: true }] }
+  - name: transformer_blocks
+    repeat: n_layers
+    template: block
+    inputs: [pack, time_embedder.linear_2, adaln_indices]
+    streams: { hidden: { carries: true } }
+  # `MiniMaxH3AdaLayerNormOut`: shift / scale per noise level, picked by each
+  # row's `timestep_indices`.
+  - { name: norm_out.silu, op: silu, inputs: [time_embedder.linear_2], dim: d_temb }
+  - { name: norm_out.linear, op: linear, inputs: [norm_out.silu], dims: { in: d_temb, out: "2 * d_model", bias: "1" },
+      weight_axes: [{ replicated: true }, { replicated: true }] }
+  - { name: norm_out.rows, op: row_gather, inputs: [norm_out.linear, timestep_indices], dims: { dim: "2 * d_model" } }
+  - { name: norm_out.shift, op: slice, inputs: [norm_out.rows], dims: { in: "2 * d_model", out: d_model } }
+  - { name: norm_out.scale, op: slice, inputs: [norm_out.rows], dims: { in: "2 * d_model", out: d_model, start: d_model } }
+  - { name: norm_out.norm, op: rmsnorm, dim: d_model, inputs: [transformer_blocks], weight_axes: [{ replicated: true }] }
+  - { name: norm_out.scale1, op: add_const, inputs: [norm_out.scale], dim: d_model }
+  - { name: norm_out.modulated, op: mul, inputs: [norm_out.norm, norm_out.scale1], dim: d_model }
+  - { name: norm_out.shifted, op: add, inputs: [norm_out.modulated, norm_out.shift], dim: d_model }
+  # Both heads run over every row; the video and audio rows are selected
+  # after (transformer_minimax_h3.py:657-659). Float32.
+  - { name: proj_out, op: linear, inputs: [norm_out.shifted],
+      dims: { in: d_model, out: "n_latent_channels * s_dit_patch_t * s_dit_patch * s_dit_patch", bias: "1" },
+      weight_axes: [{ replicated: true }, { replicated: true }] }
+  - { name: audio_proj_out, op: linear, inputs: [norm_out.shifted], dims: { in: d_model, out: n_audio_channels, bias: "1" },
+      weight_axes: [{ replicated: true }, { replicated: true }] }
+
+  # ===================== video decoder: once, on the final latents =====================
+  - name: video_decoder
+    group: true
+    aux_kind: decoder
+    checkpoint: { root: vae, prefix: vae.decoder.transformer_blocks, index: local }
+    layers:
+      # `_decode`: chunks of s_vae_chunk latent frames advancing by
+      # n_vae_tokens_chunk, ceil((T + token_drop) / 5) - 1 of them; each
+      # chunk in s_vae_tile-square tiles overlapping by at least
+      # s_vae_overlap (`_split_tiles`): every tile decoded whole.
+      - name: tiles
+        op: tile_video
+        inputs: [denoised_video]
+        dims:
+          tiles: "B * n_vden * (ceiling((vden_t + n_vae_token_drop) / n_vae_tokens_chunk) - 1) * Max(1, ceiling((vden_h - s_vae_overlap) / (s_vae_tile - s_vae_overlap))) * Max(1, ceiling((vden_w - s_vae_overlap) / (s_vae_tile - s_vae_overlap)))"
+          rows: "s_vae_chunk * s_vae_tile * s_vae_tile"
+          channels: n_latent_channels
+          align: s_dit_patch
+        segment: item
+        source_anchor: "autoencoder_kl_minimax_h3.py:645-666 _split_tiles, :735-763 _decode_clip per tile, :793-843 _decode chunks"
+      # A Conv3d with a 1×1×1 kernel: a per-voxel linear (the checkpoint
+      # keeps the conv's [24, 24, 1, 1, 1]); run on every tile.
+      - { name: post_quant_conv, op: linear, inputs: [tiles], dims: { in: n_latent_channels, out: n_latent_channels, bias: "1" },
+          weight_axes: [{ replicated: true }, { replicated: true }] }
+      - { name: decoder.proj_in, op: linear, inputs: [post_quant_conv], dims: { in: n_latent_channels, out: d_vae, bias: "1" },
+          weight_axes: [{ replicated: true }, { replicated: true }] }
+      - { name: decoder.register_tokens, op: parameter_tensor, shape: ["1", n_vae_registers, d_vae],
+          weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+      - { name: decoder.zero_token, op: zero_rows, dims: { rows: "1", dim: d_vae } }
+      - { name: decoder.tokens, op: append_tokens, inputs: [decoder.proj_in, decoder.register_tokens, decoder.zero_token],
+          dims: { dim: d_vae } }
+      - name: decoder.transformer_blocks
+        repeat: n_vae_layers
+        inputs: [decoder.tokens]
+        streams: { hidden: { carries: true } }
+        per_layer:
+          assign:
+            - { type: vit, rest: true }
+          map:
+            vit: { template: minimax_h3_vae_block,
+                   dims: { d_model: d_vae, n_heads: n_vae_heads, d_head: d_vae_head, d_ffn: d_vae_ffn, d_rope: d_vae_rope, d_nope: d_vae_nope } }
+      - { name: decoder.norm_out, op: layernorm, dim: d_vae, inputs: [decoder.transformer_blocks], weight_axes: [{ replicated: true }] }
+      - { name: decoder.proj_out, op: linear, inputs: [decoder.norm_out], dims: { in: d_vae, out: d_vae_pixels, bias: "1" },
+          weight_axes: [{ replicated: true }, { replicated: true }] }
+      # `hidden_states[:, :num_patches]`: the registers and the zero token
+      # are dropped before the pixels.
+      - { name: decoder.patches, op: slice, axis: 1, inputs: [decoder.proj_out],
+          dims: { in: "s_vae_chunk * s_vae_tile * s_vae_tile + n_vae_registers + 1", out: "s_vae_chunk * s_vae_tile * s_vae_tile" } }
+      # Unpatchify each tile and cross-fade the overlaps into 17n+5 frames
+      # (vLLM-Omni time_request.py `_frame_count_from_video_latent_t`).
+      - name: frames
+        op: untile_video
+        inputs: [decoder.patches]
+        dims:
+          items: "B * n_vden"
+          rows: "(17 * (vden_t - 2) / 5 + 5) * n_vae_spatial * vden_h * n_vae_spatial * vden_w"
+          channels: n_vae_out_channels
+
+
+  # ===================== audio decoder: once per channel, on the final latents =====================
+  - name: audio_decoder
+    group: true
+    aux_kind: decoder
+    checkpoint: { root: audio_vae.decoder }
+    layers:
+      # `self.decoder(self.dec_in_proj(latents))`: a kernel-1 Conv1d lift to
+      # latent_dim, then BigVGAN. Feature-last [B, S, C], as conv1d is
+      # written; float32 throughout.
+      - { name: dec_in_proj, op: conv1d, inputs: [denoised_audio], checkpoint: { path: audio_vae.dec_in_proj },
+          dims: { C_in: n_audio_channels, C_out: d_audio_latent, groups: "1", kernel_size: "1", dilation: "1", bias: "1" },
+          weight_axes: [{ replicated: true }, { replicated: true }, { replicated: true }] }
+      - { name: decoder, template: minimax_h3_bigvgan_decoder, inputs: [dec_in_proj] }
+      # `torch.clamp(hidden_states, min=-1.0, max=1.0)`.
+      - { name: waveform, op: clamp, inputs: [decoder], dims: { dim: "1", clamp_limit: "1" } }
+
+# One transformer forward per denoise step. Between forwards the schedulers
+# apply the two velocity heads to the latents (diffusers
+# modular_pipelines/minimax_h3/denoise.py `MiniMaxH3LoopSchedulerStep`); the
+# decoders read the latents the last step leaves.
+denoise_loop:
+  steps: n_denoise_steps
+  latents:
+    - { start: video_latents, update: proj_out, end: denoised_video }
+    - { start: audio_latents, update: audio_proj_out, end: denoised_audio }
+  source_anchor: "diffusers modular_pipelines/minimax_h3/denoise.py:111-133 MiniMaxH3LoopDenoiser, :221-237 MiniMaxH3LoopSchedulerStep"
+
+# A mixed-precision checkpoint, no quantisation: the transformer's blocks,
+# refiner and AdaLN projections and the text encoder are BF16; the
+# transformer's patch projections, timestep MLP and output heads
+# (`_keep_in_fp32_modules`) and both autoencoders are F32.
+quant_context:
+  default_dtype: BF16
+  overrides:
+    - tensors_re: '^transformer\.(?:proj_in|audio_proj_in|time_embedder\.linear_[12]|proj_out|audio_proj_out)\.'
+      dtype: F32
+    - tensors_re: '^(?:vae|audio_vae)\.'
+      dtype: F32
+
+# What the checkpoint stores that text-to-video-and-audio never runs.
+checkpoint_unread:
+  - module: text_encoder.model.language_model.layers
+    layers: 50-63
+    kind: load_skipped
+    reason: "the transformer conditions on the hidden state after layer 49; the later layers never run, and vLLM-Omni drops them at load"
+    source_anchor: "diffusers modular_pipelines/minimax_h3/encoders.py:99 hidden_states[text_encoder_layer]; vLLM-Omni minimax_h3/encoder.py:1157"
+  - module: text_encoder.model.language_model.norm
+    kind: load_skipped
+    reason: "the conditioning is the un-normalized hidden state; the final norm never runs"
+    source_anchor: "vLLM-Omni minimax_h3/encoder.py:1148"
+  - module: text_encoder.lm_head
+    kind: load_skipped
+    reason: "no workflow reads logits"
+    source_anchor: "diffusers modular_pipelines/minimax_h3/encoders.py:82-91; vLLM-Omni minimax_h3/encoder.py:1148"
+  - module: text_encoder.model.visual
+    kind: other_workflow
+    reason: "the vision tower encodes image and video references (I2VA, FL2VA, Ref2VA); a text-only prompt passes none"
+    source_anchor: "diffusers modular_pipelines/minimax_h3/encoders.py:76 vision_inputs, :272-276"
+  - module: vae.encoder
+    kind: other_workflow
+    reason: "the video encoder encodes keyframes and references; T2VA starts from noise"
+    source_anchor: "diffusers modular_pipelines/minimax_h3/encoders.py:102-133 encode_vae_condition; vLLM-Omni minimax_h3/vae.py:200-201"
+  - module: vae.quant_conv
+    kind: other_workflow
+    reason: "the encoder's output projection, run only with it"
+    source_anchor: "diffusers autoencoders/autoencoder_kl_minimax_h3.py:710-733 _encode_clip"
+  - module: audio_vae.encoder
+    kind: other_workflow
+    reason: "the audio encoder encodes reference soundtracks (Ref2VA)"
+    source_anchor: "vLLM-Omni minimax_h3/vae.py:235-237"
+  - module: audio_vae.pre_block
+    kind: other_workflow
+    reason: "the encoder's attention projection, run only with it"
+    source_anchor: "diffusers autoencoders/autoencoder_kl_minimax_h3_audio.py:609-611 encode"
+  - module: audio_vae.mean_proj
+    kind: other_workflow
+    reason: "the posterior mean head of the encoder, run only with it"
+    source_anchor: "diffusers autoencoders/autoencoder_kl_minimax_h3_audio.py:611 encode"
+  - module: audio_vae.logs_proj
+    kind: load_skipped
+    reason: "MiniMax-H3 takes the posterior mean; the log-variance head never runs, and vLLM-Omni drops it"
+    source_anchor: "diffusers autoencoders/autoencoder_kl_minimax_h3_audio.py:587-588; vLLM-Omni minimax_h3/vae.py:235"
+  - module: transformer_ref
+    kind: other_workflow
+    reason: "Ref2VA's transformer; T2VA and FL2VA run `transformer`"
+    source_anchor: "diffusers modular_pipelines/minimax_h3/denoise.py:38-48"

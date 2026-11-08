@@ -20,7 +20,7 @@ from backend.arch.spec_parsing import _parse_block_graph
 class TestTheRegistry(unittest.TestCase):
     def test_the_corpus_families_are_registered_with_kinds(self):
         self.assertEqual(set(families.all_families()),
-                         {"MHA", "GQA", "MLA", "SWA", "ViT", "GLA-Linear", "GatedDeltaNet", "Mamba2"})
+                         {"MHA", "GQA", "MLA", "SWA", "ViT", "DiT", "GLA-Linear", "GatedDeltaNet", "Mamba2"})
         self.assertEqual(families.of_kind("windowed"), {"SWA"})
         self.assertEqual(families.of_kind("recurrent"), {"GLA-Linear", "GatedDeltaNet", "Mamba2"})
 

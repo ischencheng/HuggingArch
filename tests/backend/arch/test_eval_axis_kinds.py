@@ -149,6 +149,11 @@ class TestEngineSuppliedIsDeclared(unittest.TestCase):
         # bound by the encode phase
         "n_img", "img_h", "img_w", "n_crops", "crop_h", "crop_w", "n_aud",
         "s_audio",
+        # a diffusion pipeline's: its prompt, the latents the denoise loop
+        # starts from, and the latents the decoders read at its end
+        "n_prompt", "s_prompt",
+        "n_vlat", "vlat_t", "vlat_h", "vlat_w", "n_alat", "alat_t",
+        "n_vden", "vden_t", "vden_h", "vden_w", "n_aden", "aden_t",
     })
 
     @staticmethod

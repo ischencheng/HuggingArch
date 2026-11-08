@@ -238,6 +238,14 @@ groups:
     the model reads another config scope (a vision tower's own bound). A
     config that does not publish one leaves it unbound — absent, never a
     default — and a consumer that has to compute the function declines.
+- slug: diffusion_pipeline
+  title: Diffusion pipeline (MiniMax-H3 — text encoder, DiT, video and audio decoders)
+  intro: >-
+    A diffusers pipeline's components around its transformer. The transformer
+    is the backbone: one forward per denoise step over a packed sequence of
+    every modality's rows, its AdaLN modulation picked per row from a table
+    computed off the step's noise levels. The text encoder runs once per
+    request; the autoencoders' decoders once on the final latents.
 - slug: engine_dims
   title: Engine-supplied dims (threaded from the analyze request)
   intro: >-
@@ -269,6 +277,267 @@ groups:
     block.
 
 symbols:
+  n_denoise_steps:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: >-
+      Transformer forwards one request runs: the denoise loop's steps
+      (`num_inference_steps`; 50 for the base checkpoint, 4 for a distilled
+      few-step adapter).
+  n_noise_levels:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: >-
+      Distinct noise levels one denoise step's packed sequence holds (diffusers
+      `MiniMaxH3` `timestep`): the rows of the timestep embedding every AdaLN
+      projection runs on. Text-to-video-and-audio steps two schedules, the
+      video's and the audio's (text rows inherit the video's).
+  n_modalities:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: >-
+      Modality tags a packed row carries (video, text, audio): the AdaLN table
+      holds one modulation row per (noise level, modality).
+  d_temb:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Width of the timestep embedding every AdaLN projection reads (`time_embed_dim`).
+  d_temb_hidden:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Inner width of the timestep MLP (`time_embed_hidden_dim`).
+  d_freq:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Sinusoidal features per noise level (`freq_dim`).
+  n_refiner_layers:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Token-refiner blocks the projected text runs through before it is packed.
+    unit: layers
+  d_text_cond:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Width of the text conditioning the text encoder hands the transformer (`text_dim`).
+  n_latent_channels:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Channels of the video latent (`latent_channels`).
+  n_audio_channels:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Channels of the audio latent (`latent_channels` of the audio autoencoder).
+  s_dit_patch:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Spatial side of the transformer's video patch (`patch_size[1:]`).
+  s_dit_patch_t:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Temporal side of the transformer's video patch (`patch_size[0]`).
+  d_te_model:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Hidden size of the pipeline's text encoder.
+  n_te_heads:
+    kind: head_count
+    shardable_by: [attention]
+    group: diffusion_pipeline
+    meaning: Text-encoder attention heads (query side).
+  n_te_kv_heads:
+    kind: head_count
+    shardable_by: [attention]
+    group: diffusion_pipeline
+    meaning: Text-encoder key/value heads.
+  d_te_ffn:
+    kind: split_width
+    shardable_by: [dense_ffn]
+    group: diffusion_pipeline
+    meaning: Text-encoder FFN intermediate width.
+  n_te_layers:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Decoder layers the text-encoder checkpoint stores.
+    unit: layers
+  n_te_used:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: >-
+      Text-encoder layers the pipeline runs: it conditions on the hidden state
+      after this many decoder layers (diffusers `text_encoder_layer`), so the
+      rest, the final norm and the LM head never run.
+    unit: layers
+  d_vae:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Hidden size of the video autoencoder's ViT decoder.
+  n_vae_heads:
+    kind: head_count
+    shardable_by: [attention]
+    group: diffusion_pipeline
+    meaning: ViT-decoder attention heads.
+  d_vae_head:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: ViT-decoder per-head dim.
+  d_vae_ffn:
+    kind: split_width
+    shardable_by: [dense_ffn]
+    group: diffusion_pipeline
+    meaning: ViT-decoder SwiGLU inner width (`decoder_ffn_mult · d_vae`).
+  n_vae_layers:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: ViT-decoder blocks (`decoder_num_layers`).
+    unit: layers
+  n_vae_registers:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Learned register tokens the ViT decoder appends to every tile (`decoder_num_register_tokens`).
+  d_vae_rope:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Channels of a ViT-decoder head the 3-D RoPE rotates (`decoder_rope_dim_ratio · d_vae_head`).
+  d_vae_nope:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Channels of a ViT-decoder head the 3-D RoPE passes through.
+  d_vae_pixels:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: >-
+      Pixel values one ViT-decoder token expands into: out channels × temporal
+      × spatial patch (`3 · 4 · 16 · 16`).
+  s_vae_tile:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Side of a decoder tile in latent pixels (diffusers `tile_sample_min_height / spatial_compression_ratio`).
+  s_vae_overlap:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Least overlap of two neighbouring decoder tiles, in latent pixels.
+  s_vae_chunk:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: >-
+      Latent frames one decoder call reads: a temporal chunk and the overlap
+      the encoder's `token_drop` left (`tokens_chunk_size + token_overlap`).
+  n_vae_tokens_chunk:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Latent frames a temporal chunk advances by (`tokens_chunk_size`).
+  n_vae_token_drop:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Trailing latent frames the encoder dropped per chunk (`token_drop`).
+  n_vae_spatial:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Pixels per latent pixel along a side (`spatial_compression_ratio`).
+  n_vae_temporal:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Frames per latent frame (`temporal_compression_ratio`).
+  d_audio_dec:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Channels of the audio decoder's first upsampler (`decoder_dim`); each upsampler halves them.
+  d_audio_latent:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Width `dec_in_proj` lifts the audio latent to before the decoder (`latent_dim`).
+  s_up_0:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Upsampling factor of audio-decoder stage 0's transposed conv (`decoder_rates[0]`).
+  s_up_1:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Upsampling factor of audio-decoder stage 1's transposed conv (`decoder_rates[1]`).
+  s_up_2:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Upsampling factor of audio-decoder stage 2's transposed conv (`decoder_rates[2]`).
+  s_up_3:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Upsampling factor of audio-decoder stage 3's transposed conv (`decoder_rates[3]`).
+  s_up_4:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Upsampling factor of audio-decoder stage 4's transposed conv (`decoder_rates[4]`).
+  s_up_5:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Upsampling factor of audio-decoder stage 5's transposed conv (`decoder_rates[5]`).
+  s_up_6:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Upsampling factor of audio-decoder stage 6's transposed conv (`decoder_rates[6]`).
+  k_up_0:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Kernel of audio-decoder stage 0's transposed conv (`decoder_kernel_sizes[0]`).
+  k_up_1:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Kernel of audio-decoder stage 1's transposed conv (`decoder_kernel_sizes[1]`).
+  k_up_2:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Kernel of audio-decoder stage 2's transposed conv (`decoder_kernel_sizes[2]`).
+  k_up_3:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Kernel of audio-decoder stage 3's transposed conv (`decoder_kernel_sizes[3]`).
+  k_up_4:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Kernel of audio-decoder stage 4's transposed conv (`decoder_kernel_sizes[4]`).
+  k_up_5:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Kernel of audio-decoder stage 5's transposed conv (`decoder_kernel_sizes[5]`).
+  k_up_6:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Kernel of audio-decoder stage 6's transposed conv (`decoder_kernel_sizes[6]`).
+  k_res_0:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Kernel of AMP block 0 of every audio-decoder stage (`resblock_kernel_sizes[0]`).
+  k_res_1:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Kernel of AMP block 1 of every audio-decoder stage (`resblock_kernel_sizes[1]`).
+  k_res_2:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Kernel of AMP block 2 of every audio-decoder stage (`resblock_kernel_sizes[2]`).
+  n_rope_freq:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Rotary frequencies per (t, h, w) axis of the transformer's 3-D RoPE (`rope_freq_dim`).
+  n_vae_ffn_mult:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: ViT-decoder FFN width as a multiple of its hidden size (`decoder_ffn_mult`).
+  r_vae_rope:
+    kind: constant
+    group: diffusion_pipeline
+    meaning: Share of a ViT-decoder head the 3-D RoPE rotates (`decoder_rope_dim_ratio`).
+  n_vae_out_channels:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Pixel channels the video decoder writes (`out_channels`).
+  n_vae_clip_length:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Pixel frames the video encoder reads per chunk (`clip_length`), which sets the decoder's chunking.
+  n_aa_taps:
+    kind: whole
+    group: diffusion_pipeline
+    meaning: Taps of the anti-aliasing FIR filters around each SnakeBeta activation.
   d_model:
     kind: whole
     group: backbone
@@ -990,6 +1259,80 @@ symbols:
     group: media_input
     engine_supplied: true
     meaning: A crop's processed width in pixels.
+  n_prompt:
+    kind: whole
+    group: media_input
+    engine_supplied: true
+    meaning: Prompts per request a pipeline's text encoder reads (one).
+  s_prompt:
+    kind: whole
+    group: media_input
+    engine_supplied: true
+    meaning: A prompt's length in the text encoder's tokens.
+  n_vlat:
+    kind: whole
+    group: media_input
+    engine_supplied: true
+    meaning: Latent videos per request (one generated video).
+  vlat_t:
+    kind: whole
+    group: media_input
+    engine_supplied: true
+    meaning: >-
+      A latent video's frames: 5n + 2 for the 17n + 5 frames MiniMax-H3
+      generates (vLLM-Omni `time_request._video_latent_t`).
+  vlat_h:
+    kind: whole
+    group: media_input
+    engine_supplied: true
+    meaning: A latent video's height in latent pixels (the frame height / 16).
+  vlat_w:
+    kind: whole
+    group: media_input
+    engine_supplied: true
+    meaning: A latent video's width in latent pixels (the frame width / 16).
+  n_alat:
+    kind: whole
+    group: media_input
+    engine_supplied: true
+    meaning: >-
+      Audio latent sequences per request: MiniMax-H3 generates stereo, one per
+      channel, and decodes each as its own item.
+  alat_t:
+    kind: whole
+    group: media_input
+    engine_supplied: true
+    meaning: An audio latent's frames, 40 per second (vLLM-Omni `time_request._audio_latent_t`).
+  n_vden:
+    kind: whole
+    group: media_input
+    engine_supplied: true
+    meaning: Denoised latent videos per request the video decoder reads (one).
+  vden_t:
+    kind: whole
+    group: media_input
+    engine_supplied: true
+    meaning: The denoised latent video's frames (`vlat_t` once the loop ends).
+  vden_h:
+    kind: whole
+    group: media_input
+    engine_supplied: true
+    meaning: The denoised latent video's height in latent pixels.
+  vden_w:
+    kind: whole
+    group: media_input
+    engine_supplied: true
+    meaning: The denoised latent video's width in latent pixels.
+  n_aden:
+    kind: whole
+    group: media_input
+    engine_supplied: true
+    meaning: Denoised audio latent sequences per request the audio decoder reads, one per stereo channel.
+  aden_t:
+    kind: whole
+    group: media_input
+    engine_supplied: true
+    meaning: The denoised audio latent's frames (`alat_t` once the loop ends).
   n_aud:
     kind: whole
     group: media_input

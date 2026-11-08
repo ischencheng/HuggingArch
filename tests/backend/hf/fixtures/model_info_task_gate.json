@@ -1383,6 +1383,164 @@
     }
    ]
   },
+  "Qwen/Qwen2.5-Omni-7B": {
+   "id": "Qwen/Qwen2.5-Omni-7B",
+   "pipeline_tag": "any-to-any",
+   "library_name": "transformers",
+   "transformersInfo": {
+    "auto_model": "AutoModel",
+    "processor": "AutoProcessor"
+   },
+   "config": {
+    "architectures": [
+     "Qwen2_5OmniModel"
+    ],
+    "model_type": "qwen2_5_omni"
+   },
+   "siblings": [
+    {
+     "rfilename": ".gitattributes"
+    },
+    {
+     "rfilename": "LICENSE"
+    },
+    {
+     "rfilename": "README.md"
+    },
+    {
+     "rfilename": "added_tokens.json"
+    },
+    {
+     "rfilename": "chat_template.json"
+    },
+    {
+     "rfilename": "config.json"
+    },
+    {
+     "rfilename": "generation_config.json"
+    },
+    {
+     "rfilename": "merges.txt"
+    },
+    {
+     "rfilename": "model-00001-of-00005.safetensors"
+    },
+    {
+     "rfilename": "model-00002-of-00005.safetensors"
+    },
+    {
+     "rfilename": "model-00003-of-00005.safetensors"
+    },
+    {
+     "rfilename": "model-00004-of-00005.safetensors"
+    },
+    {
+     "rfilename": "model-00005-of-00005.safetensors"
+    },
+    {
+     "rfilename": "model.safetensors.index.json"
+    },
+    {
+     "rfilename": "preprocessor_config.json"
+    },
+    {
+     "rfilename": "special_tokens_map.json"
+    },
+    {
+     "rfilename": "spk_dict.pt"
+    },
+    {
+     "rfilename": "tokenizer.json"
+    },
+    {
+     "rfilename": "tokenizer_config.json"
+    },
+    {
+     "rfilename": "vocab.json"
+    }
+   ]
+  }
+ },
+ "own_forward": {
+  "stepfun-ai/Step-5-Preview": {
+   "id": "stepfun-ai/Step-5-Preview",
+   "config": {
+    "architectures": [
+     "Step5ForConditionalGeneration"
+    ],
+    "model_type": "step5_vl"
+   },
+   "siblings": [
+    {
+     "rfilename": ".gitattributes"
+    },
+    {
+     "rfilename": "LICENSE-CN.txt"
+    },
+    {
+     "rfilename": "LICENSE.txt"
+    },
+    {
+     "rfilename": "README.md"
+    },
+    {
+     "rfilename": "chat_template.jinja"
+    },
+    {
+     "rfilename": "config.json"
+    },
+    {
+     "rfilename": "fp8_vit_sidecar_ready.json"
+    },
+    {
+     "rfilename": "inference/README.md"
+    },
+    {
+     "rfilename": "inference/README.zh.md"
+    },
+    {
+     "rfilename": "inference/convert.py"
+    },
+    {
+     "rfilename": "inference/generate.py"
+    },
+    {
+     "rfilename": "inference/kernel.py"
+    },
+    {
+     "rfilename": "inference/model.py"
+    },
+    {
+     "rfilename": "inference/requirements.txt"
+    },
+    {
+     "rfilename": "inference/test_vision.py"
+    },
+    {
+     "rfilename": "inference/validate_vision.py"
+    },
+    {
+     "rfilename": "inference/vision_encoder.py"
+    },
+    {
+     "rfilename": "model.safetensors.index.json"
+    },
+    {
+     "rfilename": "special_tokens_map.json"
+    },
+    {
+     "rfilename": "tokenizer.json"
+    },
+    {
+     "rfilename": "tokenizer_config.json"
+    },
+    {
+     "rfilename": "vit.safetensors"
+    }
+   ]
+  }
+ },
+ "pipelines": {
   "stabilityai/stable-diffusion-xl-base-1.0": {
    "id": "stabilityai/stable-diffusion-xl-base-1.0",
    "pipeline_tag": "text-to-image",
@@ -1559,162 +1717,6 @@
     },
     {
      "rfilename": "vae_encoder/openvino_model.xml"
-    }
-   ]
-  },
-  "Qwen/Qwen2.5-Omni-7B": {
-   "id": "Qwen/Qwen2.5-Omni-7B",
-   "pipeline_tag": "any-to-any",
-   "library_name": "transformers",
-   "transformersInfo": {
-    "auto_model": "AutoModel",
-    "processor": "AutoProcessor"
-   },
-   "config": {
-    "architectures": [
-     "Qwen2_5OmniModel"
-    ],
-    "model_type": "qwen2_5_omni"
-   },
-   "siblings": [
-    {
-     "rfilename": ".gitattributes"
-    },
-    {
-     "rfilename": "LICENSE"
-    },
-    {
-     "rfilename": "README.md"
-    },
-    {
-     "rfilename": "added_tokens.json"
-    },
-    {
-     "rfilename": "chat_template.json"
-    },
-    {
-     "rfilename": "config.json"
-    },
-    {
-     "rfilename": "generation_config.json"
-    },
-    {
-     "rfilename": "merges.txt"
-    },
-    {
-     "rfilename": "model-00001-of-00005.safetensors"
-    },
-    {
-     "rfilename": "model-00002-of-00005.safetensors"
-    },
-    {
-     "rfilename": "model-00003-of-00005.safetensors"
-    },
-    {
-     "rfilename": "model-00004-of-00005.safetensors"
-    },
-    {
-     "rfilename": "model-00005-of-00005.safetensors"
-    },
-    {
-     "rfilename": "model.safetensors.index.json"
-    },
-    {
-     "rfilename": "preprocessor_config.json"
-    },
-    {
-     "rfilename": "special_tokens_map.json"
-    },
-    {
-     "rfilename": "spk_dict.pt"
-    },
-    {
-     "rfilename": "tokenizer.json"
-    },
-    {
-     "rfilename": "tokenizer_config.json"
-    },
-    {
-     "rfilename": "vocab.json"
-    }
-   ]
-  }
- },
- "own_forward": {
-  "stepfun-ai/Step-5-Preview": {
-   "id": "stepfun-ai/Step-5-Preview",
-   "config": {
-    "architectures": [
-     "Step5ForConditionalGeneration"
-    ],
-    "model_type": "step5_vl"
-   },
-   "siblings": [
-    {
-     "rfilename": ".gitattributes"
-    },
-    {
-     "rfilename": "LICENSE-CN.txt"
-    },
-    {
-     "rfilename": "LICENSE.txt"
-    },
-    {
-     "rfilename": "README.md"
-    },
-    {
-     "rfilename": "chat_template.jinja"
-    },
-    {
-     "rfilename": "config.json"
-    },
-    {
-     "rfilename": "fp8_vit_sidecar_ready.json"
-    },
-    {
-     "rfilename": "inference/README.md"
-    },
-    {
-     "rfilename": "inference/README.zh.md"
-    },
-    {
-     "rfilename": "inference/convert.py"
-    },
-    {
-     "rfilename": "inference/generate.py"
-    },
-    {
-     "rfilename": "inference/kernel.py"
-    },
-    {
-     "rfilename": "inference/model.py"
-    },
-    {
-     "rfilename": "inference/requirements.txt"
-    },
-    {
-     "rfilename": "inference/test_vision.py"
-    },
-    {
-     "rfilename": "inference/validate_vision.py"
-    },
-    {
-     "rfilename": "inference/vision_encoder.py"
-    },
-    {
-     "rfilename": "model.safetensors.index.json"
-    },
-    {
-     "rfilename": "special_tokens_map.json"
-    },
-    {
-     "rfilename": "tokenizer.json"
-    },
-    {
-     "rfilename": "tokenizer_config.json"
-    },
-    {
-     "rfilename": "vit.safetensors"
     }
    ]
   }

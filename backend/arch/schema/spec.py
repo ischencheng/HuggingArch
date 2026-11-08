@@ -20,7 +20,8 @@ from .guards import (_check_quant_suffix_in_arch_spec,
                      _check_weight_dim_geometry)
 from .graph import BlockGraph, resolve_block_input_ports
 from .model import (CheckpointAddress, HISTORY_AXIS, LayerMap, ModelInputSpec,
-                     ModelLayer, StreamLayerRef, StreamSpec)
+                     ModelLayer, StreamLayerRef, StreamSpec,
+                     DenoiseLoop, UnreadCheckpointModule)
 from .quant import _QUANT_METHOD_NONE, QuantContext
 
 
@@ -227,6 +228,16 @@ class ArchSpec(BaseModel):
     validation_exemptions: ValidationExemptions = Field(
         default_factory=ValidationExemptions)
 
+    #: Modules the checkpoint stores and this path never runs
+    #: (`UnreadCheckpointModule`).
+    checkpoint_unread: List[UnreadCheckpointModule] = Field(
+        default_factory=list, exclude_if=lambda v: not v)
+
+    #: The denoise loop that runs the language model's step per request
+    #: (`DenoiseLoop`); None for a model whose step is not one.
+    denoise_loop: Optional[DenoiseLoop] = Field(
+        default=None, exclude_if=lambda v: v is None)
+
     # Quantization context.
     # Optional; absent means the model is treated as unquantized
     # (HF safetensors header dtype is canonical at load time).
@@ -241,6 +252,7 @@ class ArchSpec(BaseModel):
             raise ValueError("Must define either 'blocks' or 'components'")
         if self.checkpoint is not None:
             self.checkpoint.only("root", where="spec")
+        self._check_denoise_loop()
         self._check_view()
         self._check_model_layer_templates()
         self._check_quant_override_scopes()
@@ -571,6 +583,40 @@ class ArchSpec(BaseModel):
                 f"by name (its final value). A stack's layers read it "
                 f"through `reads_from`")
 
+    def _check_denoise_loop(self) -> None:
+        """A denoise loop steps latents the model declares: each starts and
+        ends as a model input of one kind and width, and is updated by a
+        top-level layer of the language model's step; its step count reads
+        the spec's dims."""
+        loop = self.denoise_loop
+        if loop is None:
+            return
+        unknown = sorted(str(sym) for sym in read_law(loop.steps).free_symbols
+                         if str(sym) not in self.dims)
+        if unknown:
+            raise ValueError(
+                f"denoise_loop.steps {loop.steps!r} names {unknown}, which "
+                f"this spec's `dims:` does not bind")
+        top = {layer.name for layer in self.model if not layer.group}
+        for latent in loop.latents:
+            ends = [self.model_inputs.get(latent.start),
+                    self.model_inputs.get(latent.end)]
+            if None in ends:
+                raise ValueError(
+                    f"denoise_loop latent {latent.start!r} -> {latent.end!r}: "
+                    f"both are model inputs (`model_inputs:`)")
+            if (ends[0].kind, ends[0].width) != (ends[1].kind, ends[1].width):
+                raise ValueError(
+                    f"denoise_loop latent {latent.start!r} -> {latent.end!r}: "
+                    f"one latent, so one kind and width; got "
+                    f"{(ends[0].kind, ends[0].width)} and "
+                    f"{(ends[1].kind, ends[1].width)}")
+            if latent.update not in top:
+                raise ValueError(
+                    f"denoise_loop latent {latent.start!r}: `update: "
+                    f"{latent.update!r}` is no top-level layer of the "
+                    f"language model's step")
+
     def _check_model_inputs(self) -> None:
         """Each model input is a tensor some layer reads, under a name no
         layer or stream takes. The token ids are read outside the encoders,
@@ -875,8 +921,12 @@ class ArchSpec(BaseModel):
                 f"defined once, and every other edge onto them declares "
                 f"`defines: false`")
         encoders = self.encoder_groups()
+        # A decoder (a diffusion pipeline's autoencoder decoder) is the
+        # pipeline's sink: it reads the final latents and hands the language
+        # model nothing.
         silent = sorted(layer.name for layer in self.model
                         if layer.name in encoders
+                        and layer.aux_kind != "decoder"
                         and layer.name not in encoders_defining)
         if silent:
             raise ValueError(
@@ -886,10 +936,18 @@ class ArchSpec(BaseModel):
                 f"into the language model's embeddings (HF "
                 f"`masked_scatter`, vLLM `_merge_multimodal_embeddings`: "
                 f"`scatter_rows_replace`)")
+        # What only a decoder reads defines no prompt positions either.
+        decoders = {sub.name for layer in self.model
+                    if layer.group is True and layer.aux_kind == "decoder"
+                    for sub in (layer, *(s for _p, s in _layers_under(layer)))}
+        readers = self.model_input_readers()
         undefined = sorted(
             name for name, entry in self.model_inputs.items()
             if entry.kind != "tokens" and entry.per_item_of is None
-            and name not in defining)
+            and name not in defining
+            and not (readers[name] and all(
+                group is not None and group.name in decoders
+                for _reader, group in readers[name])))
         if undefined:
             raise ValueError(
                 f"media input(s) {undefined} have no defining edge: no edge "

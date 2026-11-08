@@ -10,6 +10,7 @@ import json
 import logging
 import re
 
+from backend.arch.checkpoint_unread import UnreadSplit
 from backend.arch.dtypes import dtype_bytes as dtype_bytes_of
 from backend.arch.eval import capacity as capacity_mod
 from backend.arch.eval.checkpoint import Reconciliation
@@ -20,6 +21,7 @@ from backend.arch.eval.transforms import CallSite
 from backend.custom_id import is_custom_id
 from backend.arch.loader import SpecLoader, overlay_kwargs, get_default_loader
 from backend.hf.metadata import HUB_UNREACHABLE, fetch_config, fetch_metadata
+from backend.arch.snapshots import default_overlay_dir
 from backend.arch.snapshots import load_model_str as _load_snapshot_model_str
 from backend.hf.forward_source import model_info_cache_path
 from backend.hf.task_gate import unsupported_task_refusal
@@ -70,6 +72,10 @@ def analyze_model(model_id: str = "", batch_size: int = 1, seq_len: int = 2048,
     # to the named registered spec instead of falling into score-based
     # model_type matching (which can collide across agent-generated
     # custom specs sharing a model_type).
+    # The overlay the environment names (`HA_SPEC_OVERLAY_DIR`) when the
+    # caller passes none: `validate` resolves it the same way, so a spec the
+    # validator judged from an overlay is the one analysed here.
+    overlay_dir = default_overlay_dir(overlay_dir)
     if overlay_dir:
         loader = SpecLoader(**overlay_kwargs(overlay_dir))
     else:
@@ -463,6 +469,14 @@ def _analyze_from_spec(model_id: str, config: dict, resolved, hf_meta: dict,
     # are intentionally NOT exposed in summary anymore — keeping them
     # would silently mislead consumers and the only honest descriptor at
     # this layer is bytes.
+    # The file's figures are the part the spec's path reads; the modules it
+    # declares unread (`checkpoint_unread:`) are split off, as `validate`
+    # splits them.
+    unread = UnreadSplit.of(hf_meta.get("header"),
+                            resolved.spec.checkpoint_unread)
+    hf_meta = unread.read_part(hf_meta)
+    if unread.parts:
+        summary["checkpoint_unread"] = [part.as_dict() for part in unread.parts]
     hf_total_params = hf_meta.get("total_params", 0)
     if hf_total_params > 0:
         summary["hf_model_storage_bytes"] = hf_meta.get("model_storage_bytes", 0)
