@@ -3,6 +3,8 @@ import ELK from "elkjs/lib/elk.bundled.js";
 import type { ElkExtendedEdge, ElkNode } from "elkjs";
 import { escapeHtml, formatBytes, formatCount, formatGiB, formatSI } from "../format";
 import { tipHandlers } from "../Tip";
+import { placeLabels, type EdgeText, type Rect } from "../dagLabels";
+import { revealSideways } from "../revealSideways";
 
 /** Inspector block-graph node — fields vanilla dag.js `buildDagNodeInner` reads. */
 // `src_port` names one of several outputs of `src` — a distinct edge. `via`
@@ -34,22 +36,6 @@ const EDGE_STYLE: Record<string, { stroke: string; width: number; dash?: string;
   state: { stroke: "#db2777", width: 1.4, dash: "2 3", legend: "state edge" },
 };
 const edgeStyle = (kind?: string) => EDGE_STYLE[kind || "activation"] || EDGE_STYLE.activation;
-
-// Edge labels sit at their edge's longest segment; parallel edges put theirs
-// at the same height. Keep each inside the canvas and step it down a line
-// while it would overlap one already placed (~6.2px per 10px mono char).
-function placeLabels(texts: { key: string; x: number; y: number; text: string }[], width: number) {
-  const placed: { x0: number; x1: number; y: number }[] = [];
-  return texts.map((t) => {
-    const len = t.text.length * 6.2;
-    const anchor = t.x + len / 2 > width - 4 ? "end" : t.x - len / 2 < 4 ? "start" : "middle";
-    const x0 = anchor === "end" ? t.x - len : anchor === "start" ? t.x : t.x - len / 2;
-    let y = t.y;
-    for (let step = 0; step < 6 && placed.some((p) => Math.abs(p.y - y) < 12 && x0 < p.x1 && p.x0 < x0 + len); step++) y += 12;
-    placed.push({ x0, x1: x0 + len, y });
-    return { ...t, y, anchor };
-  });
-}
 
 function edgeLabel(e: BlockEdge, srcNode?: BlockNode): EdgeLabel {
   const kind = e.kind && e.kind !== "activation" ? e.kind : undefined;
@@ -323,6 +309,34 @@ const COMPOUND_OPTS: Record<string, string> = {
   "elk.layered.nodePlacement.strategy": "NETWORK_SIMPLEX",
 };
 
+// A compound's title tab: its name and the Structure / Detailed switch.
+const COMPOUND_TAB_PX = 320;
+// Past this a layout no longer fits the panel it is shown in.
+const WIDE_LAYOUT_PX = 960;
+// The second placement bends straight chains, so it has to earn that.
+const NARROWER_BY = 0.9;
+
+function withPlacement(node: ElkNode, strategy: string): ElkNode {
+  const key = "elk.layered.nodePlacement.strategy";
+  const options = node.layoutOptions as Record<string, string> | undefined;
+  return {
+    ...node,
+    layoutOptions: options && key in options ? { ...options, [key]: strategy } : options,
+    children: node.children?.map((c) => withPlacement(c, strategy)),
+  };
+}
+
+/** NETWORK_SIMPLEX shortens every edge, which keeps a chain straight but lets a
+ *  long run of fan-out / fan-in stages drift sideways stage by stage, leaving
+ *  the top of the graph far from the bottom. A layout that comes out wide is
+ *  laid out again with linear segments, and the narrower one is kept. */
+async function layoutCompact(graph: ElkNode): Promise<ElkNode> {
+  const first = await elk.layout(structuredClone(graph));
+  if ((first.width || 0) <= WIDE_LAYOUT_PX) return first;
+  const second = await elk.layout(structuredClone(withPlacement(graph, "LINEAR_SEGMENTS")));
+  return (second.width || 0) < (first.width || 0) * NARROWER_BY ? second : first;
+}
+
 function hasAbsorbed(n: BlockNode): boolean {
   return (n.absorbed_params || []).length > 0;
 }
@@ -511,6 +525,8 @@ export function BlockElkDag({ nodes, edges, legend = true, fit = false }: {
 
   const [sizes, setSizes] = useState<Map<string, { width: number; height: number }>>(new Map());
   const measureRef = useRef<HTMLDivElement | null>(null);
+  const scrollerRef = useRef<HTMLDivElement | null>(null);
+  const focusRef = useRef<string | null>(null);
 
   // Measure the real collapsed size of every node off-screen (same CSS) so ELK
   // allocates slots that match what actually renders. The static nodeSize
@@ -786,7 +802,7 @@ export function BlockElkDag({ nodes, edges, legend = true, fit = false }: {
     })(graph.children);
 
     setErr("");
-    elk.layout(graph).then((result) => {
+    layoutCompact(graph).then((result) => {
       if (!cancelled) { setLabels(labelOf); setLaid(result); }
     }).catch((e) => {
       if (!cancelled) {
@@ -797,7 +813,19 @@ export function BlockElkDag({ nodes, edges, legend = true, fit = false }: {
     return () => { cancelled = true; };
   }, [edges, expanded, displayNodes, sizes]);
 
+  // Bring what was just opened into view once its layout has landed.
+  useLayoutEffect(() => {
+    const id = focusRef.current;
+    const panel = scrollerRef.current;
+    if (!id || !panel) return;
+    const opened = panel.querySelector<HTMLElement>(`[data-compound="${CSS.escape(id)}"]`);
+    if (!opened) return;
+    focusRef.current = null;
+    revealSideways(opened);
+  }, [laid]);
+
   const toggle = (id: string) => {
+    focusRef.current = expanded.has(id) ? null : id;
     setExpanded((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
@@ -906,7 +934,7 @@ export function BlockElkDag({ nodes, edges, legend = true, fit = false }: {
   // container-relative coords, so translate each by its container's absolute
   // origin into root space for the single overlay SVG.
   const edgePaths: { key: string; d: string; edge: string; kind?: string; tone?: number }[] = [];
-  const edgeTexts: { key: string; x: number; y: number; text: string }[] = [];
+  const edgeTexts: EdgeText[] = [];
   (function walkEdges(node: ElkNode, ox: number, oy: number) {
     for (const e of (node.edges as ElkExtendedEdge[]) || []) {
       const label = labels.get(e.id);
@@ -915,24 +943,33 @@ export function BlockElkDag({ nodes, edges, legend = true, fit = false }: {
         const d = pts.map((p, idx) => `${idx ? "L" : "M"} ${p.x + ox} ${p.y + oy}`).join(" ");
         edgePaths.push({ key: `${e.id}-${i}`, d, edge: `${e.sources[0]}->${e.targets[0]}`, kind: label?.kind, tone: label?.tone });
         if (i === 0 && label?.text) {
-          // On the edge's longest segment, where it has room.
-          let best = 0, bx = 0, by = 0;
-          for (let k = 0; k < pts.length - 1; k++) {
-            const len = Math.hypot(pts[k + 1].x - pts[k].x, pts[k + 1].y - pts[k].y);
-            if (len > best) { best = len; bx = (pts[k].x + pts[k + 1].x) / 2; by = (pts[k].y + pts[k + 1].y) / 2; }
-          }
-          edgeTexts.push({ key: e.id, x: bx + ox, y: by + oy - 4, text: label.text });
+          edgeTexts.push({ key: e.id, text: label.text, points: pts.map((p) => ({ x: p.x + ox, y: p.y + oy })) });
         }
       });
     }
     for (const c of node.children || []) walkEdges(c, ox + (c.x || 0), oy + (c.y || 0));
   })(laid, 0, 0);
 
+  // What a label has to stay off: every card, and a compound's title tab.
+  const nodeRects: Rect[] = [];
+  (function walkNodes(node: ElkNode, ox: number, oy: number) {
+    for (const c of node.children || []) {
+      const x = ox + (c.x || 0);
+      const y = oy + (c.y || 0);
+      if (c.children?.length) {
+        nodeRects.push({ x0: x + 8, y0: y - 12, x1: x + Math.min(c.width || 0, COMPOUND_TAB_PX), y1: y + 12 });
+        walkNodes(c, x, y);
+      } else {
+        nodeRects.push({ x0: x, y0: y, x1: x + (c.width || 0), y1: y + (c.height || 0) });
+      }
+    }
+  })(laid, 0, 0);
+
   return (
     <>
       {measureEl}
       {legend && <DagLegend nodes={displayNodes} edges={edges} />}
-      <div className="dag-svg-container">
+      <div className="dag-svg-container" ref={scrollerRef}>
       <svg width={w} height={h} className="dag-edges absolute inset-0 pointer-events-none">
         <defs>
           {Object.entries(EDGE_STYLE).map(([k, st]) => (
@@ -966,7 +1003,7 @@ export function BlockElkDag({ nodes, edges, legend = true, fit = false }: {
             />
           );
         })}
-        {placeLabels(edgeTexts, w).map((t) => (
+        {placeLabels(edgeTexts, w, nodeRects).map((t) => (
           <text key={`t:${t.key}`} className="dag-edge-label" x={t.x} y={t.y} textAnchor={t.anchor}>{t.text}</text>
         ))}
       </svg>

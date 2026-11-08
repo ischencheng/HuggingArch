@@ -1,6 +1,7 @@
 import ELK from "elkjs/lib/elk.bundled.js";
 import type { ElkExtendedEdge, ElkNode } from "elkjs";
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { revealSideways } from "../revealSideways";
 
 /** One box of the architecture overview: a model input, a card (an op, a
  *  block, a kind with its variants, a cycle) or an auxiliary module's
@@ -69,6 +70,7 @@ export function ArchGraph({ nodes, edges }: { nodes: ArchGraphNode[]; edges: Arc
   const edgeKey = JSON.stringify(edges);
   const latest = useRef({ nodes, edges });
   latest.current = { nodes, edges };
+  const laidSizes = useRef<Record<string, { w: number; h: number }>>({});
 
   useLayoutEffect(() => {
     let frame = 0;
@@ -153,6 +155,17 @@ export function ArchGraph({ nodes, edges }: { nodes: ArchGraphNode[]; edges: Arc
       cancelled = true;
     };
   }, [sizes, nodeKey, edgeKey]);
+
+  // A box that just widened was just opened: once the graph has re-laid
+  // around it, bring it into view.
+  useLayoutEffect(() => {
+    if (!laid) return;
+    const before = laidSizes.current;
+    laidSizes.current = sizes;
+    const opened = Object.keys(sizes).find((id) => before[id] && sizes[id].w > before[id].w);
+    const box = opened ? boxes.current.get(opened) : undefined;
+    if (box) revealSideways(box);
+  }, [laid]);
 
   return (
     <div style={{ overflowX: "auto" }}>
