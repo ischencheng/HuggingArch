@@ -35,8 +35,12 @@ def test_a_non_json_reply_is_a_miss(monkeypatch, module):
 
     import httpx
 
-    from backend import supabase_env
+    from backend import supabase_env, supabase_rest
     mod = importlib.import_module(module)
+    # `_client` keeps one client per process: without this the stub outlives
+    # the test and answers every later RPC, or a real client already cached
+    # answers this one.
+    monkeypatch.setattr(supabase_rest, "_clients", {})
     monkeypatch.setattr(supabase_env, "configured", lambda: True)
     monkeypatch.setattr(supabase_env, "service_role", lambda: ("https://x", "k"))
     monkeypatch.setattr(httpx, "Client", _Client)
