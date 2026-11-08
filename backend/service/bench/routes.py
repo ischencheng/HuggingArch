@@ -111,13 +111,29 @@ def _catalog():
     return providers
 
 
+@lru_cache(maxsize=1)
+def _shape_identity(op: str, shape_json: str) -> tuple[dict, str, str]:
+    """One op/shape's catalog shape and physical identity.
+
+    Startup streams inputs ordered by `(op, shape_json)`, so this one-entry
+    memo computes the expensive physical half once for every duplicate input
+    in that run without keeping a per-process shape table. It is the same
+    annotation road `row_annotations` always takes; callers never derive it.
+    """
+    shape = current_shape(op, _store.canonical_json(shape_json))
+    identity = physical_identity(op, shape)
+    return shape, identity["signature"], identity["physical_shape"]
+
+
 def row_annotations(row: Mapping[str, Any]) -> dict:
     """The annotations of one row's input (`op`, `shape_json`, `phase`,
     `kernel_impl` read)."""
-    shape = current_shape(row["op"], _store.canonical_json(row["shape_json"]))
+    shape, signature, physical_shape = _shape_identity(
+        row["op"], row["shape_json"])
     batch, context = workload_coordinates(row["phase"], shape)
     return {
-        **physical_identity(row["op"], shape),
+        "signature": signature,
+        "physical_shape": physical_shape,
         "workload_batch": batch,
         "workload_context": context,
         "catalog_kernel": _catalog().catalog_kernel(row["kernel_impl"]),

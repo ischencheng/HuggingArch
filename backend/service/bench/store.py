@@ -369,19 +369,36 @@ def _add_annotations(cur, entries: Sequence[Mapping[str, Any]]) -> None:
 
 def annotate_all(lake: Lake, annotate: Annotate) -> int:
     """(Re)build `annot` from every input of the lake — at startup, before
-    the lake serves. Returns how many inputs are annotated."""
+    the lake serves. Returns how many inputs are annotated.
+
+    Inputs stream in annotation order (`op`, `shape_json`, then the rest of
+    the key), one `ANNOT_BATCH` at a time: Python holds one input batch and
+    one annotation batch, never the lake. The routes' annotator memoizes the
+    physical half by the same op/shape while their duplicates are adjacent.
+    """
     t0 = time.monotonic()
     with lake.inputs_lock():
-        inputs = lake.read("SELECT input_id, " + ", ".join(INPUT_KEY) + " FROM lake.inputs")
-        entries = _annotated(annotate, inputs)
+        total = 0
+        annotated = 0
 
         def build(cur) -> None:
+            nonlocal total, annotated
             cur.execute(_ANNOT)
-            _add_annotations(cur, entries)
+            batches = lake.read_batches(
+                "SELECT input_id, " + ", ".join(INPUT_KEY)
+                + " FROM lake.inputs ORDER BY "
+                + ", ".join(("op", "shape_json", "phase", "kernel_impl")),
+                batch_rows=ANNOT_BATCH)
+            for inputs in batches:
+                total += len(inputs)
+                entries = _annotated(annotate, inputs)
+                annotated += len(entries)
+                _add_annotations(cur, entries)
+
         lake.transact(build)
-    _LOG.info("bench: %d of %d inputs annotated in %.1f s", len(entries), len(inputs),
+    _LOG.info("bench: %d of %d inputs annotated in %.1f s", annotated, total,
               time.monotonic() - t0)
-    return len(entries)
+    return annotated
 
 
 def upload(lake: Lake, *, owner: str, upload_id: str, run_id: Optional[str],

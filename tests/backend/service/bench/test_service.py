@@ -276,6 +276,46 @@ def test_rules_rev_covers_the_annotation_closure():
     assert ast and len(R.rules_rev()) == 16
 
 
+def test_repeated_op_shapes_compute_their_physical_identity_once(monkeypatch):
+    """The annotation owner memoizes the physical half by (op, shape_json).
+
+    Inputs stream in that order, so the memo is one entry, not a second
+    process-wide table. Phase and kernel impl still annotate every input.
+    """
+    calls = {"shape": 0, "identity": 0}
+
+    def current_shape(op, shape_json):
+        calls["shape"] += 1
+        return {"op": op, "shape": shape_json}
+
+    def physical_identity(op, shape):
+        calls["identity"] += 1
+        return {"signature": f"{op}:sig", "physical_shape": shape["shape"]}
+
+    class Catalog:
+        @staticmethod
+        def catalog_kernel(kernel_impl):
+            return kernel_impl.upper()
+
+    monkeypatch.setattr(R, "current_shape", current_shape)
+    monkeypatch.setattr(R, "physical_identity", physical_identity)
+    monkeypatch.setattr(R, "_catalog", lambda: Catalog)
+    R._shape_identity.cache_clear()
+    try:
+        shape = _row(0)["shape_json"]
+        rows = [
+            {"op": "linear", "shape_json": shape, "phase": phase,
+             "kernel_impl": impl}
+            for phase in ("decode", "prefill")
+            for impl in ("a", "b")
+        ]
+        answers = [R.row_annotations(row) for row in rows]
+    finally:
+        R._shape_identity.cache_clear()
+    assert calls == {"shape": 1, "identity": 1}
+    assert {answer["catalog_kernel"] for answer in answers} == {"A", "B"}
+
+
 @pytest.mark.parametrize("rows_each", [1, 40], ids=["inlined", "files"])
 def test_divergent_copies_of_a_lake_have_divergent_scopes(tmp_path, annotate, make_rows,
                                                           new_owner, rows_each):

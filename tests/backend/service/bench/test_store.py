@@ -465,6 +465,24 @@ def test_annotate_all_inserts_in_batches(lake, make_rows, annotate, new_owner,
     assert _count(lake, "SELECT count(DISTINCT input_id) AS n FROM annot") == 5
 
 
+def test_annotate_all_never_holds_every_input(lake, make_rows, annotate,
+                                               new_owner, monkeypatch):
+    """Startup streams one insert batch at a time: even a lake with millions
+    of inputs never materializes them all in Python."""
+    _up(lake, new_owner(), make_rows(5), annotate)
+    monkeypatch.setattr(store, "ANNOT_BATCH", 2)
+    batches: list[int] = []
+    real = store._annotated
+
+    def measured(annotator, inputs):
+        batches.append(len(inputs))
+        return real(annotator, inputs)
+
+    monkeypatch.setattr(store, "_annotated", measured)
+    assert store.annotate_all(lake, annotate) == 5
+    assert batches == [2, 2, 1]
+
+
 def test_an_input_annotate_refuses_has_no_annotations(lake, make_rows, new_owner):
     def refuse_one(inp):
         if json.loads(inp["shape_json"])["s_ctx"] == 4096:
@@ -645,4 +663,3 @@ def test_rekey_env_drops_the_deployment_from_an_old_lake(lake, make_rows, annota
     assert store.rekey_env(lake) == 0
     (env,) = {r["env"] for r in lake.read("SELECT env FROM lake.measurements")}
     assert env == _md5_upper(f"{base['dtype_env_json']}\x1f{base['gpu']}")
-

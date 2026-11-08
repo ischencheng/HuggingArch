@@ -303,6 +303,24 @@ class Lake:
             finally:
                 cur.close()
 
+    def read_batches(self, sql: str, params: Sequence[Any] = (),
+                     *, batch_rows: int) -> Iterator[list[dict]]:
+        """`read` without materializing the answer: `fetchmany(batch_rows)`
+        lists of row dicts, one read cursor held for the generator's life.
+        A bounded caller's peak is bounded by its batch, not the lake."""
+        if batch_rows < 1:
+            raise ValueError("batch_rows must be positive")
+        with self._reads:
+            cur = self._con.cursor()
+            try:
+                cur.execute(sql, list(params))
+                names = [d[0] for d in cur.description]
+                while rows := cur.fetchmany(batch_rows):
+                    yield [dict(zip(names, row, strict=True))
+                           for row in rows]
+            finally:
+                cur.close()
+
     def transact(self, fn: Callable[[Any], T]) -> T:
         """Run `fn(cursor)` in one lake transaction (BEGIN … COMMIT); on a
         commit conflict roll back and run `fn` again, up to 3 attempts with
