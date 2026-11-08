@@ -156,6 +156,22 @@ class TestLookup:
                               json={"keys": [_key(_row(0))], "snapshot": 10 ** 9})
         assert r.status_code == 503, r.text
 
+    def test_cells_that_cannot_catch_up_are_503_not_a_lake_read(self, bench_client,
+                                                                bench_lake, monkeypatch):
+        """The lookup's cells file is its one read of a row's cells: behind
+        the pin and unable to catch up, the lookup is 503 (the client's
+        "measurements unavailable"), never answered from the lake's files."""
+        from backend.service.bench import lookup as LK
+        from backend.service.bench import routes as R
+        _upload(bench_client, ALICE, [_row(0)])
+        assert _lookup(bench_client, [_key(_row(0))], owner=ALICE)["rows"][0]
+        monkeypatch.setattr(R.cells, "refresh", lambda lake: None)
+        monkeypatch.setattr(LK.Cells, "CATCH_UP_S", 0.3)
+        _upload(bench_client, ALICE, [_row(1)])
+        r = bench_client.post("/internal/bench/lookup",
+                              json={"keys": [_key(_row(1))], "owner": ALICE})
+        assert r.status_code == 503 and "did not reach snapshot" in r.text, r.text
+
     def test_a_legacy_shape_is_found_under_the_current_key(self, bench_client, bench_lake,
                                                            monkeypatch):
         """Membership is the service's current annotations (`current_shape`,

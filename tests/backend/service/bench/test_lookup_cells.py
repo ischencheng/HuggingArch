@@ -1,13 +1,13 @@
 """The lookup's cells file (`lookup.Cells`, docs/measured_calibration.md
-§7.2): a lookup reads the cells of its rows from the file, not the lake's
-parquet, when the file holds the lookup's snapshot and content; the file
-follows the lake by its change feed and then holds exactly what the lake
-holds; at any other snapshot or content it answers nothing and the lookup
-reads the lake, with the same answer."""
+§7.2): the one place a lookup reads its rows' cells. No lookup reads the
+lake's wide columns; a file behind the lookup's pin is caught up before the
+lookup answers, and one that cannot be caught up in time fails the lookup
+(503: measurements unavailable) rather than sending it to the lake's files.
+The file keeps each row's versions with the snapshots they are live at, so
+every pin from its base answers exactly what the lake holds at that pin."""
 from __future__ import annotations
 
 import threading
-import time
 import uuid
 
 import pytest
@@ -15,10 +15,8 @@ import pytest
 from backend.inference.op_calibration import ROW_COLUMNS
 from backend.service.bench import lookup as LK
 from backend.service.bench import store
-from backend.service.bench.lake import Lake, LakeConfig
+from backend.service.bench.lake import Lake, LakeConfig, LakeUnavailable
 from tests.backend.service.bench.conftest import make_annotator
-
-_LAKE_CELLS = "FROM lake.measurements m AT (VERSION => ?) WHERE m.input_id IN"
 
 
 def _upload(lake, annotate, owner, rows, *, status="shared"):
@@ -34,31 +32,19 @@ def _key(annotate, row) -> dict:
             "dtype_env_json": row["dtype_env_json"], "gpu": row["gpu"], "phase": row["phase"]}
 
 
-class _Reads:
-    """Counts the lake reads of a lookup's wide cells from the lake's files."""
-
-    def __init__(self, lake, monkeypatch):
-        self.lake_cells = 0
-        real = lake.read
-
-        def read(sql, params=()):
-            self.lake_cells += _LAKE_CELLS in sql
-            return real(sql, params)
-        monkeypatch.setattr(lake, "read", read)
-
-
 _SELECTION = LK.Selection()
 
 
-def _lookup(lake, keys, snap, cells=None, owner=None):
-    return LK.lookup(lake, keys, owner=owner, snapshot=snap,
-                     selection=_SELECTION, cells=cells)
+def _lookup(lake, keys, snap, cells, owner=None):
+    return LK.lookup(lake, keys, owner=owner, snapshot=snap, selection=_SELECTION,
+                     cells=cells)
 
 
-def _file(lake) -> dict:
-    a = LK.Cells.ALIAS
+def _file_at(lake, snap) -> dict:
+    """The versions the file holds live at `snap`."""
     return {r["id"]: tuple(LK._cell(r[c]) for c in ROW_COLUMNS) for r in lake.read(
-        f"SELECT id::VARCHAR AS id, * EXCLUDE (id) FROM {a}.rows")}
+        f"SELECT id::VARCHAR AS id, * EXCLUDE (id) FROM {LK.Cells.ALIAS}.rows WHERE begin_snapshot <= ? "
+        "AND (end_snapshot IS NULL OR end_snapshot > ?)", [snap, snap])}
 
 
 def _lake_at(lake, snap) -> dict:
@@ -68,90 +54,120 @@ def _lake_at(lake, snap) -> dict:
         "AT (VERSION => ?)", [snap])}
 
 
+def test_no_lookup_reads_the_lakes_wide_columns(lake, cells, annotate, make_rows,
+                                                new_owner, monkeypatch):
+    """Not with the file current, not behind it (the catch-up is the
+    builder's, not the lookup's), not at an older pin."""
+    owner = new_owner()
+    rows = make_rows(4)
+    s1 = _upload(lake, annotate, owner, rows[:2])
+    keys = [_key(annotate, r) for r in rows]
+    wide: list[str] = []
+    real = lake.read
+
+    def read(sql, params=()):
+        if "lake.measurements" in sql and '"shape_json"' in sql:
+            wide.append(sql)
+        return real(sql, params)
+    monkeypatch.setattr(lake, "read", read)
+    first = _lookup(lake, keys, s1, cells)
+    s2 = _upload(lake, annotate, owner, rows[2:], status="private")
+    now = _lookup(lake, keys, s2, cells, owner=owner)
+    assert _lookup(lake, keys, s1, cells) == first
+    assert wide == []
+    assert sum(map(len, first["rows"])) == 2
+    assert sum(map(len, now["rows"])) == 6       # the owner's shared rows twice
+
+
 def _cell_of(out, key_index: int, column: str) -> str:
     """One returned row's cell, decoded from the lookup's value table."""
     row = out["rows"][key_index][0]
     return out["values"][row[out["columns"].index(column)]]
 
 
-def test_a_restamped_row_is_not_answered_from_an_older_process_cache(
-        lake, annotate, make_rows, new_owner):
-    """A row id names different content before and after `store.restamp`."""
+def test_a_restamped_row_is_answered_with_its_cells_at_each_pin(
+        lake, cells, annotate, make_rows, new_owner):
+    """A row id names different content before and after `store.restamp`:
+    the file, behind the restamp, catches up before answering the new pin
+    and still answers the old pin with the old cells."""
     owner = new_owner()
     rows = make_rows(1)
     before = _upload(lake, annotate, owner, rows)
-    cells = LK.Cells()
-    assert cells.refresh(lake)["how"] == "rebuilt"
     key = _key(annotate, rows[0])
     assert _cell_of(_lookup(lake, [key], before, cells), 0,
                     "achieved_tflops") == rows[0]["achieved_tflops"]
-
-    row_id = next(iter(_file(lake)))
-    changed = "1234.5"
-    store.restamp(lake, owner=owner, rows=[{
-        "id": row_id, "achieved_tflops": changed}])
+    row_id = next(iter(_lake_at(lake, before)))
+    store.restamp(lake, owner=owner, rows=[{"id": row_id, "achieved_tflops": "1234.5"}])
     after = lake.snapshot_id()
-    # The cells file is intentionally still behind; the lookup must read the
-    # new post-image from the lake, not a cache keyed only by row id.
-    assert _cell_of(_lookup(lake, [key], after, cells), 0,
-                    "achieved_tflops") == changed
+    assert _cell_of(_lookup(lake, [key], after, cells), 0, "achieved_tflops") == "1234.5"
     assert _cell_of(_lookup(lake, [key], before, cells), 0,
                     "achieved_tflops") == rows[0]["achieved_tflops"]
 
 
-def test_a_lookup_reads_its_cells_from_the_file_not_the_lakes_files(
-        lake, annotate, make_rows, new_owner, monkeypatch):
-    rows = make_rows(4)
-    snap = _upload(lake, annotate, new_owner(), rows)
-    keys = [_key(annotate, r) for r in rows]
-    cells = LK.Cells()
-    assert cells.refresh(lake)["how"] == "rebuilt"
-    reads = _Reads(lake, monkeypatch)
-    got = _lookup(lake, keys, snap, cells)
-    assert reads.lake_cells == 0
-    assert got == _lookup(lake, keys, snap) and all(got["rows"])
-    assert reads.lake_cells == 1               # without the file: the lake's files
-
-
-def test_the_file_follows_the_change_feed_and_holds_what_the_lake_holds(
-        lake, annotate, make_rows, new_owner):
-    alice = new_owner()
-    rows = make_rows(6)
-    _upload(lake, annotate, alice, rows[:3])
-    cells = LK.Cells()
-    assert cells.refresh(lake)["how"] == "rebuilt"
-    _upload(lake, annotate, alice, rows[3:], status="private")      # inserts
-    doomed = sorted(_file(lake))[0]
-    store.delete_rows(lake, owner=alice, ids=[doomed])                # a delete
-    edited = sorted(_file(lake))[1]
-    store.restamp(lake, owner=alice, rows=[{"id": edited, "achieved_tflops": 1.25}])
-    snap = lake.snapshot_id()
-    assert cells.refresh(lake) == {"snapshot": snap, "how": "changes", "rows": 5}
-    held = _file(lake)
-    assert held == _lake_at(lake, snap) and len(held) == 5
-    assert doomed not in held
-    assert held[edited][ROW_COLUMNS.index("achieved_tflops")] == "1.25"
-    assert cells.refresh(lake)["how"] == "current"
-
-
-def test_the_file_answers_only_its_own_snapshot_and_content(
-        lake, annotate, make_rows, new_owner, monkeypatch):
+def test_a_behind_file_is_caught_up_before_the_lookup_answers(lake, cells, annotate,
+                                                              make_rows, new_owner):
     owner = new_owner()
     rows = make_rows(3)
-    s1 = _upload(lake, annotate, owner, rows[:2])
-    cells = LK.Cells()
+    _upload(lake, annotate, owner, rows[:1])
     cells.refresh(lake)
-    ids = sorted(_file(lake))
-    assert set(cells.read(lake, ids, s1)) == set(ids)
-    s2 = _upload(lake, annotate, owner, rows[2:])
-    assert cells.read(lake, ids, s2) == {}       # the lake moved: nothing
+    s2 = _upload(lake, annotate, owner, rows[1:])
+    assert cells._held[lake][1] < s2
+    out = _lookup(lake, [_key(annotate, r) for r in rows], s2, cells)
+    assert [len(r) for r in out["rows"]] == [1, 1, 1]
+    assert cells._held[lake][1] >= s2
+
+
+def test_a_catch_up_that_cannot_finish_fails_the_lookup(lake, cells, annotate, make_rows,
+                                                        new_owner, monkeypatch):
+    owner = new_owner()
+    rows = make_rows(2)
+    s1 = _upload(lake, annotate, owner, rows[:1])
+    s2 = _upload(lake, annotate, owner, rows[1:])
+
+    def broken(lk):
+        raise LakeUnavailable("the builder is down")
+    monkeypatch.setattr(cells, "refresh", broken)
+    monkeypatch.setattr(LK.Cells, "CATCH_UP_S", 0.3)
     keys = [_key(annotate, r) for r in rows]
-    assert _lookup(lake, keys, s2, cells) == _lookup(lake, keys, s2)
+    with pytest.raises(LakeUnavailable, match="did not reach snapshot"):
+        _lookup(lake, keys, s2, cells)
+    del s1
+
+
+def test_a_pin_before_the_files_base_is_refused(lake, annotate, make_rows, new_owner):
+    owner = new_owner()
+    rows = make_rows(2)
+    s1 = _upload(lake, annotate, owner, rows[:1])
+    _upload(lake, annotate, owner, rows[1:])
+    cells = LK.Cells()
+    cells.refresh(lake)                          # built after s1: base is s2
+    with pytest.raises(LakeUnavailable, match="older than"):
+        _lookup(lake, [_key(annotate, rows[0])], s1, cells)
+
+
+def test_every_pin_from_the_base_holds_what_the_lake_holds(lake, cells, annotate,
+                                                           make_rows, new_owner):
+    """Inserts, a delete and an in-place restamp, followed by the change
+    feed: at every snapshot the file answers, its live versions are the
+    lake's rows at that snapshot."""
+    alice = new_owner()
+    rows = make_rows(6)
+    snaps = [_upload(lake, annotate, alice, rows[:3])]
     cells.refresh(lake)
-    assert cells.read(lake, ids, s1) == {}       # an older pin: nothing
-    # Another content at the same snapshot (a restored or diverged copy).
-    monkeypatch.setattr(lake, "content_id", lambda n: "another lake")
-    assert cells.read(lake, ids, s2) == {}
+    snaps.append(_upload(lake, annotate, alice, rows[3:], status="private"))
+    ids = sorted(_lake_at(lake, snaps[-1]))
+    store.delete_rows(lake, owner=alice, ids=[ids[0]])
+    snaps.append(lake.snapshot_id())
+    store.restamp(lake, owner=alice, rows=[{"id": ids[1], "achieved_tflops": 1.25}])
+    snaps.append(lake.snapshot_id())
+    got = cells.refresh(lake)
+    assert got["how"] == "changes" and got["snapshot"] == snaps[-1]
+    base, at = cells._held[lake]
+    assert base <= snaps[0] and at == snaps[-1]
+    for snap in range(base, at + 1):
+        assert _file_at(lake, snap) == _lake_at(lake, snap), snap
+    assert _file_at(lake, at)[ids[1]][ROW_COLUMNS.index("achieved_tflops")] == "1.25"
+    assert cells.refresh(lake)["how"] == "current"
 
 
 def test_a_reopened_lake_resumes_from_the_file_it_left(tmp_path, make_rows, new_owner):
@@ -170,38 +186,20 @@ def test_a_reopened_lake_resumes_from_the_file_it_left(tmp_path, make_rows, new_
     try:
         store.annotate_all(lk, annotate)
         snap = _upload(lk, annotate, owner, rows[2:])
-        # A new process: its history is checked by content, then followed.
+        # A new process: the file's history is checked by content, then followed.
         assert LK.Cells().refresh(lk) == {"snapshot": snap, "how": "changes", "rows": 1}
-        assert _file(lk) == _lake_at(lk, snap)
+        assert _file_at(lk, snap) == _lake_at(lk, snap)
     finally:
         lk.close()
 
 
-def test_a_lookup_behind_the_file_wakes_the_follower(lake, annotate, make_rows, new_owner):
-    owner = new_owner()
-    rows = make_rows(2)
-    _upload(lake, annotate, owner, rows[:1])
-    cells = LK.Cells()
-    cells.follow(lake)
-    s1 = lake.snapshot_id()
-    deadline = time.monotonic() + 20
-    while not cells.read(lake, sorted(_lake_at(lake, s1)), s1):
-        assert time.monotonic() < deadline
-        time.sleep(0.05)
-    s2 = _upload(lake, annotate, owner, rows[1:])
-    ids = sorted(_lake_at(lake, s2))
-    while len(cells.read(lake, ids, s2)) < len(ids):   # each miss pokes it
-        assert time.monotonic() < deadline
-        time.sleep(0.05)
-
-
 @pytest.mark.parametrize("n", [4])
-def test_lookups_read_while_the_file_refreshes(lake, annotate, make_rows, new_owner, n):
+def test_lookups_read_while_the_file_refreshes(lake, cells, annotate, make_rows,
+                                               new_owner, n):
     owner = new_owner()
     rows = make_rows(n)
     snaps = [_upload(lake, annotate, owner, [r]) for r in rows]
     keys = [_key(annotate, r) for r in rows]
-    cells = LK.Cells()
     errors: list = []
 
     def run():

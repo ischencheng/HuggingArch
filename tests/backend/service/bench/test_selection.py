@@ -76,7 +76,8 @@ def test_a_selection_limit_not_below_the_memory_limit_is_refused(tmp_path):
                              memory_limit="256MB", selection_limit="256MB"))
 
 
-def test_the_held_table_answers_as_the_pinned_query(lake, annotate, make_rows, new_owner):
+def test_the_held_table_answers_as_the_pinned_query(lake, cells, annotate, make_rows,
+                                                    new_owner):
     alice, admin = new_owner(), new_owner()
     rows = make_rows(3)
     s1 = _upload(lake, annotate, admin, rows[:2], status="shared")
@@ -84,12 +85,13 @@ def test_the_held_table_answers_as_the_pinned_query(lake, annotate, make_rows, n
     keys = [_key(annotate, r) for r in rows]
     held, pinned = LK.Selection(), LK.Selection()
     unheld = _limited(lake, 0)
+    cells.refresh(unheld)
     for owner in (None, alice):
         for snap in (s2, s1):
-            a = LK.lookup(lake, keys, owner=owner, snapshot=snap,
-                          selection=held)
-            b = LK.lookup(unheld, keys, owner=owner, snapshot=snap,
-                          selection=pinned)
+            a = LK.lookup(lake, keys, owner=owner, snapshot=snap, selection=held,
+                          cells=cells)
+            b = LK.lookup(unheld, keys, owner=owner, snapshot=snap, selection=pinned,
+                          cells=cells)
             assert a == b and a["rows"] != [[], [], []]
     assert len(_tables(lake)) == 1 and pinned._current[unheld][1] is None
 
@@ -150,7 +152,7 @@ def test_an_older_pin_takes_the_pinned_query(lake, annotate, make_rows, new_owne
 
 
 @pytest.mark.parametrize("held", [False, True])
-def test_concurrent_lookups_at_moving_snapshots_never_fail(lake, annotate, make_rows,
+def test_concurrent_lookups_at_moving_snapshots_never_fail(lake, cells, annotate, make_rows,
                                                            new_owner, held):
     owner = new_owner()
     rows = make_rows(6)
@@ -159,13 +161,14 @@ def test_concurrent_lookups_at_moving_snapshots_never_fail(lake, annotate, make_
     sel = LK.Selection()
     if not held:
         lake = _limited(lake, 0)
+    cells.refresh(lake)
     errors: list = []
 
     def run(snap):
         try:
             for _ in range(5):
                 out = LK.lookup(lake, keys, owner=None, snapshot=snap,
-                                selection=sel)
+                                selection=sel, cells=cells)
                 assert sum(map(len, out["rows"])) == snaps.index(snap) + 1
         except Exception as e:
             errors.append(e)
