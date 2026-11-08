@@ -51,7 +51,7 @@ _SELECTION = LK.Selection()
 
 
 def _lookup(lake, keys, snap, cells=None, owner=None):
-    return LK.lookup(lake, keys, owner=owner, snapshot=snap, verdicts=LK.Verdicts(),
+    return LK.lookup(lake, keys, owner=owner, snapshot=snap,
                      selection=_SELECTION, cells=cells)
 
 
@@ -66,6 +66,37 @@ def _lake_at(lake, snap) -> dict:
     return {r["id"]: tuple(LK._cell(r[c]) for c in ROW_COLUMNS) for r in lake.read(
         f"SELECT id::VARCHAR AS id, {LK._SENT} FROM lake.measurements m "
         "AT (VERSION => ?)", [snap])}
+
+
+def _cell_of(out, key_index: int, column: str) -> str:
+    """One returned row's cell, decoded from the lookup's value table."""
+    row = out["rows"][key_index][0]
+    return out["values"][row[out["columns"].index(column)]]
+
+
+def test_a_restamped_row_is_not_answered_from_an_older_process_cache(
+        lake, annotate, make_rows, new_owner):
+    """A row id names different content before and after `store.restamp`."""
+    owner = new_owner()
+    rows = make_rows(1)
+    before = _upload(lake, annotate, owner, rows)
+    cells = LK.Cells()
+    assert cells.refresh(lake)["how"] == "rebuilt"
+    key = _key(annotate, rows[0])
+    assert _cell_of(_lookup(lake, [key], before, cells), 0,
+                    "achieved_tflops") == rows[0]["achieved_tflops"]
+
+    row_id = next(iter(_file(lake)))
+    changed = "1234.5"
+    store.restamp(lake, owner=owner, rows=[{
+        "id": row_id, "achieved_tflops": changed}])
+    after = lake.snapshot_id()
+    # The cells file is intentionally still behind; the lookup must read the
+    # new post-image from the lake, not a cache keyed only by row id.
+    assert _cell_of(_lookup(lake, [key], after, cells), 0,
+                    "achieved_tflops") == changed
+    assert _cell_of(_lookup(lake, [key], before, cells), 0,
+                    "achieved_tflops") == rows[0]["achieved_tflops"]
 
 
 def test_a_lookup_reads_its_cells_from_the_file_not_the_lakes_files(

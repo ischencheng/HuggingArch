@@ -150,51 +150,49 @@ def _cell(v: Any) -> str:
 
 
 class Verdicts:
-    """Each row's cells and its verdict under this process's validator, by
-    row id (the verdict None when the row passes `validate_row`), bounded.
-    Rows are never edited and the validator changes only with the code, so
-    an entry holds for the process's life; a lookup reads the lake's wide
-    columns only for rows it does not hold (the narrow join that selects
-    rows is most of a warm lookup). A row is held as the cells a lookup
-    sends (`ROW_COLUMNS`, interned: a shape or a dtype env is one string
-    however many rows repeat it) and its verdict. Lookup asks for cells with
-    `validate=False`; owner reporting asks for the current verdict."""
+    """Validator verdicts by row content, bounded.
+
+    The key is the lake's content identity, the pinned snapshot, and the row
+    id: ``store.restamp`` changes a row in place, so a row id alone is not a
+    content identity. Only a caller that supplies the whole row and asks for
+    a verdict puts an entry here; lookup never does. Row cells belong to
+    ``Cells`` (or the lake read), which are already pinned to a snapshot and
+    content identity."""
 
     def __init__(self, max_entries: int = 120_000):
         self._max = max_entries
-        self._memo: "OrderedDict[str, tuple]" = OrderedDict()
+        self._memo: "OrderedDict[str, Optional[str]]" = OrderedDict()
         self._lock = threading.Lock()
 
-    def get(self, row_id: str) -> Optional[tuple]:
-        """`(cells, verdict)` of a row held, else None."""
-        with self._lock:
-            got = self._memo.get(row_id)
-            if got is not None:
-                self._memo.move_to_end(row_id)
-            return got
+    def _key(self, lake: Lake, snapshot: int, row_id: str) -> str:
+        return f"{lake.content_id(snapshot)}:{int(snapshot)}:{row_id}"
 
-    def put(self, row_id: str, cells: Mapping[str, str], *,
-            validate: bool = True) -> tuple:
-        """Hold a row's cells: the ones a lookup sends (`ROW_COLUMNS`), and its
-        verdict when the caller asked for one (then `cells` is the whole row,
-        `ALL_COLUMNS`, which the validator reads)."""
-        why = None
-        if validate:
-            try:
-                _benchmarks.validate_row(dict(cells))
-            except _benchmarks.BenchmarkValidationError as e:
-                why = str(e)
-        entry = (tuple(sys.intern(cells[c]) for c in ROW_COLUMNS), why)
+    def get(self, lake: Lake, snapshot: int, row_id: str) -> Optional[str]:
+        """A verdict already computed for this row content, else None."""
         with self._lock:
-            self._memo[row_id] = entry
+            key = self._key(lake, snapshot, row_id)
+            if key in self._memo:
+                self._memo.move_to_end(key)
+                return self._memo[key]
+            return None
+
+    def of(self, lake: Lake, snapshot: int, row_id: str,
+           cells: Mapping[str, str]) -> Optional[str]:
+        """The current validator's verdict for this row content."""
+        key = self._key(lake, snapshot, row_id)
+        got = self.get(lake, snapshot, row_id)
+        if got is not None or key in self._memo:
+            return got
+        try:
+            _benchmarks.validate_row(dict(cells))
+            why = None
+        except _benchmarks.BenchmarkValidationError as e:
+            why = str(e)
+        with self._lock:
+            self._memo[key] = why
             while len(self._memo) > self._max:
                 self._memo.popitem(last=False)
-        return entry
-
-    def of(self, row_id: str, cells: Mapping[str, str]) -> Optional[str]:
-        """The row's verdict (held, or computed from `cells` and held)."""
-        got = self.get(row_id)
-        return (got if got is not None else self.put(row_id, cells))[1]
+        return why
 
 
 class _Gate:
@@ -422,36 +420,31 @@ class Cells:
 
 
 def _entries(lake: Lake, found: Sequence[Mapping[str, Any]], snapshot: int,
-             verdicts: Verdicts, cells: Optional[Cells] = None) -> dict:
-    """Every selected row as a held entry: from the held rows (`verdicts`),
-    then the lookup's cells file (`Cells`) when it holds `snapshot`, then the
-    lake's columns at `snapshot` for the rest. The lake read is narrowed by
-    the rows' inputs as literals, which prune the lake's files by their
-    input ranges; a row-id list does not (it scanned every wide column)."""
+             cells: Optional[Cells] = None) -> dict:
+    """Every selected row's cells: from the lookup's snapshot-scoped cells
+    file (`Cells`) when it holds `snapshot`, then the lake's columns at
+    `snapshot` for the rest. The lake read is narrowed by the rows' inputs as
+    literals, which prune the lake's files by their input ranges; a row-id
+    list does not (it scanned every wide column)."""
     out = {}
     missing: dict[str, int] = {}
     for r in found:
         row_id = r["id"]
         if row_id in out or row_id in missing:
             continue
-        got = verdicts.get(row_id)
-        if got is None:
-            missing[row_id] = int(r["input_id"])
-        else:
-            out[row_id] = got
+        missing[row_id] = int(r["input_id"])
     if missing and cells is not None:
         for row_id, r in cells.read(lake, list(missing), snapshot).items():
-            out[row_id] = verdicts.put(row_id, {c: _cell(r[c]) for c in ROW_COLUMNS},
-                                       validate=False)
+            out[row_id] = tuple(sys.intern(_cell(r[c])) for c in ROW_COLUMNS)
             del missing[row_id]
     if missing:
         inputs = ",".join(str(i) for i in sorted(set(missing.values())))
         for r in lake.read(
-                f"SELECT {_SENT}, m.id::VARCHAR AS id FROM lake.measurements m "
-                f"AT (VERSION => ?) WHERE m.input_id IN ({inputs})", [snapshot]):
+            f"SELECT {_SENT}, m.id::VARCHAR AS id FROM lake.measurements m "
+            f"AT (VERSION => ?) WHERE m.input_id IN ({inputs})", [snapshot]):
             if r["id"] in missing:
-                out[r["id"]] = verdicts.put(
-                    r["id"], {c: _cell(r[c]) for c in ROW_COLUMNS}, validate=False)
+                out[r["id"]] = tuple(
+                    sys.intern(_cell(r[c])) for c in ROW_COLUMNS)
     return out
 
 
@@ -459,7 +452,8 @@ class Selection:
     """A memory-budgeted copy of what a lookup selects from, for the newest
     snapshot asked.
 
-    The table `sel_<n>_<k>` (the DuckDB instance's own in-memory database)
+    The table `sel_<n>_<k>` (the DuckDB instance's own in-memory database,
+    `k` allocated by the lake object, not by a Selection instance)
     holds, per measurement at snapshot `n` (`AT (VERSION => n)`), only what
     narrows it to a key: its input, its `env` (the hash of its dtype env and
     gpu the lake already keeps), its phase, its id, its batch and whether it
@@ -488,21 +482,34 @@ class Selection:
     #: Bytes a held table takes per measurement (DuckDB's in-memory table).
     ROW_BYTES = 72
 
+    _TABLE_SERIALS: "weakref.WeakKeyDictionary[Any, int]" = (
+        weakref.WeakKeyDictionary())
+    _TABLE_SERIALS_LOCK = threading.Lock()
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._built = 0
         # per lake: [snapshot, name, readers] of the current table, and the
         # retired ones still read: {name: readers}.
         self._current: "weakref.WeakKeyDictionary[Lake, list]" = weakref.WeakKeyDictionary()
         self._retired: "weakref.WeakKeyDictionary[Lake, dict]" = weakref.WeakKeyDictionary()
+
+    @classmethod
+    def _table_name(cls, lake: Lake, snapshot: int) -> str:
+        """A table name unique across every Selection using this connection."""
+        with cls._TABLE_SERIALS_LOCK:
+            # A copied Lake handle can share one DuckDB connection; names
+            # belong to that connection, not to the Python wrapper.
+            owner = lake._con
+            serial = cls._TABLE_SERIALS.get(owner, 0) + 1
+            cls._TABLE_SERIALS[owner] = serial
+        return f"sel_{int(snapshot)}_{serial}"
 
     def _build(self, lake: Lake, snapshot: int) -> Optional[str]:
         rows = lake.read("SELECT count(*) AS n FROM lake.measurements AT (VERSION => ?)",
                          [snapshot])[0]["n"]
         if rows * self.ROW_BYTES > lake.selection_bytes:
             return None
-        self._built += 1
-        name = f"sel_{int(snapshot)}_{self._built}"
+        name = self._table_name(lake, snapshot)
         lake.transact(lambda cur: cur.execute(
             f"CREATE TABLE {name} AS SELECT m.input_id, m.env, m.phase, m.id, m.batch_id, "
             f"{WITHIN_PEAK} AS within_peak FROM lake.measurements m AT (VERSION => ?)",
@@ -582,7 +589,7 @@ def _select(lake: Lake, records: list, owner: Optional[str], snapshot: int,
 
 
 def lookup(lake: Lake, keys: Sequence[Mapping[str, str]], *, owner: Optional[str],
-           snapshot: int, verdicts: Verdicts, selection: Selection,
+           snapshot: int, selection: Selection,
            stats: Optional[LookupStats] = None, cells: Optional[Cells] = None) -> dict:
     """The candidate rows of each key at `snapshot` (module docstring):
     `{columns, values, rows: [[[value index…] per row] per key],
@@ -599,8 +606,8 @@ def lookup(lake: Lake, keys: Sequence[Mapping[str, str]], *, owner: Optional[str
     if not records:
         return {"columns": list(COLUMNS), "values": [], "rows": out, "excluded_mine": 0}
     # Which rows: ids and origin (`Selection`, or the pinned query) — the
-    # wide columns come from the held rows (`Verdicts`), then the cells file
-    # (`Cells`), read from the lake only for rows neither holds.
+    # wide columns come from the cells file (`Cells`), read from the lake
+    # only for rows it does not hold.
     with selection.use(lake, snapshot) as table:
         found = _select(lake, records, owner, snapshot, table)
     per_key = [0] * len(keys)
@@ -613,19 +620,19 @@ def lookup(lake: Lake, keys: Sequence[Mapping[str, str]], *, owner: Optional[str
         raise TooManyRows(
             f"{len(found)} candidate rows for {len(keys)} keys, over the lookup's "
             f"bound of {MAX_ROWS}: ask fewer keys")
-    entries = _entries(lake, found, snapshot, verdicts, cells)
+    entries = _entries(lake, found, snapshot, cells)
     shared_rows: list[list[list[int]]] = [[] for _ in keys]
     mine_rows: list[list[list[int]]] = [[] for _ in keys]
     excluded = 0
     values: dict[str, int] = {}
 
     def cells_of(entry: tuple, origin: str) -> list[int]:
-        return [values.setdefault(v, len(values)) for v in (*entry[0], origin)]
+        return [values.setdefault(v, len(values)) for v in (*entry, origin)]
     for r in found:
         entry = entries[r["id"]]
         key = records[r["idx"]]
         # The text equality the hash narrowed to (the row's own cells).
-        if (entry[0][_DTYPE], entry[0][_GPU], entry[0][_PHASE]) != (
+        if (entry[_DTYPE], entry[_GPU], entry[_PHASE]) != (
                 key["dtype_env_json"], key["gpu"], key["phase"]):
             continue
         if r["shared"]:
@@ -643,11 +650,11 @@ def owner_report(lake: Lake, owner: str, *, snapshot: int, verdicts: Verdicts) -
     calibrate their estimates (`rows_used`), how many are valid but record
     an outcome rather than a measurement (`rows_not_measured`: an OOM or a
     failed attempt — the lookup sends them, the estimate's registry skips
-    them, `op_calibration._index_row`), and how many the current validator
-    refuses, why (the first `_REJECTIONS_KEPT` rows and distinct reasons) —
-    the same gate the lookup applies to them."""
+    them, `op_calibration._index_row`) — and how many the current validator
+    refuses, why (the first `_REJECTIONS_KEPT` rows and distinct reasons).
+    This page owns its validator verdicts; it never borrows lookup cells,
+    because lookup intentionally trusts the migrated lake."""
     gate = _Gate()
-    outcome_at = ROW_COLUMNS.index("outcome")
     used = not_measured = rejected = 0
     first: list[dict] = []
     reasons: dict[str, int] = {}
@@ -656,11 +663,12 @@ def owner_report(lake: Lake, owner: str, *, snapshot: int, verdicts: Verdicts) -
             "AT (VERSION => ?) JOIN lake.batches b AT (VERSION => ?) "
             "ON b.batch_id = m.batch_id WHERE b.owner = ?::UUID ORDER BY m.id",
             [snapshot, snapshot, owner]):
-        entry = verdicts.get(r["id"]) or verdicts.put(
-            r["id"], {c: _cell(r[c]) for c in _benchmarks.ALL_COLUMNS})
-        why = gate.reason(r["id"], entry)
+        cells = {c: _cell(r[c]) for c in ROW_COLUMNS}
+        why = verdicts.of(lake, snapshot, r["id"],
+                          {c: _cell(r[c]) for c in _benchmarks.ALL_COLUMNS})
+        why = gate.reason(r["id"], (tuple(cells[c] for c in ROW_COLUMNS), why))
         if why is None:
-            if _benchmarks.is_measurement({"outcome": entry[0][outcome_at]}):
+            if _benchmarks.is_measurement({"outcome": cells["outcome"]}):
                 used += 1
             else:
                 not_measured += 1

@@ -86,12 +86,25 @@ def test_the_held_table_answers_as_the_pinned_query(lake, annotate, make_rows, n
     unheld = _limited(lake, 0)
     for owner in (None, alice):
         for snap in (s2, s1):
-            a = LK.lookup(lake, keys, owner=owner, snapshot=snap, verdicts=LK.Verdicts(),
+            a = LK.lookup(lake, keys, owner=owner, snapshot=snap,
                           selection=held)
-            b = LK.lookup(unheld, keys, owner=owner, snapshot=snap, verdicts=LK.Verdicts(),
+            b = LK.lookup(unheld, keys, owner=owner, snapshot=snap,
                           selection=pinned)
             assert a == b and a["rows"] != [[], [], []]
     assert len(_tables(lake)) == 1 and pinned._current[unheld][1] is None
+
+
+def test_two_selections_on_one_lake_get_distinct_table_names(
+        lake, annotate, make_rows, new_owner):
+    owner = new_owner()
+    snap = _upload(lake, annotate, owner, make_rows(1), status="shared")
+    first, second = LK.Selection(), LK.Selection()
+    # A copied handle is still the same DuckDB connection and name space.
+    same_connection = _limited(lake, lake.selection_bytes)
+    with first.use(lake, snap) as one, second.use(same_connection, snap) as two:
+        assert one is not None and two is not None and one != two
+        assert lake.read(f"SELECT count(*) AS n FROM {one}")[0]["n"] == 1
+        assert lake.read(f"SELECT count(*) AS n FROM {two}")[0]["n"] == 1
 
 
 def test_a_table_is_never_dropped_under_its_reader(lake, annotate, make_rows, new_owner):
@@ -152,7 +165,7 @@ def test_concurrent_lookups_at_moving_snapshots_never_fail(lake, annotate, make_
         try:
             for _ in range(5):
                 out = LK.lookup(lake, keys, owner=None, snapshot=snap,
-                                verdicts=LK.Verdicts(), selection=sel)
+                                selection=sel)
                 assert sum(map(len, out["rows"])) == snaps.index(snap) + 1
         except Exception as e:
             errors.append(e)

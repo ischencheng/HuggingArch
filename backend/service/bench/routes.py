@@ -98,7 +98,7 @@ _DELETE_IDS_MAX = 5000
 
 #: The snapshot the shared rows last changed at (`lookup.SharedRevision`).
 shared_revision = _lookup.SharedRevision()
-#: Each row's verdict under this process's validator (`lookup.Verdicts`).
+#: Validator verdicts for owner calibration, keyed by row content.
 verdicts = _lookup.Verdicts()
 #: What a lookup selects from, per pinned snapshot (`lookup.Selection`).
 selection = _lookup.Selection()
@@ -844,7 +844,7 @@ def bench_lookup(body: LookupBody):
     keys = [dict(k) for k in body.keys]
     started = time.perf_counter()
     try:
-        out = _lookup.lookup(lake, keys, owner=owner, snapshot=snapshot, verdicts=verdicts,
+        out = _lookup.lookup(lake, keys, owner=owner, snapshot=snapshot,
                              selection=selection, stats=lookup_stats, cells=cells)
     except _lookup.TooManyRows as e:
         raise HTTPException(status_code=503, detail=str(e)) from None

@@ -855,7 +855,7 @@ estimate never reads stays in the lake.
 | Keys per lookup (`lookup.MAX_KEYS`) | 20,000 | Request refused. |
 | Candidate rows per answer (`lookup.MAX_ROWS`) | 50,000 | 503 before any wide column is read; never truncated, since a partial candidate set would change what an estimate picks. |
 | In-memory selection table (`BENCH_LAKE_SELECTION_LIMIT`, a share of `BENCH_LAKE_MEMORY_LIMIT`) | default 32 MiB (~460k rows at ~72 B a row) | Above it, or at an older pin, the service runs the exact pinned query over the lake's files instead. |
-| Row cells held by the service (`Verdicts`) | 120,000 rows | Lookup's cells are remembered by id; owner calibration computes validator verdicts. |
+| Validator verdicts held by the service (`Verdicts`) | 120,000 row-content keys | Owner calibration only; lookup does not put cells or unvalidated “valid” marks here. |
 | Lookup cells file (`lookup.Cells`, `<cache dir>/lookup_cells.duckdb`) | every row's `ROW_COLUMNS` at one snapshot (4.28M rows: ~230 MB on disk, rebuilt in ~5–10 s) | Rows not held in memory are read from it when it holds the lookup's snapshot, its content identity and the current columns; otherwise from the lake's files. It follows the lake by DuckLake's change feed, woken by any lookup that finds it behind. |
 | Rows held per client process (`measure.lookup.ROWS_KEPT`) | 50,000 rows | Evicted keys are asked again. |
 | Client timeout (`lookup_timeout`) | 5 s + 2 ms per key sent | A slower answer is a failure (§7.3). |
