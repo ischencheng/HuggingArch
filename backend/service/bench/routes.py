@@ -106,12 +106,13 @@ selection = _lookup.Selection()
 lookup_stats = _lookup.LookupStats()
 
 
-def _serving_started(lake: _lake_mod.Lake, backup) -> None:
+def _serving_started(lake: _lake_mod.Lake, backup, *, read_only: bool = False) -> None:
     """Once the lake serves: the shared rows' revision starts at the
     snapshot now; the maintainer (lake maintenance; a backup every cycle)
     starts."""
     shared_revision.current(lake)
-    _maintain.start(lake, backup)
+    if not read_only:
+        _maintain.start(lake, backup)
 
 
 gate = _serving.Gate(annotate=row_annotations, on_serving=_serving_started)

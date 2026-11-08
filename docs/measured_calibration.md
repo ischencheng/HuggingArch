@@ -348,7 +348,7 @@ The lake stores four tables and nothing derived (`store.py`):
 | `batches` | One row per upload: `batch_id`, `owner`, `upload_id`, `piece`, `run_id`, `label`, `created_at`, `status` (§6.1), `within_peak`, `nominated_at`, `decided_at`, `decided_by`. Unique on `(owner, upload_id, piece)`. |
 | `inputs` | An input's identity only: `input_id` and the key `(op, phase, kernel_impl, shape_json)`. |
 | `measurements` | Every CSV column (`benchmarks.ALL_COLUMNS`, typed by `store.MEASUREMENT_TYPES`) plus `id` (UUID), `batch_id`, `input_id`, `env`, `created_at`. Written sorted by `(batch_id, input_id)`. |
-| `lake_meta` | The lake's own facts: `lake_id` (a UUID written when the lake is created), `import_state`, `lease_claimed_at`, `data_rules` and the last data-rules migration's report. |
+| `lake_meta` | The lake's own facts: `lake_id` (a UUID written when the lake is created), `lake_role` (`authority` or `development`), `import_state`, `supersedes_lake_id` on a replacement, `data_rules`, and the last data-rules migration's report. |
 
 Ids are hashes of the identities they name, not counters
 (`md5_number_upper` over the identity's fields joined by `0x1F`), so two
@@ -441,7 +441,7 @@ refuses one not owned by the process user or granting any group or other
 permission. The container entrypoint creates `bench_lake` root-owned with
 mode 0700 and chowns only the agent's own directories (§8.1).
 
-### 4.6 The lease: one authoritative lake
+### 4.6 The lease: one authoritative, writable lake
 
 A Supabase table `public.bench_lake_lease` (one row: `lake_id`, `machine`,
 `claimed_at`) records which lake is authoritative, through the functions
@@ -458,7 +458,66 @@ it with its `lake_id` and machine id (`FLY_MACHINE_ID`, or
 An unreachable lease fails closed and is retried. A brand-new, empty lake is
 refused when the lease already names a lake: an empty volume is restored
 from backup, never started afresh. `BENCH_LAKE_LEASE=off` disables the lease
-for development and tests only.
+for development and tests only — and it never turns a copy of an identified
+lake into a second writable history:
+
+- a lake created or claimed with the lease has `lake_role=authority`;
+- a lake created without the lease has `lake_role=development` and its own
+  UUID, and can never later claim the production lease;
+- an existing unleased lake that does not say `development` (including a
+  backup restored before `lake_role` existed) serves **reads only**; `writer`
+  refuses, startup runs no data migration, maintenance and backups do not
+  write, and `/health` reports `read_only: true`.
+
+Thus `lake_id` names one lineage. Caches may key on it without adding a
+second content identity: two copies at one `lake_id` may exist for disaster
+recovery, but only the lease holder can write one.
+
+#### Replacing the authoritative lake
+
+Never upload a copied lake under its old `lake_id`. Build a replacement in a
+separate directory, give it a new lineage, upload that directory, then move
+the lease in one operator action:
+
+```bash
+# 1. From a pristine copy (never the live authority), make a new candidate.
+PYTHONPATH=. .venv/bin/python tools/reidentify_authoritative_lake.py \
+  --source-catalog /scratch1/newlake/catalog.ducklake \
+  --source-data /scratch1/newlake/data \
+  --destination /scratch1/lake-v3-candidate \
+  --migrate
+
+# 2. Apply the operator-only lease migration once (migration 0027).
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 \
+  -f supabase/migrations/0027_bench_lake_transfer_lineage.sql
+
+# 3. Publish the candidate as its own backup generation (credentials elided).
+BENCH_LAKE_CATALOG=/scratch1/lake-v3-candidate/catalog.ducklake \
+BENCH_LAKE_DATA=/scratch1/lake-v3-candidate/data \
+BENCH_LAKE_BACKUP_DATA=s3://bench-lake-backup/lake-v3 \
+BENCH_LAKE_BACKUP_S3_ENDPOINT=... BENCH_LAKE_BACKUP_S3_REGION=... \
+BENCH_LAKE_BACKUP_S3_KEY=... BENCH_LAKE_BACKUP_S3_SECRET=... \
+  .venv/bin/python scripts/bench_lake_backup_now.py
+```
+
+Restore that **new generation/prefix** into an empty production volume
+(`BENCH_LAKE_BACKUP_DATA=s3://bench-lake-backup/lake-v3` and
+`HUGGINGARCH_BENCH_RESTORE=on`). Stop the old writer first. Then, with the
+old lease's `lake_id`/machine and the candidate's new `lake_id`/machine, use
+the four-argument `bench_lake_transfer`: it changes both the machine and the
+lake lineage only when the old holder matches:
+
+```sql
+SELECT public.bench_lake_transfer(
+  '<old-machine>', '<new-machine>',
+  '<old-lake-id>'::uuid, '<new-lake-id>'::uuid);
+```
+
+Start the new service and confirm `/health` reports the new `lake_id`,
+`read_only: false`, and current data rules. The old volume and old backup
+generation are rollback artifacts, not writable peers. The two-argument
+`bench_lake_transfer(old_machine, new_machine)` remains for moving the same
+lineage between machines.
 
 ### 4.7 Backup and restore
 
@@ -924,7 +983,11 @@ prints the exports the API, workers, warm and service need, `run` execs the
 service with the `BENCH_LAKE_*` settings from `.env`, and `pid` / `health`
 report its state. A local lake uses a file catalog in a local directory,
 usually with `BENCH_LAKE_LEASE=off` and `BENCH_LAKE_BACKUP=off` (or a local
-backup directory).
+backup directory). A fresh local lake is created as `lake_role=development`
+with its own UUID and may write. Restoring an authoritative backup locally is
+for reads and debugging: without the lease it stays read-only even when
+`BENCH_LAKE_LEASE=off`. Never change that copy's `lake_id` by hand; build a
+new development lake instead.
 
 ---
 
@@ -948,6 +1011,7 @@ backup directory).
 | Batch pages | `backend/service/bench/sets.py` |
 | Estimate lookup (service side) | `backend/service/bench/lookup.py` |
 | Startup gate, lease, restore | `backend/service/bench/serving.py` |
+| Replacement lake lineage | `tools/reidentify_authoritative_lake.py`, `supabase/migrations/0027_bench_lake_transfer_lineage.sql` |
 | Backup and restore | `backend/service/bench/backup.py`, `scripts/bench_lake_backup_now.py` |
 | Maintainer | `backend/service/bench/maintain.py` |
 | Annotation rules, kernel catalog, `rules_rev` | `backend/service/bench/annotations.py` |
