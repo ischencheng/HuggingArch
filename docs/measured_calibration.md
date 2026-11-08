@@ -856,8 +856,19 @@ estimate never reads stays in the lake.
 | Candidate rows per answer (`lookup.MAX_ROWS`) | 50,000 | 503 before any wide column is read; never truncated, since a partial candidate set would change what an estimate picks. |
 | In-memory selection table (`BENCH_LAKE_SELECTION_LIMIT`, a share of `BENCH_LAKE_MEMORY_LIMIT`) | default 32 MiB (~460k rows at ~72 B a row) | Above it, or at an older pin, the service runs the exact pinned query over the lake's files instead. |
 | Row cells held by the service (`Verdicts`) | 120,000 rows | Lookup's cells are remembered by id; owner calibration computes validator verdicts. |
+| Lookup cells file (`lookup.Cells`, `<cache dir>/lookup_cells.duckdb`) | every row's `ROW_COLUMNS` at one snapshot (4.28M rows: ~230 MB on disk, rebuilt in ~5–10 s) | Rows not held in memory are read from it when it holds the lookup's snapshot, its content identity and the current columns; otherwise from the lake's files. It follows the lake by DuckLake's change feed, woken by any lookup that finds it behind. |
 | Rows held per client process (`measure.lookup.ROWS_KEPT`) | 50,000 rows | Evicted keys are asked again. |
 | Client timeout (`lookup_timeout`) | 5 s + 2 ms per key sent | A slower answer is a failure (§7.3). |
+
+**Cold reads.** A cold lookup's rows are a random point set over the lake
+(row and input ids are hashes), so reading their wide cells from parquet
+scans every data file; reordering files cannot help. The service therefore
+keeps the cells it sends as one native DuckDB table (`lookup.Cells`) scoped to
+a snapshot and its content: at 4.28M rows a cold 5,000-key lookup went from
+2.6–2.8 s to 1.0–1.1 s, and the slowest of 8 concurrent 2,000-key lookups from
+8.0 s to 3.5–3.8 s. Narrowing candidates before the wide read was measured and
+not built: per key, 3.1 rows arrive and 3.07 survive the client's
+one-row-per-implementation dedup, so it saves about 1%.
 
 **Held rows.** Each process (the API and each compute worker) keeps the rows
 of the keys it has looked up, keyed by the scope's cache identity and the

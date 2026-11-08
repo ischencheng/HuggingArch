@@ -42,12 +42,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import threading
 import weakref
 from collections import OrderedDict
 from contextlib import contextmanager
 from typing import Any, Iterator, Mapping, Optional, Sequence
+
+import duckdb
 
 from backend.inference import benchmarks as _benchmarks
 from backend.inference.op_calibration import ROW_COLUMNS
@@ -172,8 +175,9 @@ class Verdicts:
 
     def put(self, row_id: str, cells: Mapping[str, str], *,
             validate: bool = True) -> tuple:
-        """Hold a row read from the lake (all its cells, `ALL_COLUMNS`): the
-        cells a lookup sends, and its verdict when the caller asked for one."""
+        """Hold a row's cells: the ones a lookup sends (`ROW_COLUMNS`), and its
+        verdict when the caller asked for one (then `cells` is the whole row,
+        `ALL_COLUMNS`, which the validator reads)."""
         why = None
         if validate:
             try:
@@ -219,12 +223,211 @@ class _Gate:
         return None
 
 
+_ROW_CELLS = ", ".join(_q(c) for c in ROW_COLUMNS)
+_SENT = ", ".join(f"m.{_q(c)}" for c in ROW_COLUMNS)
+
+
+class Cells:
+    """The cells a lookup sends (`ROW_COLUMNS`) of every measurement at one
+    snapshot, by row id, in a DuckDB file in the lake's local cache
+    directory (`path`: BENCH_LAKE_CACHE, else `<lake dir>/tmp`, root-only),
+    attached to the lake's instance (its memory limit, threads, spill) as
+    `ALIAS`. DuckDB locks the file against a second process.
+
+    Why: a cold lookup's rows are a random point set over the lake (row and
+    input ids are hashes), so reading their cells from the lake's parquet
+    scans every data file's wide columns — most of a cold lookup, and two
+    concurrent lookups hold both read slots for it. The same cells as one
+    native table answer a 15,000-row read by a scan of one compressed table
+    (docs/measured_calibration.md §7.2).
+
+    What it holds, and when it answers. `rows` (id, then `ROW_COLUMNS` in the
+    lake's own types) and one `meta` row naming what `rows` is: the lake
+    snapshot, that snapshot's content identity (`Lake.content_id`) and the
+    columns. A read answers only when all three equal the lookup's — pinned
+    snapshot, its content now, this code's `ROW_COLUMNS` — checked in the
+    same statement that reads the rows, so a refresh committing meanwhile is
+    seen whole or not at all. Anything else (a moved snapshot, a restored or
+    diverged copy, a column added, no file yet) answers nothing and the
+    lookup reads the lake, exactly as without it: the file is a faster
+    route to the same cells, never a second source of them.
+
+    Following the lake (`refresh`): to the lake's current snapshot, by the
+    lake's own change feed (`ducklake_table_changes`) from the snapshot it
+    holds when that is this lake's history — the snapshot this process last
+    brought it to, or one whose content identity still matches — else
+    rebuilt whole (4.28M rows: ~10 s, ~230 MB on disk). A lookup that finds
+    it behind pokes the follower thread (`follow`), so it moves with every
+    write and maintenance commit without either knowing it exists."""
+
+    ALIAS = "lookup_cells"
+
+    @staticmethod
+    def path(lake: Lake) -> str:
+        return os.path.join(lake.config.spill_dir, "lookup_cells.duckdb")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # per lake: the snapshot this process last brought the file to, and
+        # the follower's wake-up (None until `follow`).
+        self._at: "weakref.WeakKeyDictionary[Lake, int]" = weakref.WeakKeyDictionary()
+        self._wake: "weakref.WeakKeyDictionary[Lake, threading.Event]" = \
+            weakref.WeakKeyDictionary()
+        self._ready: "weakref.WeakSet[Lake]" = weakref.WeakSet()
+
+    def _attach(self, lake: Lake) -> None:
+        if lake in self._ready:
+            return
+        a = self.ALIAS
+        path = self.path(lake).replace("'", "''")
+
+        def attach(cur: Any) -> None:
+            cur.execute(f"ATTACH IF NOT EXISTS '{path}' AS {a}")
+            cur.execute(f"CREATE TABLE IF NOT EXISTS {a}.meta (snapshot BIGINT, "
+                        "content VARCHAR, columns VARCHAR)")
+        lake.transact(attach)
+        self._ready.add(lake)
+
+    @staticmethod
+    def _columns() -> str:
+        return ",".join(ROW_COLUMNS)
+
+    def read(self, lake: Lake, ids: Sequence[str], snapshot: int) -> dict[str, dict]:
+        """The cells of `ids` at `snapshot` the file holds: every one of them
+        when it holds `snapshot`, none otherwise (then the follower is
+        poked)."""
+        if not ids:
+            return {}
+        try:
+            self._attach(lake)
+        except duckdb.Error:
+            _LOG.warning("Kernel Bench lookup cells: %s cannot be attached; lookups "
+                         "read the lake", self.path(lake), exc_info=True)
+            return {}
+        try:
+            a = self.ALIAS
+            # Ids are the lake's own UUID text (`_select`); literals let the
+            # scan filter by them (a joined list is planned as a hash join
+            # over the whole table, several times slower).
+            rows = lake.read(
+                f"SELECT r.id::VARCHAR AS id, {', '.join(f'r.{_q(c)}' for c in ROW_COLUMNS)} "
+                f"FROM {a}.rows r, {a}.meta m WHERE m.snapshot = ? AND m.content = ? "
+                f"AND m.columns = ? AND r.id IN ({','.join(repr(str(i)) for i in ids)})",
+                [snapshot, lake.content_id(snapshot), self._columns()])
+        except duckdb.CatalogException:          # no `rows` yet: never built
+            rows = []
+        if len(rows) < len(ids):
+            self.poke(lake)
+        return {r["id"]: r for r in rows}
+
+    def poke(self, lake: Lake) -> None:
+        """Wake the follower (`follow`) to bring the file to the lake's
+        snapshot; nothing when none follows this lake."""
+        wake = self._wake.get(lake)
+        if wake is not None:
+            wake.set()
+
+    def follow(self, lake: Lake) -> None:
+        """Keep the file at the lake's snapshot from a daemon thread: one
+        refresh now, then one per poke (pokes during a refresh coalesce); a
+        failed refresh is logged and tried again on the next poke."""
+        if lake in self._wake:
+            return
+        wake = self._wake[lake] = threading.Event()
+        ref = weakref.ref(lake)
+
+        def run() -> None:
+            while wake.wait():
+                wake.clear()
+                lk = ref()
+                if lk is None:
+                    return
+                try:
+                    self.refresh(lk)
+                except Exception:
+                    _LOG.exception("Kernel Bench lookup cells: refresh failed; "
+                                   "lookups read the lake until the next one")
+                del lk
+        wake.set()
+        threading.Thread(target=run, name="bench-lookup-cells", daemon=True).start()
+
+    def refresh(self, lake: Lake) -> dict:
+        """Bring the file to the lake's current snapshot: `{snapshot, how,
+        rows}` — how `current` (nothing to do), `changes` (the change feed
+        since the snapshot held applied) or `rebuilt`."""
+        with self._lock:
+            self._attach(lake)
+            a = self.ALIAS
+            target = lake.snapshot_id()
+            content = lake.content_id(target)
+            meta = lake.read(f"SELECT snapshot, content, columns FROM {a}.meta")
+            held = meta[0] if meta else None
+            if held is not None and (held["snapshot"], held["content"], held["columns"]) == (
+                    target, content, self._columns()):
+                return {"snapshot": target, "how": "current", "rows": 0}
+            lake.require_free("refreshing the lookup's cells")
+            own = (held is not None and held["columns"] == self._columns()
+                   and held["snapshot"] <= target
+                   and (self._at.get(lake) == held["snapshot"]
+                        or held["content"] == lake.content_id(held["snapshot"])))
+            how, rows = "rebuilt", 0
+            if own:
+                try:
+                    rows = lake.transact(lambda cur: self._apply_changes(
+                        cur, held["snapshot"], target, content))
+                    how = "changes"
+                except duckdb.Error:
+                    _LOG.warning("Kernel Bench lookup cells: the change feed from snapshot "
+                                 "%s cannot be applied; rebuilding", held["snapshot"],
+                                 exc_info=True)
+                    own = False
+            if not own:
+                rows = lake.transact(lambda cur: self._rebuild(cur, target, content))
+            self._at[lake] = target
+            _LOG.info("Kernel Bench lookup cells at snapshot %d: %s (%d rows)",
+                      target, how, rows)
+            return {"snapshot": target, "how": how, "rows": rows}
+
+    def _set_meta(self, cur: Any, snapshot: int, content: str) -> None:
+        a = self.ALIAS
+        cur.execute(f"DELETE FROM {a}.meta")
+        cur.execute(f"INSERT INTO {a}.meta VALUES (?, ?, ?)",
+                    [snapshot, content, self._columns()])
+
+    def _rebuild(self, cur: Any, snapshot: int, content: str) -> int:
+        a = self.ALIAS
+        cur.execute(f"CREATE OR REPLACE TABLE {a}.rows AS SELECT m.id, {_SENT} "
+                    "FROM lake.measurements m AT (VERSION => ?)", [snapshot])
+        self._set_meta(cur, snapshot, content)
+        return cur.execute(f"SELECT count(*) FROM {a}.rows").fetchone()[0]
+
+    def _apply_changes(self, cur: Any, held: int, target: int, content: str) -> int:
+        """The change feed (held, target] applied: each changed id's last
+        change decides — present with its cells after an insert or an
+        update's post-image, absent after a delete."""
+        a = self.ALIAS
+        cur.execute(
+            f"CREATE OR REPLACE TABLE {a}.changes AS SELECT m.change_type, m.id, {_SENT} "
+            "FROM ducklake_table_changes('lake', 'main', 'measurements', ?, ?) m "
+            "QUALIFY row_number() OVER (PARTITION BY m.id ORDER BY m.snapshot_id DESC, "
+            "m.change_type IN ('insert', 'update_postimage') DESC) = 1",
+            [held + 1, target])
+        cur.execute(f"DELETE FROM {a}.rows WHERE id IN (SELECT id FROM {a}.changes)")
+        cur.execute(f"INSERT INTO {a}.rows SELECT id, {_ROW_CELLS} FROM {a}.changes "
+                    "WHERE change_type IN ('insert', 'update_postimage')")
+        n = cur.execute(f"SELECT count(*) FROM {a}.changes").fetchone()[0]
+        cur.execute(f"DROP TABLE {a}.changes")
+        self._set_meta(cur, target, content)
+        return n
+
+
 def _entries(lake: Lake, found: Sequence[Mapping[str, Any]], snapshot: int,
-             verdicts: Verdicts) -> dict:
-    """Every selected row as a held entry, reading the lake's wide columns
-    (at `snapshot`) only for the rows not held. The read is narrowed by the
-    rows' inputs as literals, which prune the lake's files by their input
-    ranges; a row-id list does not (it scanned every wide column)."""
+             verdicts: Verdicts, cells: Optional[Cells] = None) -> dict:
+    """Every selected row as a held entry: from the held rows (`verdicts`),
+    then the lookup's cells file (`Cells`) when it holds `snapshot`, then the
+    lake's columns at `snapshot` for the rest. The lake read is narrowed by
+    the rows' inputs as literals, which prune the lake's files by their
+    input ranges; a row-id list does not (it scanned every wide column)."""
     out = {}
     missing: dict[str, int] = {}
     for r in found:
@@ -236,15 +439,19 @@ def _entries(lake: Lake, found: Sequence[Mapping[str, Any]], snapshot: int,
             missing[row_id] = int(r["input_id"])
         else:
             out[row_id] = got
+    if missing and cells is not None:
+        for row_id, r in cells.read(lake, list(missing), snapshot).items():
+            out[row_id] = verdicts.put(row_id, {c: _cell(r[c]) for c in ROW_COLUMNS},
+                                       validate=False)
+            del missing[row_id]
     if missing:
         inputs = ",".join(str(i) for i in sorted(set(missing.values())))
         for r in lake.read(
-                f"SELECT {_CELLS}, m.id::VARCHAR AS id FROM lake.measurements m "
+                f"SELECT {_SENT}, m.id::VARCHAR AS id FROM lake.measurements m "
                 f"AT (VERSION => ?) WHERE m.input_id IN ({inputs})", [snapshot]):
             if r["id"] in missing:
                 out[r["id"]] = verdicts.put(
-                    r["id"], {c: _cell(r[c]) for c in _benchmarks.ALL_COLUMNS},
-                    validate=False)
+                    r["id"], {c: _cell(r[c]) for c in ROW_COLUMNS}, validate=False)
     return out
 
 
@@ -276,7 +483,7 @@ class Selection:
       the snapshot); the local lake's 71k rows ~5 MB. Holding it saves
       the selection's scan of the lake's files — ~0.2 s of a 5,000-key
       lookup at 4.28M rows — not the wide read of the rows not yet held
-      (`_entries`), which is most of a cold lookup either way."""
+      (`_entries`; from `Cells` when it holds the snapshot)."""
 
     #: Bytes a held table takes per measurement (DuckDB's in-memory table).
     ROW_BYTES = 72
@@ -376,7 +583,7 @@ def _select(lake: Lake, records: list, owner: Optional[str], snapshot: int,
 
 def lookup(lake: Lake, keys: Sequence[Mapping[str, str]], *, owner: Optional[str],
            snapshot: int, verdicts: Verdicts, selection: Selection,
-           stats: Optional[LookupStats] = None) -> dict:
+           stats: Optional[LookupStats] = None, cells: Optional[Cells] = None) -> dict:
     """The candidate rows of each key at `snapshot` (module docstring):
     `{columns, values, rows: [[[value index…] per row] per key],
     excluded_mine}` — a row's cells are indices into `values`, the distinct
@@ -392,8 +599,8 @@ def lookup(lake: Lake, keys: Sequence[Mapping[str, str]], *, owner: Optional[str
     if not records:
         return {"columns": list(COLUMNS), "values": [], "rows": out, "excluded_mine": 0}
     # Which rows: ids and origin (`Selection`, or the pinned query) — the
-    # wide columns come from the held rows (`Verdicts`), read from the lake
-    # only for rows not held yet.
+    # wide columns come from the held rows (`Verdicts`), then the cells file
+    # (`Cells`), read from the lake only for rows neither holds.
     with selection.use(lake, snapshot) as table:
         found = _select(lake, records, owner, snapshot, table)
     per_key = [0] * len(keys)
@@ -406,7 +613,7 @@ def lookup(lake: Lake, keys: Sequence[Mapping[str, str]], *, owner: Optional[str
         raise TooManyRows(
             f"{len(found)} candidate rows for {len(keys)} keys, over the lookup's "
             f"bound of {MAX_ROWS}: ask fewer keys")
-    entries = _entries(lake, found, snapshot, verdicts)
+    entries = _entries(lake, found, snapshot, verdicts, cells)
     shared_rows: list[list[list[int]]] = [[] for _ in keys]
     mine_rows: list[list[list[int]]] = [[] for _ in keys]
     excluded = 0

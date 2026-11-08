@@ -102,15 +102,18 @@ shared_revision = _lookup.SharedRevision()
 verdicts = _lookup.Verdicts()
 #: What a lookup selects from, per pinned snapshot (`lookup.Selection`).
 selection = _lookup.Selection()
+#: The cells lookups send, persisted beside the lake (`lookup.Cells`).
+cells = _lookup.Cells()
 #: What lookups have answered, for /health (`lookup.LookupStats`).
 lookup_stats = _lookup.LookupStats()
 
 
 def _serving_started(lake: _lake_mod.Lake, backup, *, read_only: bool = False) -> None:
     """Once the lake serves: the shared rows' revision starts at the
-    snapshot now; the maintainer (lake maintenance; a backup every cycle)
-    starts."""
+    snapshot now; the lookup's cells file follows the lake; the maintainer
+    (lake maintenance; a backup every cycle) starts."""
     shared_revision.current(lake)
+    cells.follow(lake)
     if not read_only:
         _maintain.start(lake, backup)
 
@@ -842,7 +845,7 @@ def bench_lookup(body: LookupBody):
     started = time.perf_counter()
     try:
         out = _lookup.lookup(lake, keys, owner=owner, snapshot=snapshot, verdicts=verdicts,
-                             selection=selection, stats=lookup_stats)
+                             selection=selection, stats=lookup_stats, cells=cells)
     except _lookup.TooManyRows as e:
         raise HTTPException(status_code=503, detail=str(e)) from None
     except duckdb.Error as e:
