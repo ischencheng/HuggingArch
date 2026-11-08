@@ -298,14 +298,20 @@ class Gate:
             self._set_data_rules(
                 "behind", lake=before,
                 phase=("degraded", f"the lake's data rules are {before}; migrating"))
+            if self.read_only:
+                reason = (f"the read-only copy's data rules are {before}, not "
+                          f"{data_rules.registered_version()}; restore a current backup "
+                          "or start the authoritative lease holder")
+                self._set_data_rules("failed", lake=before, error=reason,
+                                     phase=("degraded", reason))
+                raise _Degraded(f"the lake's data rules did not migrate: {reason}",
+                                transient=False)
         # A lake written before annotations moved to memory (docs/measured_calibration.md §4.2) still
         # has them as `inputs` columns, and an upload's insert of the key
         # alone fails against them: drop them (idempotent; after the lease,
         # like every other write).
         if self.read_only:
-            self._set_data_rules(
-                "current" if before == data_rules.registered_version() else "behind",
-                lake=before)
+            self._set_data_rules("current", lake=before)
         else:
             store.ensure_schema(lake)
             try:

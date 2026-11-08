@@ -828,7 +828,8 @@ def bench_lookup(body: LookupBody):
     """The candidate rows of each key (`lookup.lookup`), at `snapshot`:
     `{lake_id, snapshot, columns, rows: [[row cells…] per key],
     excluded_mine}`. A snapshot that cannot be read (expired) is 503, never
-    an empty answer; a shared row the validator refuses is 500."""
+    an empty answer. Row validity is the write path's and the registered
+    data-rules migration's fact, not a per-row read-path check."""
     owner = None
     if body.owner:
         try:
@@ -842,8 +843,6 @@ def bench_lookup(body: LookupBody):
     try:
         out = _lookup.lookup(lake, keys, owner=owner, snapshot=snapshot, verdicts=verdicts,
                              selection=selection, stats=lookup_stats)
-    except _lookup.InvalidSharedRow as e:
-        raise HTTPException(status_code=500, detail=str(e)) from None
     except _lookup.TooManyRows as e:
         raise HTTPException(status_code=503, detail=str(e)) from None
     except duckdb.Error as e:

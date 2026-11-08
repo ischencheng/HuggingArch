@@ -83,8 +83,8 @@ def initialize(lake: Any) -> None:
     store.set_meta(lake, data_rules=registered_version())
 
 
-def _invalid_shared_rows(lake: Any) -> tuple[int, Counter[str]]:
-    """Remove shared rows today's shared validator refuses.
+def _invalid_rows(lake: Any) -> tuple[int, Counter[str]]:
+    """Remove rows today's validator refuses.
 
     The validator is the only authority on “invalid”; this function owns no
     second list of suspicious ops or shapes.  Rows are read in bounded pages
@@ -98,7 +98,7 @@ def _invalid_shared_rows(lake: Any) -> tuple[int, Counter[str]]:
     reasons: Counter[str] = Counter()
     sql = (f"SELECT m.id::VARCHAR AS id, b.owner::VARCHAR AS owner, {cells} "
            "FROM lake.measurements m JOIN lake.batches b USING (batch_id) "
-           "WHERE b.status = 'shared'")
+           "WHERE true")
     for page in lake.read_batches(sql, batch_rows=_SCAN_ROWS):
         invalid: dict[str, list[str]] = {}
         for row in page:
@@ -115,6 +115,33 @@ def _invalid_shared_rows(lake: Any) -> tuple[int, Counter[str]]:
     return dropped, reasons
 
 
+def _duplicate_shared_rows(lake: Any) -> int:
+    """Remove later effective-shared repeats of one row identity.
+
+    Upload deduplicates within an owner, and promotion can still accept the
+    same public row from another contributor.  The read path must not carry
+    that stream check forever: a migration makes the shared corpus duplicate-
+    free once, deterministically keeping the earliest upload batch and id.
+    """
+    identity = ", ".join(f'm."{c}"' for c in benchmarks.IDENTITY_COLUMNS)
+    outcome = "coalesce(nullif(m.outcome, ''), 'measured')"
+    dropped = 0
+    query = (
+        "WITH shared AS (SELECT m.id, b.owner, row_number() OVER ("
+        f"PARTITION BY {identity}, {outcome} "
+        "ORDER BY b.created_at, b.upload_id, m.id) AS n "
+        "FROM lake.measurements m JOIN lake.batches b USING (batch_id) "
+        f"WHERE {store.SHARED_ROW}) "
+        "SELECT id::VARCHAR AS id, owner::VARCHAR AS owner FROM shared WHERE n > 1")
+    for page in lake.read_batches(query, batch_rows=_SCAN_ROWS):
+        by_owner: dict[str, list[str]] = {}
+        for row in page:
+            by_owner.setdefault(row["owner"], []).append(row["id"])
+        for owner, ids in by_owner.items():
+            dropped += store.delete_rows(lake, owner=owner, ids=ids)
+    return dropped
+
+
 def _apply_registered(step: Mapping[str, Any], lake: Any) -> MigrationResult:
     rekeyed = 0
     if step.get("rekey_plan"):
@@ -129,8 +156,13 @@ def _apply_registered(step: Mapping[str, Any], lake: Any) -> MigrationResult:
             rekeyed += int(rekey_lake.apply(
                 lake, rewrites[start:start + _REKEY_ROWS]))
     env_rekeyed = int(store.rekey_env(lake)) if step.get("rekey_env") else 0
-    dropped, reasons = (_invalid_shared_rows(lake)
-                        if step.get("validate_shared_rows") else (0, Counter()))
+    dropped, reasons = (_invalid_rows(lake)
+                        if step.get("validate_rows") else (0, Counter()))
+    if step.get("deduplicate_shared_rows"):
+        duplicates = _duplicate_shared_rows(lake)
+        dropped += duplicates
+        if duplicates:
+            reasons["duplicate shared row identity"] = duplicates
     return MigrationResult(str(step["to"]), rekeyed, env_rekeyed, dropped, reasons)
 
 

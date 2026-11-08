@@ -111,14 +111,19 @@ def _imports(path: pathlib.Path, name: str) -> set[str]:
 @lru_cache(maxsize=1)
 def rules_rev() -> str:
     """The revision of the annotation rules that decide which rows a lookup
-    key selects: a hash of the source of every repository module the rules
-    can run (the import closure of `rule_roots()`, function-level imports
-    included), the engine's shared data (`shared_data_version`: the
+    key selects and the migration owner brings an older lake to: a hash of
+    the source of every repository module the rules can run (the import
+    closure of `rule_roots()`, function-level imports included), the data
+    migration owner (`data_rules.py`), the engine's shared data
+    (`shared_data_version`: the
     migration tables `current_shape` reads among them), and the catalogs
     as loaded — every registered measurement signature and every registered
     kernel. Any edit that can change a selection moves it; computed once,
     at the start (a catalog change takes effect at the next start)."""
     seen: dict[str, pathlib.Path] = {}
+    migration_owner = _module_file("backend.service.bench.data_rules")
+    if migration_owner is not None:
+        seen["backend.service.bench.data_rules"] = migration_owner
     todo = list(rule_roots())
     while todo:
         name = todo.pop()

@@ -15,7 +15,6 @@ from fastapi.testclient import TestClient
 import tests.corpus_row as _corpus
 from backend.measure.scope import MeasurementScope
 from backend.service.bench import annotations as A
-from backend.service.bench import lake as lake_mod
 from backend.service.bench import store
 
 from ..conftest import BENCH_SECRET, as_user
@@ -183,26 +182,29 @@ class TestLookup:
         assert len(got[0]) == 1 and got[1] == []
         assert json.loads(got[0][0]["shape_json"])["d_head"] == 64
 
-    def test_an_invalid_shared_row_fails_an_invalid_owners_row_is_counted(
-            self, bench_client, bench_lake):
+    def test_the_write_path_refuses_bad_rows_and_lookup_does_not_revalidate(
+            self, bench_client, bench_lake, monkeypatch):
         old = _corpus.row(contributor="old", shape_json=json.dumps(
             {"B": 1, "H": 4, "s_ctx": 77}, sort_keys=True, separators=(",", ":")))
         good = _row(0)
         bench_client.get("/api/bench/list", headers=as_user(ALICE))       # the lake serves
-        lake = lake_mod.get_lake()
-        store.upload(lake, owner=ALICE, upload_id=str(uuid.uuid4()), run_id=None, label=None,
-                     rows=[old, good], annotate=A.row_annotations)
+        refused = bench_client.post("/api/bench/upload", headers=as_user(ALICE), json={
+            "csv_text": _corpus.to_csv([old]), "label": "old"})
+        assert refused.status_code == 422
+        assert "unknown symbol 'H'" in refused.json()["detail"]
+        _upload(bench_client, ALICE, [good])
         keys = [_key(old), _key(good)]
-        got = _lookup(bench_client, keys, owner=ALICE)
-        assert got["excluded_mine"] == 1
-        assert [len(k) for k in got["rows"]] == [0, 1]
         report = bench_client.get("/api/bench/calibration", headers=as_user(ALICE)).json()
-        assert (report["rows_used"], report["rows_rejected"]) == (1, 1)
-        assert "unknown symbol 'H'" in report["rejected_reasons"][0]["reason"]
-        store.upload(lake, owner=BOB, upload_id=str(uuid.uuid4()), run_id=None, label=None,
-                     rows=[old], annotate=A.row_annotations, status="shared", decided_by=ADMIN)
-        r = bench_client.post("/internal/bench/lookup", json={"keys": keys})
-        assert r.status_code == 500 and "fails the validator" in r.json()["detail"]
+        assert report["rows_rejected"] == 0
+        from backend.inference import benchmarks
+
+        def unreachable(_row):
+            raise AssertionError("lookup must not run the row validator")
+
+        monkeypatch.setattr(benchmarks, "validate_row", unreachable)
+        got = _lookup(bench_client, keys, owner=ALICE)
+        assert got["excluded_mine"] == 0
+        assert [len(k) for k in got["rows"]] == [0, 1]
 
     def test_bounds(self, bench_client, bench_lake):
         bench_client.get("/api/bench/list", headers=as_user(ALICE))
@@ -262,6 +264,7 @@ def test_rules_rev_covers_the_annotation_closure():
     entry points."""
     import ast
     seen = set()
+    seen.add("backend.service.bench.data_rules")
     todo = list(A.rule_roots())
     while todo:
         name = todo.pop()
@@ -271,7 +274,8 @@ def test_rules_rev_covers_the_annotation_closure():
         todo.extend(A._imports(A._module_file(name), name))
     for module in ("backend.inference.benchmark_identity", "backend.inference.op_signatures",
                    "backend.inference.op_signatures_catalog", "backend.arch.spec_migrate",
-                   "backend.service.bench.store", "kernel_bench.providers"):
+                   "backend.service.bench.store", "backend.service.bench.data_rules",
+                   "kernel_bench.providers"):
         assert module in seen, module
     assert ast and len(A.rules_rev()) == 16
 

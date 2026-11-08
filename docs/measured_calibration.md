@@ -368,8 +368,12 @@ brand-new lake is stamped with the current revision; an older lake is migrated
 after the lease is claimed and before annotations or serving. The heavy legacy
 dtype-env rewrite ships as `migrations/prod_rekey_plan.json` (the same plan
 `kernel_bench.rekey_lake` made offline), then today's validator is run over
-shared rows and rows it refuses are deleted through the owner deletion path.
-`data_rules` is written only after every registered step commits.
+the rows, refused rows are deleted through the owner deletion path, and
+effective-shared duplicate identities are reduced to their earliest row.
+`data_rules` is written only after every registered step commits. A read-only
+restored copy that is behind this revision does not serve: it cannot migrate
+itself, and its rows therefore do not yet carry the guarantee the read path
+relies on.
 
 ### 4.2 Annotations
 
@@ -385,13 +389,13 @@ them. An input the rules refuse has no `annot` entry: its rows are visible
 in row views but belong to no envelope.
 
 A change to the annotation rules or catalogs takes effect at the next
-service start. `annotations.rules_rev` names the rules' revision: a hash of the
-source of every repository module the rules can run (their import closure),
-the engine's shared data version, and the loaded signature and kernel
-catalogs. It is part of every measurement scope (§7.1).
-A key, validator, or shared-data change that can make an older lake invalid
-must add a migration (or an explicit no-op step) to the registered chain and
-regenerate `data_rules_version.json`; `test_data_rules.py` turns an
+service start. `annotations.rules_rev` names the data format's revision: a
+hash of the source of every repository module the rules can run (their import
+closure), the registered migration owner (`data_rules.py`), the engine's
+shared data version, and the loaded signature and kernel catalogs. It is part
+of every measurement scope (§7.1). A key, validator, shared-data, or migration
+change that can make an older lake invalid must extend the registered chain
+and regenerate `data_rules_version.json`; `test_data_rules.py` turns an
 unregistered edit red.
 
 ### 4.3 Writes
@@ -814,11 +818,13 @@ snapshot. One projection decides membership — the service's current
 annotations — and the client indexes each row under the key that selected
 it, never re-projecting the row's stored shape (`registry_from_lookup`).
 
-**Validation.** Every row is checked under the current validator
-(`benchmarks.RowCheck`). A shared row that fails, or repeats another shared
-row's identity, fails the lookup with 500 rather than silently dropping a
-public measurement. An owner's row that fails is left out and counted
-(`excluded_mine`), and `/api/bench/calibration` reports why.
+**Validation.** The write path validates every upload, and a validator change
+is applied to the lake by the registered data-rules migration before it serves
+(§4.1). Lookup does not re-run Python's validator for every selected row in
+every process; that defense cost about 80 µs per row and was a read-path
+duplicate of the migration owner. `/api/bench/calibration` still validates and
+explains one owner's rows on its own page. `excluded_mine` remains in the wire
+contract and is zero for a validated, migrated lake.
 
 **Wire form.** A row travels as the columns the estimator's registry reads
 (`op_calibration.ROW_COLUMNS`: the 12-column identity, the measurement,
@@ -833,7 +839,7 @@ estimate never reads stays in the lake.
 | Keys per lookup (`lookup.MAX_KEYS`) | 20,000 | Request refused. |
 | Candidate rows per answer (`lookup.MAX_ROWS`) | 50,000 | 503 before any wide column is read; never truncated, since a partial candidate set would change what an estimate picks. |
 | In-memory selection table (`Selection.BUDGET_BYTES`) | 32 MiB (~500k rows) | Above it, or at an older pin, the service runs the exact pinned query over the lake's files instead. |
-| Row verdicts held by the service (`Verdicts`) | 120,000 rows | Each row's validator verdict is remembered by id. |
+| Row cells held by the service (`Verdicts`) | 120,000 rows | Lookup's cells are remembered by id; owner calibration computes validator verdicts. |
 | Rows held per client process (`measure.lookup.ROWS_KEPT`) | 50,000 rows | Evicted keys are asked again. |
 | Client timeout (`lookup_timeout`) | 5 s + 2 ms per key sent | A slower answer is a failure (§7.3). |
 

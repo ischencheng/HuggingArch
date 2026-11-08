@@ -204,6 +204,7 @@ def test_an_unleased_copy_of_an_identified_lake_is_read_only(env, opened, make_r
     lake = opened()
     _dev_schema(lake, lake_id="11111111-1111-4111-8111-111111111111")
     store.set_meta(lake, lake_role="authority")
+    serving.data_rules.initialize(lake)
     store.annotate_all(lake, annotate)
     store.upload(lake, owner="11111111-1111-4111-8111-111111111111",
                  upload_id="22222222-2222-4222-8222-222222222222", run_id=None,
@@ -215,6 +216,20 @@ def test_an_unleased_copy_of_an_identified_lake_is_read_only(env, opened, make_r
         gate.writer()
     health = gate.health()
     assert health["state"] == "serving" and health["read_only"] is True
+
+
+def test_a_read_only_copy_behind_the_data_rules_does_not_serve_unvalidated_rows(
+        env, opened):
+    env.setenv("BENCH_LAKE_LEASE", "off")
+    lake = opened()
+    _dev_schema(lake, lake_id="11111111-1111-4111-8111-111111111111")
+    store.set_meta(lake, lake_role="authority")
+    gate = _gate(opened)
+    with pytest.raises(LakeUnavailable, match="read-only copy's data rules"):
+        gate.reader()
+    health = gate.health()
+    assert health["state"] == "degraded" and health["read_only"] is True
+    assert health["data_rules"]["state"] == "failed"
 
 
 def test_an_unleased_development_lake_has_its_own_writable_identity(env, opened):

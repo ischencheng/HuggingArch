@@ -42,6 +42,9 @@ def test_the_legacy_migration_is_idempotent_and_removes_refused_shared_rows(
     store.upload(lake, owner=owner, upload_id=str(uuid.uuid4()),
                  run_id="r", label=None, rows=rows, annotate=annotate,
                  status="shared")
+    store.upload(lake, owner=new_owner(), upload_id=str(uuid.uuid4()),
+                 run_id="r", label=None, rows=[rows[1]], annotate=annotate,
+                 status="shared")
     rows_now = lake.read("SELECT id, op FROM lake.measurements")
     kept_id = next(row["id"] for row in rows_now if row["op"] != "removed_op")
 
@@ -50,8 +53,9 @@ def test_the_legacy_migration_is_idempotent_and_removes_refused_shared_rows(
     assert result.version == data_rules.registered_version()
     assert meta["data_rules"] == data_rules.registered_version()
     assert json.loads(meta["data_rules_migration"]) == result.report()
-    assert result.dropped_shared_rows == 1
-    assert sum(result.reasons.values()) == 1
+    assert result.dropped_shared_rows == 2
+    assert result.reasons["duplicate shared row identity"] == 1
+    assert sum(result.reasons.values()) == 2
     kept = lake.read("SELECT id FROM lake.measurements ORDER BY id")
     assert [row["id"] for row in kept] == [kept_id]
     assert lake.read("SELECT count(*) AS n FROM lake.batches")[0]["n"] == 1
