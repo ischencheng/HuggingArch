@@ -80,7 +80,7 @@ def _health(lookups_answer: bool) -> dict:
 def _run(lookups_answer: bool) -> Report:
     rep = Report(out=lambda _s: None)
     groups = candidate_groups(_browse_rows())
-    assert [g[0] for g in groups] == [("m/a", "H100-SXM", 325)]
+    assert [g[0] for g in groups] == [("m/a", "H100-SXM", "", 325)]
     keys = groups[0][1]
     est = _estimate(lookups_answer)
     hits = lake_keys_in_estimate(keys, est)
@@ -131,3 +131,19 @@ def test_dtype_disagreement_is_not_a_lake_hit():
          "act_dtype": "FP8", "weight_dtype": "FP8", "output_dtype": "BF16"}]}
     assert lake_keys_in_estimate(keys, est) == []
     assert json.loads(_LM_HEAD)["B"] == 325
+
+
+def test_a_measurement_is_reproduced_under_its_own_deployment():
+    """A shared row was measured at the per-rank shape its plan's deployment
+    cut; the estimate must name that deployment, or a TP>1 row is never
+    reproduced and the gate goes red on a healthy lake."""
+    from tools.post_deploy_smoke import parallel_of
+    assert parallel_of("tp_attention=4,tp_dense_ffn=4,ep_moe=8") == {
+        "tp_attention": 4, "tp_dense_ffn": 4, "ep_moe": 8}
+    assert parallel_of("") == {}
+    groups = candidate_groups([{
+        "model": "m/a", "gpu": "H100-SXM", "phase": "decode", "outcome": "measured",
+        "parallel": "tp_attention=4", "signature": "gemm",
+        "physical_shape": '{"B":8,"d_out":1,"d_reduce":1,"s_query":1}',
+        "dtype_env_json": {"activation": "bf16"}}])
+    assert groups[0][0] == ("m/a", "H100-SXM", "tp_attention=4", 8)

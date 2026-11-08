@@ -79,10 +79,23 @@ def _dtypes_agree(env: dict, op_row: dict) -> bool:
     return True
 
 
+def parallel_of(text: Optional[str]) -> dict:
+    """A row's `parallel` cell (`tp_attention=8,ep_moe=8`) as the estimate
+    request's `parallel` mapping: the deployment that cut the measured
+    per-rank shape, which the estimate must name to reproduce it."""
+    out: dict = {}
+    for part in (text or "").split(","):
+        name, _, value = part.partition("=")
+        if name and value.isdigit():
+            out[name.strip()] = int(value)
+    return out
+
+
 def candidate_groups(rows: Iterable[dict]) -> list:
     """Shared decode measurements grouped by what an estimate request can
-    name — (model, gpu, per-rank batch `B` of the physical shape) — each with
-    its keys → dtype env. Largest groups first (more keys to hit)."""
+    name — (model, gpu, deployment, per-rank batch `B` of the physical
+    shape) — each with its keys → dtype env. Largest groups first (more keys
+    to hit)."""
     groups: dict = defaultdict(dict)
     for r in rows:
         if r.get("phase") != "decode" or r.get("outcome", "measured") != "measured":
@@ -94,7 +107,8 @@ def candidate_groups(rows: Iterable[dict]) -> list:
         b = shape.get("B") if isinstance(shape, dict) else None
         if not isinstance(b, int) or b < 1:
             continue
-        groups[(r["model"], r["gpu"], b)][row_key(r)] = r.get("dtype_env_json") or {}
+        groups[(r["model"], r["gpu"], r.get("parallel") or "", b)][row_key(r)] = (
+            r.get("dtype_env_json") or {})
     return sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))
 
 
@@ -221,15 +235,17 @@ def run_estimate(rep: Report, c: Client) -> None:
                          f"&gpu={urllib.request.quote(gpu)}&page_size=200", timeout=120)
         rows.extend((page or {}).get("items") or [])
     groups = candidate_groups(rows)
-    rep.note(f"browse: {len(rows)} shared decode rows, {len(groups)} (model, gpu, B) groups")
+    rep.note(f"browse: {len(rows)} shared decode rows, {len(groups)} (model, gpu, parallel, B) groups")
     tried = 0
-    for (model, gpu, b), keys in groups:
+    for (model, gpu, parallel, b), keys in groups:
         if tried >= MAX_ESTIMATE_TRIES:
             break
         tried += 1
-        status, est = c.call("/inference/estimate", {
-            "model_id": model, "gpu_sku": gpu, "decode_batch_size": b})
-        label = f"estimate {model} @{gpu} B={b}"
+        request = {"model_id": model, "gpu_sku": gpu, "decode_batch_size": b}
+        if parallel_of(parallel):
+            request["parallel"] = parallel_of(parallel)
+        status, est = c.call("/inference/estimate", request)
+        label = f"estimate {model} @{gpu} {parallel or 'tp1'} B={b}"
         if status != 200 or not est:
             rep.note(f"{label}: {status}, trying the next group")
             continue
