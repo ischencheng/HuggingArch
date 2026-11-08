@@ -149,6 +149,10 @@ export function PlanCard(props: {
   onPrefixLen: (v: number) => void;
   prefillChunk: number;
   onPrefillChunk: (v: number) => void;
+  /** The decode batch the estimate asks for, per GPU, as typed: "" = the
+   *  card's KV-bound max (the backend's default). */
+  decBatch: string;
+  onDecBatch: (v: string) => void;
   specMode: string;
   onSpecMode: (v: string) => void;
   specK: number;
@@ -356,6 +360,12 @@ export function PlanCard(props: {
             <input id="infer-prefill-chunk" type="number" min={0} step={256} className="w-full px-2 py-1.5 text-sm border border-gray-300 rounded"
               value={props.prefillChunk} onChange={(e) => props.onPrefillChunk(Math.max(0, Math.round(Number(e.target.value) || 0)))} />
             <div className="mt-1 text-xs text-gray-500">vLLM max_num_batched_tokens · 0 = full seq</div>
+          </div>
+          <div>
+            <label htmlFor="infer-decode-batch" className="block text-xs font-medium text-gray-600 mb-1" title="Requests one decode step carries, per GPU. The per-op breakdown prices this batch; blank = the KV-bound maximum this card fits.">Decode batch</label>
+            <input id="infer-decode-batch" type="number" min={1} step={1} placeholder="max" className="w-full px-2 py-1.5 text-sm border border-gray-300 rounded"
+              value={props.decBatch} onChange={(e) => props.onDecBatch(e.target.value)} />
+            <div className="mt-1 text-xs text-gray-500">per GPU · blank = max</div>
           </div>
           <div>
             <label htmlFor="infer-spec-mode" className="block text-xs font-medium text-gray-600 mb-1" title={SPEC_DECODE_TIP}>Speculative mode</label>

@@ -34,6 +34,8 @@ export type InferHash = {
   kv_bw: string;
   prefix_len: string;
   prefill_chunk: string;
+  /** The decode step's batch, per GPU; empty = the card's KV-bound max. */
+  dec_batch: string;
   spec_mode: string;
   spec_drafts: string;
   spec_alpha: string;
@@ -48,7 +50,7 @@ const KEYS: (keyof InferHash)[] = [
   "in_tok", "out_tok", "frac", "comm_lat", "launch_floor", "tie_tp",
   "tp_attn", "tp_ffn", "tp_moe", "ep", "cp", "pp", "dp_attn", "dp_rep", "cp_scheme", "ep_load",
   "dec", "tp_attn_d", "tp_ffn_d", "tp_moe_d", "ep_d", "cp_d", "pp_d", "dp_attn_d", "dp_rep_d", "kv_bw",
-  "prefix_len", "prefill_chunk", "spec_mode", "spec_drafts", "spec_alpha", "spec_draft", "include_aux", "host_tables",
+  "prefix_len", "prefill_chunk", "dec_batch", "spec_mode", "spec_drafts", "spec_alpha", "spec_draft", "include_aux", "host_tables",
 ];
 
 /** Keys older links carry that the page no longer writes. Read once so the

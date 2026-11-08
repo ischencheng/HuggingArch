@@ -190,6 +190,9 @@ export function Inference() {
   const [resultTab, setResultTab] = useState<"lm" | "encoder">("lm");
   const [mediaDraft, setMediaDraft] = useState<MediaDraft>({});
   const [encodeBatch, setEncodeBatch] = useState("");
+  /** The decode batch the estimate asks for, per GPU: "" = the card's
+   *  KV-bound max (the backend's default). */
+  const [decBatch, setDecBatch] = useState("");
   useEffect(() => { setMediaDraft({}); setResultTab("lm"); }, [modelId]);
   const [applyTick, setApplyTick] = useState(0);
 
@@ -208,7 +211,7 @@ export function Inference() {
     epLoadText, prefixLen, prefillChunk, specMode, specK,
     specAlpha, specDraft, includeAux, tablesOnHost, selectionMode,
     framework.trim(), calibrateMine, decodeOn, decodeOn ? decPar : null,
-    decodeOn ? kvBw : null, mediaDraft, encodeBatch, kvBlock,
+    decodeOn ? kvBw : null, mediaDraft, encodeBatch, decBatch, kvBlock,
   ]);
 
   /** The page this estimate runs at when the user has chosen none: the
@@ -339,6 +342,7 @@ export function Inference() {
     if (h.prefill_chunk != null && h.prefill_chunk !== "") {
       setPrefillChunk(Math.max(0, Math.round(Number(h.prefill_chunk)) || 0));
     }
+    if (h.dec_batch != null && h.dec_batch !== "") setDecBatch(h.dec_batch);
     if (h.spec_mode) setSpecMode(h.spec_mode);
     if (h.spec_drafts) setSpecK(Math.max(0, Math.round(Number(h.spec_drafts)) || 0));
     else if (h.spec_k) setSpecK(draftTokensFromLegacyWindow(h.spec_k) ?? 4);
@@ -426,6 +430,7 @@ export function Inference() {
       kv_bw: kvBw,
       prefix_len: String(prefixLen),
       prefill_chunk: String(prefillChunk),
+      dec_batch: decBatch,
       spec_mode: specMode,
       spec_drafts: String(specK),
       spec_alpha: String(specAlpha),
@@ -436,7 +441,7 @@ export function Inference() {
       mergeSweep(hash, mode === "sweep" ? encodeSweep(rows, template) : null),
       mode === "sweep" ? icPhase : null,
     ), precPreset));
-  }, [hydrated, modelId, gpuSku, precPreset, selectionMode, framework, kvBlock, inTok, outTok, frac, commLatencyUs, launchFloorUs, tieTp, par, cpScheme, epLoadText, decodeOn, decPar, kvBw, prefixLen, prefillChunk, specMode, specK, specAlpha, specDraft, includeAux, tablesOnHost, mode, rows, template, icPhase]);
+  }, [hydrated, modelId, gpuSku, precPreset, selectionMode, framework, kvBlock, inTok, outTok, frac, commLatencyUs, launchFloorUs, tieTp, par, cpScheme, epLoadText, decodeOn, decPar, kvBw, prefixLen, prefillChunk, decBatch, specMode, specK, specAlpha, specDraft, includeAux, tablesOnHost, mode, rows, template, icPhase]);
 
   useEffect(() => {
     fetchJson<GpusResponse>("/inference/gpus")
@@ -612,6 +617,7 @@ export function Inference() {
       return;
     }
     const encBatch = Number(encodeBatch);
+    const decBs = Number(decBatch);
     const my = ++runSeq.current;
     setStatus("Estimating…");
     setStatusKind("idle");
@@ -647,6 +653,10 @@ export function Inference() {
           media: media.media,
           ...(encodeBatch.trim() && Number.isInteger(encBatch) && encBatch >= 1
             ? { encode_batch_size: encBatch } : {}),
+          // The decode step's batch: omitted = the KV-bound max, which the
+          // per-op breakdown otherwise always prices.
+          ...(decBatch.trim() && Number.isInteger(decBs) && decBs >= 1
+            ? { decode_batch_size: decBs } : {}),
           ...(decodeOn ? {
             // The decode cluster routes the same traffic: ρ rides with it.
             decode: { parallel: { ...decPar, ep_load_factor: epLoad } },
@@ -696,7 +706,7 @@ export function Inference() {
       setStatus(`Failed: ${why}`);
       setStatusKind("err");
     }
-  }, [modelId, gpuSku, frac, commLatencyUs, launchFloorUs, precPreset, inTok, outTok, par, cpScheme, epLoad, epLoadErr, prefixLen, prefillChunk, specMode, specK, specAlpha, specDraft, draftAvail, includeAux, tablesOnHost, selectionMode, framework, kvBlock, calibrateMine, loadCalibration, decodeOn, decPar, kvBw, mediaSpec, mediaDraft, encodeBatch]);
+  }, [modelId, gpuSku, frac, commLatencyUs, launchFloorUs, precPreset, inTok, outTok, par, cpScheme, epLoad, epLoadErr, prefixLen, prefillChunk, decBatch, specMode, specK, specAlpha, specDraft, draftAvail, includeAux, tablesOnHost, selectionMode, framework, kvBlock, calibrateMine, loadCalibration, decodeOn, decPar, kvBw, mediaSpec, mediaDraft, encodeBatch]);
 
   useEffect(() => {
     // After hydrate, and once the caller's calibration is known (signed in,
@@ -897,6 +907,8 @@ export function Inference() {
           onPrefixLen={setPrefixLen}
           prefillChunk={prefillChunk}
           onPrefillChunk={setPrefillChunk}
+          decBatch={decBatch}
+          onDecBatch={setDecBatch}
           specMode={specMode}
           onSpecMode={(v) => {
             setSpecMode(v);
